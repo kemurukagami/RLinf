@@ -15,6 +15,8 @@
 import asyncio
 import gc
 from collections import defaultdict
+from dataclasses import dataclass, fields
+from enum import Enum
 from typing import Any
 
 import numpy as np
@@ -35,6 +37,11 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.utils import get_env_attr
+from rlinf.envs.world_model.base_world_env import (
+    BaseWorldEnv,
+    WorldEnvResumeState,
+    WorldEnvSnapshotContext,
+)
 from rlinf.envs.wrappers import RecordVideo
 from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
 from rlinf.utils.data_iter_utils import split_list
@@ -53,6 +60,48 @@ from rlinf.utils.utils import (
     preprocess_embodied_batch,
 )
 from rlinf.workers.env.history_manager import HistoryManager
+
+ENV_ROLLOUT_RESUME_SCHEMA_VERSION = 1
+
+
+class RolloutCursorPhase(str, Enum):
+    IDLE = "idle"
+    WAITING_FOR_POLICY = "waiting_for_policy"
+    COMMITTING_CHUNK = "committing_chunk"
+    BOOTSTRAP_PENDING = "bootstrap_pending"
+    EPOCH_FINALIZING = "epoch_finalizing"
+    COMPLETED = "completed"
+
+
+@dataclass(slots=True)
+class EnvRolloutCursor:
+    schema_version: int
+    lifecycle_generation: int
+    policy_version: int
+    epoch_index: int
+    chunk_index: int
+    stage_id: int
+    next_transition_ids: tuple[int, ...]
+    phase: RolloutCursorPhase
+
+
+@dataclass(frozen=True, slots=True)
+class EnvRolloutResumeState:
+    schema_version: int
+    worker_rank: int
+    worker_world_size: int
+    stage_num: int
+    cursor: EnvRolloutCursor
+    world_states: tuple[WorldEnvResumeState, ...]
+    rollout_results: tuple[EmbodiedRolloutResult, ...]
+    current_env_outputs: tuple[EnvOutput, ...]
+    resume_bootstraps: tuple[EnvOutput | None, ...]
+    last_observations: tuple[Any, ...]
+    last_intervened_info: tuple[Any, ...]
+    train_prev_done: tuple[torch.Tensor, ...]
+    env_metrics: dict[str, tuple[torch.Tensor, ...]]
+    prefetched_train_bootstrap: tuple[EnvOutput, ...] | None
+    history_state: Any | None
 
 
 class EnvWorker(Worker):
@@ -75,6 +124,16 @@ class EnvWorker(Worker):
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.stage_num = self.cfg.rollout.pipeline_stage_num
+        self._rollout_cursor: EnvRolloutCursor | None = None
+        self._current_env_outputs: list[EnvOutput] | None = None
+        self._resume_bootstraps: list[EnvOutput | None] = [None] * self.stage_num
+        self._rollout_env_metrics: defaultdict[str, list[torch.Tensor]] = defaultdict(
+            list
+        )
+        self._rlt_pending_obs: list[dict[str, Any] | None] = [None] * self.stage_num
+        self._rollout_call_active = False
+        self._policy_request_in_flight = False
+        self._lifecycle_generation = 0
         self.enable_rlt = (
             OmegaConf.select(self.cfg, "algorithm.loss_type", default="") == "rlt_ac"
         )
@@ -920,23 +979,70 @@ class EnvWorker(Worker):
         self, rollout_channel: Channel, env_outputs: list[EnvOutput]
     ) -> None:
         for stage_id in range(self.stage_num):
-            env_output: EnvOutput = env_outputs[stage_id]
-            env_batch = env_output.to_dict()
-            data = {
-                "obs": env_batch["obs"],
-                "final_obs": env_batch["final_obs"],
-            }
-            if self.enable_rlt:
-                data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
-            self.send_to(
-                group_name=self.cfg.rollout.group_name,
-                channel=rollout_channel,
-                data=data,
-                mode="train",
-                tag="rollout_results",
-                route_key=stage_id if not self.env_decoupled_mode else None,
-                decoupled_mode=self.env_decoupled_mode,
-            )
+            self._send_stage_bootstrap(rollout_channel, env_outputs[stage_id], stage_id)
+
+    def _send_stage_bootstrap(
+        self, rollout_channel: Channel, env_output: EnvOutput, stage_id: int
+    ) -> None:
+        env_batch = env_output.to_dict()
+        data = {
+            "obs": env_batch["obs"],
+            "final_obs": env_batch["final_obs"],
+        }
+        if self.enable_rlt:
+            data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
+        self.send_to(
+            group_name=self.cfg.rollout.group_name,
+            channel=rollout_channel,
+            data=data,
+            mode="train",
+            tag="rollout_results",
+            route_key=stage_id if not self.env_decoupled_mode else None,
+            decoupled_mode=self.env_decoupled_mode,
+        )
+
+    def _set_pending_bootstrap(
+        self, env_output: EnvOutput, stage_id: int, chunk_index: int
+    ) -> None:
+        if self._rollout_cursor is None:
+            raise RuntimeError("rollout cursor is not initialized")
+        if self._resume_bootstraps[stage_id] is not None:
+            raise RuntimeError("pending bootstrap slot is already occupied")
+        self._current_env_outputs[stage_id] = env_output
+        self._resume_bootstraps[stage_id] = env_output
+        transition_ids = list(self._rollout_cursor.next_transition_ids)
+        transition_ids[stage_id] += 1
+        self._rollout_cursor.next_transition_ids = tuple(transition_ids)
+        self._rollout_cursor.chunk_index = chunk_index
+        self._rollout_cursor.stage_id = stage_id
+        self._rollout_cursor.phase = RolloutCursorPhase.BOOTSTRAP_PENDING
+
+    def _send_pending_bootstrap(
+        self, rollout_channel: Channel, stage_id: int
+    ) -> None:
+        if self._rollout_cursor is None:
+            raise RuntimeError("rollout cursor is not initialized")
+        env_output = self._resume_bootstraps[stage_id]
+        if env_output is None:
+            raise RuntimeError("no pending bootstrap to send")
+        self._send_stage_bootstrap(rollout_channel, env_output, stage_id)
+        self._resume_bootstraps[stage_id] = None
+        self._rollout_cursor.phase = RolloutCursorPhase.WAITING_FOR_POLICY
+
+    def _commit_policy_version(self, versions: torch.Tensor | None) -> None:
+        if versions is None:
+            return
+        unique_versions = torch.unique(versions.detach().cpu())
+        if unique_versions.numel() != 1:
+            raise ValueError("rollout result contains multiple policy versions")
+        version_value = float(unique_versions.item())
+        if not version_value.is_integer():
+            raise ValueError("rollout policy version must be an integer")
+        version = int(version_value)
+        if self._rollout_cursor.policy_version < 0:
+            self._rollout_cursor.policy_version = version
+        elif self._rollout_cursor.policy_version != version:
+            raise ValueError("rollout policy version changed during collection")
 
     def _bootstrap_and_send_train(self, rollout_channel: Channel) -> list[EnvOutput]:
         env_outputs = self.bootstrap_step()
@@ -968,6 +1074,288 @@ class EnvWorker(Worker):
             (env_output.intervene_actions, env_output.intervene_flags)
             for env_output in env_output_list
         ]
+
+    @staticmethod
+    def _clone_env_output(env_output: EnvOutput) -> EnvOutput:
+        return EnvOutput(
+            **{
+                field.name: clone_nested_to_cpu(getattr(env_output, field.name))
+                for field in fields(EnvOutput)
+            }
+        )
+
+    @staticmethod
+    def _clone_rollout_result(
+        rollout_result: EmbodiedRolloutResult,
+    ) -> EmbodiedRolloutResult:
+        if type(rollout_result) is not EmbodiedRolloutResult:
+            raise NotImplementedError(
+                "Task 1 supports only EmbodiedRolloutResult worker state"
+            )
+        return EmbodiedRolloutResult(
+            **{
+                field.name: clone_nested_to_cpu(getattr(rollout_result, field.name))
+                for field in fields(EmbodiedRolloutResult)
+            }
+        )
+
+    @staticmethod
+    def _clone_cursor(cursor: EnvRolloutCursor) -> EnvRolloutCursor:
+        return EnvRolloutCursor(
+            schema_version=cursor.schema_version,
+            lifecycle_generation=cursor.lifecycle_generation,
+            policy_version=cursor.policy_version,
+            epoch_index=cursor.epoch_index,
+            chunk_index=cursor.chunk_index,
+            stage_id=cursor.stage_id,
+            next_transition_ids=tuple(cursor.next_transition_ids),
+            phase=cursor.phase,
+        )
+
+    def _validate_snapshot_capability(self) -> None:
+        if self.stage_num != 1:
+            raise NotImplementedError("Task 1 requires pipeline_stage_num == 1")
+        if self.env_decoupled_mode:
+            raise NotImplementedError("Task 1 does not support decoupled mode")
+        if self.enable_online_lerobot:
+            raise NotImplementedError("Task 1 does not support online LeRobot")
+        if self.enable_rlt:
+            raise NotImplementedError("Task 1 does not support RLT worker state")
+        if self.reward_mode == "history_buffer":
+            raise NotImplementedError("Task 1 does not support history-buffer reward")
+        if self.use_training_pipeline:
+            raise NotImplementedError("Task 1 does not support training pipelining")
+        data_collection = self.cfg.env.train.get("data_collection", None)
+        if data_collection is not None and data_collection.get("enabled", False):
+            raise NotImplementedError("Task 1 does not support data collection wrappers")
+        if not self.cfg.env.train.get("use_fixed_reset_state_ids", False):
+            raise NotImplementedError(
+                "Task 1 world-model resume requires fixed reset-state IDs"
+            )
+        if len(self.env_list) != 1:
+            raise RuntimeError("Task 1 requires exactly one training environment")
+        if not callable(get_env_attr(self.env_list[0], "snapshot_resume_state")):
+            raise NotImplementedError(
+                "training environment does not expose world-model resume state"
+            )
+
+    def _assert_snapshot_safe_point(self) -> None:
+        cursor = self._rollout_cursor
+        if cursor is None or cursor.phase is not RolloutCursorPhase.BOOTSTRAP_PENDING:
+            raise RuntimeError("rollout snapshot requires BOOTSTRAP_PENDING phase")
+        if self._policy_request_in_flight:
+            raise RuntimeError("cannot snapshot with a policy request in flight")
+        if self._current_env_outputs is None or len(self._current_env_outputs) != 1:
+            raise RuntimeError("snapshot requires one current environment output")
+        if len(self._resume_bootstraps) != 1 or self._resume_bootstraps[0] is None:
+            raise RuntimeError("snapshot requires one unsent bootstrap")
+
+    def _world_snapshot_context(
+        self, cursor: EnvRolloutCursor, world_state: WorldEnvResumeState | None = None
+    ) -> WorldEnvSnapshotContext:
+        env = self.env_list[0]
+        episode_generations = (
+            world_state.episode_generations
+            if world_state is not None
+            else get_env_attr(env, "episode_generations")
+        )
+        reset_state_ids = (
+            world_state.reset_state_ids
+            if world_state is not None
+            else get_env_attr(env, "reset_state_ids")
+        )
+        return WorldEnvSnapshotContext(
+            worker_rank=self._rank,
+            worker_world_size=self._world_size,
+            stage_id=cursor.stage_id,
+            lifecycle_generation=cursor.lifecycle_generation,
+            chunk_index=cursor.chunk_index,
+            next_transition_id=cursor.next_transition_ids[cursor.stage_id],
+            episode_generations=episode_generations.detach().cpu().clone(),
+            reset_state_ids=reset_state_ids.detach().cpu().clone(),
+        )
+
+    def snapshot_rollout_stage(self) -> EnvRolloutResumeState:
+        self._validate_snapshot_capability()
+        self._assert_snapshot_safe_point()
+        cursor = self._clone_cursor(self._rollout_cursor)
+        snapshot_world = get_env_attr(self.env_list[0], "snapshot_resume_state")
+        world_state = snapshot_world(self._world_snapshot_context(cursor))
+        state = EnvRolloutResumeState(
+            schema_version=ENV_ROLLOUT_RESUME_SCHEMA_VERSION,
+            worker_rank=self._rank,
+            worker_world_size=self._world_size,
+            stage_num=self.stage_num,
+            cursor=cursor,
+            world_states=(world_state,),
+            rollout_results=tuple(
+                self._clone_rollout_result(result) for result in self.rollout_results
+            ),
+            current_env_outputs=tuple(
+                self._clone_env_output(output) for output in self._current_env_outputs
+            ),
+            resume_bootstraps=tuple(
+                self._clone_env_output(output) if output is not None else None
+                for output in self._resume_bootstraps
+            ),
+            last_observations=tuple(clone_nested_to_cpu(self.last_obs_list)),
+            last_intervened_info=tuple(
+                clone_nested_to_cpu(self.last_intervened_info_list)
+            ),
+            train_prev_done=tuple(clone_nested_to_cpu(self.train_prev_done)),
+            env_metrics={
+                key: tuple(clone_nested_to_cpu(values))
+                for key, values in self._rollout_env_metrics.items()
+            },
+            prefetched_train_bootstrap=(
+                tuple(
+                    self._clone_env_output(output)
+                    for output in self._prefetched_train_bootstrap
+                )
+                if self._prefetched_train_bootstrap is not None
+                else None
+            ),
+            history_state=None,
+        )
+        BaseWorldEnv.assert_cpu_only(state, "env_rollout_resume_state")
+        return state
+
+    def validate_rollout_resume_state(
+        self,
+        state: EnvRolloutResumeState,
+        *,
+        expected_lifecycle_generation: int,
+        expected_policy_version: int,
+    ) -> None:
+        self._validate_snapshot_capability()
+        if not isinstance(state, EnvRolloutResumeState):
+            raise TypeError("resume state must be an EnvRolloutResumeState")
+        BaseWorldEnv.assert_cpu_only(state, "env_rollout_resume_state")
+        if state.schema_version != ENV_ROLLOUT_RESUME_SCHEMA_VERSION:
+            raise ValueError("worker schema_version mismatch")
+        if state.worker_rank != self._rank or state.worker_world_size != self._world_size:
+            raise ValueError("worker rank/world-size identity mismatch")
+        if state.stage_num != 1:
+            raise ValueError("worker stage_num mismatch")
+        cursor = state.cursor
+        if cursor.schema_version != ENV_ROLLOUT_RESUME_SCHEMA_VERSION:
+            raise ValueError("cursor schema_version mismatch")
+        if cursor.phase is not RolloutCursorPhase.BOOTSTRAP_PENDING:
+            raise ValueError("cursor must be in BOOTSTRAP_PENDING phase")
+        if cursor.lifecycle_generation != expected_lifecycle_generation:
+            raise ValueError("lifecycle_generation mismatch")
+        if cursor.policy_version < 0:
+            raise ValueError("policy_version must be established before snapshot")
+        if cursor.policy_version != expected_policy_version:
+            raise ValueError("policy_version mismatch")
+        if cursor.stage_id != 0 or len(cursor.next_transition_ids) != 1:
+            raise ValueError("cursor topology is invalid for Task 1")
+        if cursor.epoch_index < 0 or cursor.chunk_index < 1:
+            raise ValueError("cursor epoch/chunk indices are invalid")
+        if cursor.next_transition_ids[0] != cursor.chunk_index + cursor.epoch_index:
+            raise ValueError("cursor transition/chunk identity mismatch")
+        if not all(
+            len(values) == 1
+            for values in (
+                state.world_states,
+                state.rollout_results,
+                state.current_env_outputs,
+                state.resume_bootstraps,
+                state.train_prev_done,
+            )
+        ):
+            raise ValueError("resume state must contain exactly one stage")
+        if state.resume_bootstraps[0] is None:
+            raise ValueError("resume state is missing its pending bootstrap")
+        if len(state.last_observations) != 1:
+            raise ValueError("resume state must contain one last observation")
+        if len(state.last_intervened_info) != 1:
+            raise ValueError("resume state must contain one intervention state")
+        if state.history_state is not None:
+            raise ValueError("history_state must be None for Task 1")
+        if state.prefetched_train_bootstrap is not None:
+            raise ValueError("prefetched bootstrap is invalid at a safe point")
+        rollout_result = state.rollout_results[0]
+        if type(rollout_result) is not EmbodiedRolloutResult:
+            raise TypeError("resume rollout must be EmbodiedRolloutResult")
+        if len(rollout_result.actions) != cursor.chunk_index:
+            raise ValueError("rollout actions length does not match chunk_index")
+        result_steps = cursor.chunk_index + cursor.epoch_index
+        for name in ("rewards", "terminations", "truncations", "dones"):
+            if len(getattr(rollout_result, name)) != result_steps:
+                raise ValueError(f"rollout {name} length does not match chunk_index")
+        for name in ("prev_logprobs", "versions", "forward_inputs"):
+            if len(getattr(rollout_result, name)) not in (0, cursor.chunk_index):
+                raise ValueError(f"rollout {name} length is inconsistent")
+        if len(rollout_result.prev_values) not in (0, result_steps):
+            raise ValueError("rollout prev_values length is inconsistent")
+        prev_done = state.train_prev_done[0]
+        if prev_done.dtype != torch.bool or tuple(prev_done.shape) != (
+            self.train_num_envs_per_stage,
+        ):
+            raise ValueError("train_prev_done has invalid shape or dtype")
+        for key, values in state.env_metrics.items():
+            if not isinstance(key, str) or not isinstance(values, tuple):
+                raise TypeError("env_metrics must map strings to tensor tuples")
+            if not all(isinstance(value, torch.Tensor) for value in values):
+                raise TypeError("env_metrics values must contain only tensors")
+        world_state = state.world_states[0]
+        validate_world = get_env_attr(self.env_list[0], "validate_resume_state")
+        validate_world(world_state, self._world_snapshot_context(cursor, world_state))
+
+    def restore_rollout_stage(
+        self,
+        state: EnvRolloutResumeState,
+        *,
+        expected_lifecycle_generation: int,
+        expected_policy_version: int,
+    ) -> None:
+        if self._rollout_call_active or self._policy_request_in_flight:
+            raise RuntimeError("cannot restore while rollout work is active")
+        self.validate_rollout_resume_state(
+            state,
+            expected_lifecycle_generation=expected_lifecycle_generation,
+            expected_policy_version=expected_policy_version,
+        )
+        env = self.env_list[0]
+        context = self._world_snapshot_context(state.cursor, state.world_states[0])
+        prepared_world = get_env_attr(env, "prepare_resume_state")(
+            state.world_states[0], context
+        )
+        cursor = self._clone_cursor(state.cursor)
+        rollout_results = [
+            self._clone_rollout_result(result) for result in state.rollout_results
+        ]
+        current_outputs = [
+            self._clone_env_output(output) for output in state.current_env_outputs
+        ]
+        resume_bootstraps = [
+            self._clone_env_output(output) if output is not None else None
+            for output in state.resume_bootstraps
+        ]
+        last_observations = list(clone_nested_to_cpu(state.last_observations))
+        last_intervened = list(clone_nested_to_cpu(state.last_intervened_info))
+        train_prev_done = list(clone_nested_to_cpu(state.train_prev_done))
+        env_metrics = defaultdict(
+            list,
+            {
+                key: list(clone_nested_to_cpu(values))
+                for key, values in state.env_metrics.items()
+            },
+        )
+
+        get_env_attr(env, "commit_resume_state")(prepared_world)
+        self._rollout_cursor = cursor
+        self._lifecycle_generation = cursor.lifecycle_generation
+        self.rollout_results = rollout_results
+        self._current_env_outputs = current_outputs
+        self._resume_bootstraps = resume_bootstraps
+        self.last_obs_list = last_observations
+        self.last_intervened_info_list = last_intervened
+        self.train_prev_done = train_prev_done
+        self._rollout_env_metrics = env_metrics
+        self._rlt_pending_obs = [None]
+        self._prefetched_train_bootstrap = None
 
     @Worker.timer("env/send_rollout_trajectories")
     async def send_rollout_trajectories(
@@ -1011,20 +1399,67 @@ class EnvWorker(Worker):
         *,
         cooperative_yield: bool,
     ) -> dict[str, torch.Tensor]:
-        self.rollout_results = self._prepare_rollout_results(
-            getattr(self, "rollout_results", None)
+        existing_cursor = getattr(self, "_rollout_cursor", None)
+        resumed = (
+            existing_cursor is not None
+            and existing_cursor.phase is RolloutCursorPhase.BOOTSTRAP_PENDING
         )
-        env_metrics = defaultdict(list)
-        rlt_pending_obs: list[dict[str, Any] | None] = [None] * self.stage_num
+        if resumed:
+            env_metrics = self._rollout_env_metrics
+            rlt_pending_obs = self._rlt_pending_obs
+            first_epoch = self._rollout_cursor.epoch_index
+        else:
+            self._lifecycle_generation = getattr(self, "_lifecycle_generation", 0) + 1
+            self._rollout_cursor = EnvRolloutCursor(
+                schema_version=ENV_ROLLOUT_RESUME_SCHEMA_VERSION,
+                lifecycle_generation=self._lifecycle_generation,
+                policy_version=-1,
+                epoch_index=0,
+                chunk_index=0,
+                stage_id=0,
+                next_transition_ids=(0,) * self.stage_num,
+                phase=RolloutCursorPhase.IDLE,
+            )
+            self.rollout_results = self._prepare_rollout_results(
+                getattr(self, "rollout_results", None)
+            )
+            self._rollout_env_metrics = defaultdict(list)
+            env_metrics = self._rollout_env_metrics
+            self._rlt_pending_obs = [None] * self.stage_num
+            rlt_pending_obs = self._rlt_pending_obs
+            self._resume_bootstraps = [None] * self.stage_num
+            first_epoch = 0
 
-        for epoch in range(self.rollout_epoch):
-            if epoch == 0 and self._prefetched_train_bootstrap is not None:
+        for epoch in range(first_epoch, self.rollout_epoch):
+            self._rollout_cursor.epoch_index = epoch
+            if resumed and epoch == first_epoch:
+                env_outputs = self._current_env_outputs
+                for stage_id in range(self.stage_num):
+                    self._send_pending_bootstrap(rollout_channel, stage_id)
+                committed_in_epoch = (
+                    self._rollout_cursor.chunk_index
+                    - epoch * self.n_train_chunk_steps
+                )
+            elif epoch == 0 and self._prefetched_train_bootstrap is not None:
                 env_outputs = self._prefetched_train_bootstrap
                 self._prefetched_train_bootstrap = None
+                committed_in_epoch = 0
             else:
+                if epoch > 0:
+                    transition_ids = list(
+                        self._rollout_cursor.next_transition_ids
+                    )
+                    transition_ids = [value + 1 for value in transition_ids]
+                    self._rollout_cursor.next_transition_ids = tuple(transition_ids)
                 env_outputs = self._bootstrap_and_send_train(rollout_channel)
+                committed_in_epoch = 0
+            self._current_env_outputs = env_outputs
+            self._rollout_cursor.phase = RolloutCursorPhase.WAITING_FOR_POLICY
+            resumed = False
 
-            for chunk_step_idx in range(self.n_train_chunk_steps):
+            for chunk_step_idx in range(
+                committed_in_epoch, self.n_train_chunk_steps
+            ):
                 for stage_id in range(self.stage_num):
                     if cooperative_yield:
                         await asyncio.sleep(0)
@@ -1050,16 +1485,24 @@ class EnvWorker(Worker):
                                 reward_model_output.detach().float().reshape(-1).cpu()
                             )
 
-                    rollout_result = self.recv_from(
-                        group_name=self.cfg.rollout.group_name,
-                        channel=input_channel,
-                        tag="train_rollout_results",
-                        route_key=stage_id if not self.env_decoupled_mode else None,
-                        batch_size=self.train_batch_size,
-                        merge_fn=RolloutResult.merge_rollout_results,
-                        infer_batch_size_fn=self._infer_rollout_batch_size,
-                        decoupled_mode=self.env_decoupled_mode,
-                    )
+                    self._policy_request_in_flight = True
+                    try:
+                        rollout_result = self.recv_from(
+                            group_name=self.cfg.rollout.group_name,
+                            channel=input_channel,
+                            tag="train_rollout_results",
+                            route_key=(
+                                stage_id if not self.env_decoupled_mode else None
+                            ),
+                            batch_size=self.train_batch_size,
+                            merge_fn=RolloutResult.merge_rollout_results,
+                            infer_batch_size_fn=self._infer_rollout_batch_size,
+                            decoupled_mode=self.env_decoupled_mode,
+                        )
+                    finally:
+                        self._policy_request_in_flight = False
+                    self._commit_policy_version(rollout_result.versions)
+                    self._rollout_cursor.phase = RolloutCursorPhase.COMMITTING_CHUNK
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
                     )
@@ -1116,24 +1559,6 @@ class EnvWorker(Worker):
                             rollout_result=rollout_result,
                             **chunk_step_payload,
                         )
-                    env_batch = env_output.to_dict()
-                    data = {
-                        "obs": env_batch["obs"],
-                        "final_obs": env_batch["final_obs"],
-                    }
-                    if self.enable_rlt:
-                        data["rlt_switch_flags"] = env_batch.get(
-                            "rlt_switch_flags", None
-                        )
-                    self.send_to(
-                        group_name=self.cfg.rollout.group_name,
-                        channel=rollout_channel,
-                        data=data,
-                        mode="train",
-                        tag="rollout_results",
-                        route_key=stage_id if not self.env_decoupled_mode else None,
-                        decoupled_mode=self.env_decoupled_mode,
-                    )
                     if self.collect_transitions and not self.enable_rlt:
                         next_obs = (
                             env_output.final_obs
@@ -1152,7 +1577,14 @@ class EnvWorker(Worker):
                     )
                     if should_record:
                         self.record_env_metrics(env_metrics, env_info)
+                    self._set_pending_bootstrap(
+                        env_output,
+                        stage_id,
+                        epoch * self.n_train_chunk_steps + chunk_step_idx + 1,
+                    )
+                    self._send_pending_bootstrap(rollout_channel, stage_id)
 
+            self._rollout_cursor.phase = RolloutCursorPhase.EPOCH_FINALIZING
             for stage_id in range(self.stage_num):
                 env_output = env_outputs[stage_id]
                 if env_output.intervene_actions is not None:
@@ -1175,16 +1607,21 @@ class EnvWorker(Worker):
                         env_metrics["reward_model_output"].append(
                             reward_model_output.detach().float().reshape(-1).cpu()
                         )
-                rollout_result = self.recv_from(
-                    group_name=self.cfg.rollout.group_name,
-                    channel=input_channel,
-                    tag="train_rollout_results",
-                    route_key=stage_id if not self.env_decoupled_mode else None,
-                    batch_size=self.train_batch_size,
-                    merge_fn=RolloutResult.merge_rollout_results,
-                    infer_batch_size_fn=self._infer_rollout_batch_size,
-                    decoupled_mode=self.env_decoupled_mode,
-                )
+                self._policy_request_in_flight = True
+                try:
+                    rollout_result = self.recv_from(
+                        group_name=self.cfg.rollout.group_name,
+                        channel=input_channel,
+                        tag="train_rollout_results",
+                        route_key=stage_id if not self.env_decoupled_mode else None,
+                        batch_size=self.train_batch_size,
+                        merge_fn=RolloutResult.merge_rollout_results,
+                        infer_batch_size_fn=self._infer_rollout_batch_size,
+                        decoupled_mode=self.env_decoupled_mode,
+                    )
+                finally:
+                    self._policy_request_in_flight = False
+                self._commit_policy_version(rollout_result.versions)
                 rewards = self.compute_bootstrap_rewards(
                     env_output, rollout_result.bootstrap_values, reward_model_output
                 )
@@ -1238,6 +1675,7 @@ class EnvWorker(Worker):
         for key, value in env_metrics.items():
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
 
+        self._rollout_cursor.phase = RolloutCursorPhase.COMPLETED
         return env_metrics
 
     @Worker.timer("interact")
@@ -1248,13 +1686,19 @@ class EnvWorker(Worker):
         reward_channel: Channel | None,
         actor_channel: Channel | None = None,
     ):
-        env_metrics = await self._run_interact_once(
-            input_channel,
-            rollout_channel,
-            reward_channel,
-            actor_channel,
-            cooperative_yield=False,
-        )
+        if getattr(self, "_rollout_call_active", False):
+            raise RuntimeError("interact() is already active")
+        self._rollout_call_active = True
+        try:
+            env_metrics = await self._run_interact_once(
+                input_channel,
+                rollout_channel,
+                reward_channel,
+                actor_channel,
+                cooperative_yield=False,
+            )
+        finally:
+            self._rollout_call_active = False
 
         for env in self.env_list:
             if self.train_enable_offload:

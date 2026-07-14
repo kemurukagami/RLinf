@@ -16,7 +16,6 @@
 This environment is used to evaluate the OpenSora  world model with the Video reward model.
 """
 
-import io
 import json
 import os
 from collections import deque
@@ -35,7 +34,7 @@ from opensora.utils.misc import to_torch_dtype
 
 from rlinf.data.datasets.world_model import NpyTrajectoryDatasetWrapper
 from rlinf.envs.utils import recursive_to_device
-from rlinf.envs.world_model.base_world_env import BaseWorldEnv
+from rlinf.envs.world_model.base_world_env import BaseWorldEnv, WorldEnvResumeState
 
 __all__ = ["OpenSoraEnv"]
 
@@ -66,6 +65,7 @@ class OpenSoraEnv(BaseWorldEnv):
         # Initialize reset state generator
         self._generator = torch.Generator()
         self._generator.manual_seed(self.seed)
+        self._diffusion_generator = self._new_diffusion_generator()
 
         # Update reset state ids
         self.update_reset_state_ids()
@@ -138,6 +138,97 @@ class OpenSoraEnv(BaseWorldEnv):
         )
         self._is_offloaded = False
 
+    def _new_diffusion_generator(self) -> torch.Generator:
+        try:
+            generator = torch.Generator(device=self.device)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"OpenSora requires a torch generator on {self.device}"
+            ) from exc
+        generator.manual_seed(self.seed)
+        return generator
+
+    def _continuation_config(self):
+        config = super()._continuation_config()
+        config.update(
+            {
+                "chunk": self.chunk,
+                "condition_frame_length": self.condition_frame_length,
+                "image_size": self.image_size,
+                "inference_dtype": self.inference_dtype,
+                "model_type": self.world_model_cfg.model.get("type"),
+                "reward_model_type": self.world_model_cfg.reward_model.get("type"),
+                "vae_type": self.world_model_cfg.vae.get("type"),
+                "z_condition_frame_length": self.z_condition_frame_length,
+                "z_mask_frame_num": self.z_mask_frame_num,
+            }
+        )
+        return config
+
+    def _snapshot_diffusion_state(self):
+        return self._diffusion_generator.get_state(), None
+
+    def _validate_model_resume_state(self, state: WorldEnvResumeState) -> None:
+        if state.condition_action is not None:
+            raise ValueError("OpenSora condition_action must be None")
+        if state.diffusion_generator_state is None:
+            raise ValueError("OpenSora requires diffusion_generator_state")
+        if state.diffusion_seed is not None:
+            raise ValueError("OpenSora diffusion_seed must be None")
+
+        current_obs = state.current_obs
+        if not isinstance(current_obs, torch.Tensor):
+            raise TypeError("OpenSora current_obs must be a torch.Tensor")
+        if not current_obs.is_floating_point():
+            raise ValueError("OpenSora current_obs must be floating point")
+        if current_obs.ndim != 6:
+            raise ValueError("OpenSora current_obs must have 6 dimensions")
+        if tuple(current_obs.shape[:3]) != (self.num_envs, 3, 1):
+            raise ValueError(
+                "OpenSora current_obs must start with shape "
+                f"({self.num_envs}, 3, 1)"
+            )
+        time = current_obs.shape[3]
+        if not self.condition_frame_length <= time <= (
+            self.condition_frame_length + 2 * self.chunk
+        ):
+            raise ValueError("OpenSora current_obs time dimension is out of bounds")
+        if tuple(current_obs.shape[-2:]) != self.image_size:
+            raise ValueError("OpenSora current_obs spatial shape must match image_size")
+
+        if len(state.image_queue) != self.num_envs:
+            raise ValueError("OpenSora image_queue count must match num_envs")
+        expected_frame_shape = None
+        for env_idx, queue in enumerate(state.image_queue):
+            if len(queue) != self.z_condition_frame_length:
+                raise ValueError(
+                    f"OpenSora image_queue[{env_idx}] length must equal "
+                    "z_condition_frame_length"
+                )
+            for frame_idx, frame in enumerate(queue):
+                path = f"OpenSora image_queue[{env_idx}][{frame_idx}]"
+                if not isinstance(frame, torch.Tensor):
+                    raise TypeError(f"{path} must be a torch.Tensor")
+                if frame.dtype != self.inference_dtype:
+                    raise ValueError(
+                        f"{path} must have dtype {self.inference_dtype}"
+                    )
+                if frame.ndim != 5 or frame.shape[0] != 1 or frame.shape[2] != 1:
+                    raise ValueError(f"{path} must have shape [1, C, 1, H, W]")
+                frame_shape = tuple(frame.shape)
+                if expected_frame_shape is None:
+                    expected_frame_shape = frame_shape
+                elif frame_shape != expected_frame_shape:
+                    raise ValueError("OpenSora latent queue frame shapes must match")
+
+    def _prepare_model_resume_state(self, state: WorldEnvResumeState):
+        generator = self._new_diffusion_generator()
+        generator.set_state(state.diffusion_generator_state)
+        return generator
+
+    def _commit_model_resume_state(self, prepared) -> None:
+        self._diffusion_generator = prepared.model_state
+
     def _build_dataset(self, cfg):
         return NpyTrajectoryDatasetWrapper(cfg.initial_image_path)
 
@@ -189,70 +280,6 @@ class OpenSoraEnv(BaseWorldEnv):
         else:
             raise ValueError(f"Action stats path {stats_path} does not exist")
 
-    def get_state(self) -> bytes:
-        """Serialize runtime state to CPU bytes buffer for offload."""
-        env_state = {
-            "current_obs": recursive_to_device(self.current_obs, "cpu")
-            if self.current_obs is not None
-            else None,
-            "task_descriptions": self.task_descriptions,
-            "init_ee_poses": self.init_ee_poses,
-            "elapsed_steps": self.elapsed_steps,
-            "prev_step_reward": self.prev_step_reward.cpu(),
-            "_is_start": self._is_start,
-            "reset_state_ids": self.reset_state_ids.cpu(),
-            "generator_state": self._generator.get_state(),
-        }
-        if self.record_metrics:
-            env_state.update(
-                {
-                    "success_once": self.success_once.cpu(),
-                    "returns": self.returns.cpu(),
-                }
-            )
-
-        image_queue_state = []
-        for env_idx in range(self.num_envs):
-            queue_frames = []
-            for frame in self.image_queue[env_idx]:
-                queue_frames.append(recursive_to_device(frame, "cpu"))
-            image_queue_state.append(queue_frames)
-        env_state["image_queue"] = image_queue_state
-
-        buffer = io.BytesIO()
-        torch.save(env_state, buffer)
-        return buffer.getvalue()
-
-    def load_state(self, state_buffer: bytes):
-        """Restore runtime state from CPU bytes buffer."""
-        buffer = io.BytesIO(state_buffer)
-        state = torch.load(buffer, map_location="cpu", weights_only=False)
-
-        self.current_obs = (
-            recursive_to_device(state["current_obs"], self.device)
-            if state["current_obs"] is not None
-            else None
-        )
-        self.task_descriptions = state["task_descriptions"]
-        self.init_ee_poses = state["init_ee_poses"]
-        self.elapsed_steps = state["elapsed_steps"]
-        self.prev_step_reward = state["prev_step_reward"].to(self.device)
-        self._is_start = state["_is_start"]
-        self.reset_state_ids = state["reset_state_ids"].to(self.device)
-        self._generator.set_state(state["generator_state"])
-
-        image_queue_state = state["image_queue"]
-        for env_idx in range(self.num_envs):
-            self.image_queue[env_idx].clear()
-            for frame in image_queue_state[env_idx]:
-                self.image_queue[env_idx].append(
-                    recursive_to_device(frame, self.device)
-                )
-
-        if self.record_metrics and "success_once" in state:
-            self.success_once = state["success_once"].to(self.device)
-            self.returns = state["returns"].to(self.device)
-
     def offload(self):
         """Move heavy models and runtime tensors to CPU."""
         if self._is_offloaded:
@@ -274,7 +301,7 @@ class OpenSoraEnv(BaseWorldEnv):
                 ],
                 maxlen=self.z_condition_frame_length,
             )
-        torch.cuda.empty_cache()
+        self._clear_accelerator_cache()
         self._is_offloaded = True
 
     def onload(self):
@@ -568,9 +595,13 @@ class OpenSoraEnv(BaseWorldEnv):
         # Store task descriptions and init_ee_poses
         self.task_descriptions = task_descriptions
         self.init_ee_poses = init_ee_poses
+        self.reset_state_ids = torch.as_tensor(
+            episode_indices, dtype=torch.int64, device=self.device
+        )
 
         # Wrap observation to match libero_env format
         extracted_obs = self._wrap_obs()
+        self._commit_episode_reset()
         infos = {}
 
         return extracted_obs, infos
@@ -659,6 +690,7 @@ class OpenSoraEnv(BaseWorldEnv):
             *latent_size[1:],
             device=self.device,
             dtype=self.inference_dtype,
+            generator=self._diffusion_generator,
         )
 
         # Concatenate condition and mask frames: [num_envs, C, T_cond + T_mask, H', W']

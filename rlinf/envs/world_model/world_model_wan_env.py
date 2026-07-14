@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import io
 import os
 from contextlib import nullcontext
 from pathlib import Path
@@ -28,7 +27,7 @@ from PIL import Image
 
 from rlinf.data.datasets.world_model import NpyTrajectoryDatasetWrapper
 from rlinf.envs.utils import recursive_to_device
-from rlinf.envs.world_model.base_world_env import BaseWorldEnv
+from rlinf.envs.world_model.base_world_env import BaseWorldEnv, WorldEnvResumeState
 
 __all__ = ["WanEnv"]
 
@@ -72,6 +71,7 @@ class WanEnv(BaseWorldEnv):
         #
         self.retain_action = cfg.get("retain_action", True)  # Default True
         self.enable_kir = cfg.get("enable_kir", True)
+        self._diffusion_seed = 0
 
         # load pipeline
         self.pipe = self._build_pipeline()
@@ -115,6 +115,101 @@ class WanEnv(BaseWorldEnv):
         )
 
         self._is_offloaded = False
+
+    def _continuation_config(self):
+        config = super()._continuation_config()
+        config.update(
+            {
+                "chunk": self.chunk,
+                "condition_frame_length": self.condition_frame_length,
+                "num_frames": self.num_frames,
+                "image_size": self.image_size,
+                "num_inference_steps": self.num_inference_steps,
+                "reward_model_type": self.cfg.reward_model.get("type"),
+                "retain_action": self.retain_action,
+                "reset_gripper_open": self.reset_gripper_open,
+                "is_libero_env": self.is_libero_env,
+                "diffusion_seed": self._diffusion_seed,
+            }
+        )
+        return config
+
+    def _snapshot_condition_action(self):
+        return self.condition_action
+
+    def _snapshot_diffusion_state(self):
+        return None, self._diffusion_seed
+
+    def _validate_model_resume_state(self, state: WorldEnvResumeState) -> None:
+        if state.diffusion_generator_state is not None:
+            raise ValueError("Wan diffusion_generator_state must be None")
+        if state.diffusion_seed != self._diffusion_seed:
+            raise ValueError(
+                f"Wan diffusion_seed must equal {self._diffusion_seed}"
+            )
+
+        current_obs = state.current_obs
+        if not isinstance(current_obs, torch.Tensor):
+            raise TypeError("Wan current_obs must be a torch.Tensor")
+        if not current_obs.is_floating_point():
+            raise ValueError("Wan current_obs must be floating point")
+        if current_obs.ndim != 6 or tuple(current_obs.shape[:3]) != (
+            self.num_envs,
+            3,
+            1,
+        ):
+            raise ValueError(
+                f"Wan current_obs must start with shape ({self.num_envs}, 3, 1)"
+            )
+        if not self.condition_frame_length <= current_obs.shape[3] <= self.num_frames:
+            raise ValueError("Wan current_obs time dimension is out of bounds")
+        if tuple(current_obs.shape[-2:]) != self.image_size:
+            raise ValueError("Wan current_obs spatial shape must match image_size")
+
+        if len(state.image_queue) != self.num_envs:
+            raise ValueError("Wan image_queue count must match num_envs")
+        for env_idx, queue in enumerate(state.image_queue):
+            if len(queue) != self.condition_frame_length:
+                raise ValueError(
+                    f"Wan image_queue[{env_idx}] length must equal "
+                    "condition_frame_length"
+                )
+            for frame_idx, frame in enumerate(queue):
+                path = f"Wan image_queue[{env_idx}][{frame_idx}]"
+                if not isinstance(frame, torch.Tensor):
+                    raise TypeError(f"{path} must be a torch.Tensor")
+                if not frame.is_floating_point():
+                    raise ValueError(f"{path} must be floating point")
+                if tuple(frame.shape) != (3, 1, *self.image_size):
+                    raise ValueError(
+                        f"{path} must have shape (3, 1, {self.image_size[0]}, "
+                        f"{self.image_size[1]})"
+                    )
+
+        condition_action = state.condition_action
+        if not isinstance(condition_action, torch.Tensor):
+            raise TypeError("Wan condition_action must be a torch.Tensor")
+        if not condition_action.is_floating_point():
+            raise ValueError("Wan condition_action must be floating point")
+        if tuple(condition_action.shape) != (
+            self.num_envs,
+            self.condition_frame_length,
+            7,
+        ):
+            raise ValueError(
+                "Wan condition_action must have shape "
+                f"({self.num_envs}, {self.condition_frame_length}, 7)"
+            )
+
+    def _prepare_model_resume_state(self, state: WorldEnvResumeState):
+        return tuple(
+            tuple(frame.clone().contiguous() for frame in queue)
+            for queue in state.image_queue
+        )
+
+    def _commit_model_resume_state(self, prepared) -> None:
+        # Wan converts queue frames to NumPy at inference, so queues stay on CPU.
+        self.image_queue = [list(queue) for queue in prepared.model_state]
 
     def _build_dataset(self, cfg):
         return NpyTrajectoryDatasetWrapper(
@@ -396,6 +491,9 @@ class WanEnv(BaseWorldEnv):
         for env_idx in range(num_envs):
             frames = [
                 self.current_obs[env_idx, :, 0, t_idx : t_idx + 1, :, :]
+                .detach()
+                .cpu()
+                .contiguous()
                 for t_idx in range(self.condition_frame_length)
             ]
             self.image_queue[env_idx] = frames
@@ -428,9 +526,13 @@ class WanEnv(BaseWorldEnv):
         # Store init_ee_poses
         self.task_descriptions = task_descriptions
         self.init_ee_poses = init_ee_poses
+        self.reset_state_ids = torch.as_tensor(
+            episode_indices, dtype=torch.int64, device=self.device
+        )
 
         # Wrap observation to match libero_env format
         extracted_obs = self._wrap_obs()
+        self._commit_episode_reset()
         infos = {}
 
         return extracted_obs, infos
@@ -538,7 +640,7 @@ class WanEnv(BaseWorldEnv):
             batch_input_image4.append(imgs[-4:])  # Last 4 frames
 
         kwargs = {
-            "seed": 0,
+            "seed": self._diffusion_seed,
             "tiled": False,
             "input_image": batch_input_image,  # List[PIL], len = B
             "input_image4": batch_input_image4,  # List[List[PIL]], B×4
@@ -751,6 +853,11 @@ class WanEnv(BaseWorldEnv):
         self.pipe.dit = self.pipe.dit.to("cpu")
         self.reward_model = self.reward_model.to("cpu")
         self.current_obs = recursive_to_device(self.current_obs, "cpu")
+        self.condition_action = self.condition_action.cpu()
+        self.image_queue = [
+            [frame.detach().cpu().contiguous() for frame in queue]
+            for queue in self.image_queue
+        ]
         self.prev_step_reward = self.prev_step_reward.cpu()
         self.reset_state_ids = self.reset_state_ids.cpu()
         if self.record_metrics:
@@ -767,39 +874,13 @@ class WanEnv(BaseWorldEnv):
         self.pipe.vae = self.pipe.vae.to(self.device)
         self.reward_model = self.reward_model.to(self.device)
         self.current_obs = recursive_to_device(self.current_obs, self.device)
+        self.condition_action = self.condition_action.to(self.device)
         self.prev_step_reward = self.prev_step_reward.to(self.device)
         self.reset_state_ids = self.reset_state_ids.to(self.device)
         if self.record_metrics:
             self.success_once = self.success_once.to(self.device)
             self.returns = self.returns.to(self.device)
         self._is_offloaded = False
-
-    def get_state(self) -> bytes:
-        """Serialize runtime state to CPU bytes buffer for offload."""
-        env_state = {
-            "current_obs": recursive_to_device(self.current_obs, "cpu")
-            if self.current_obs is not None
-            else None,
-            "task_descriptions": self.task_descriptions,
-            "init_ee_poses": self.init_ee_poses,
-            "elapsed_steps": self.elapsed_steps,
-            "prev_step_reward": self.prev_step_reward.cpu(),
-            "_is_start": self._is_start,
-            "reset_state_ids": self.reset_state_ids.cpu(),
-            "generator_state": self._generator.get_state(),
-        }
-        if self.record_metrics:
-            env_state.update(
-                {
-                    "success_once": self.success_once.cpu(),
-                    "returns": self.returns.cpu(),
-                }
-            )
-
-        buffer = io.BytesIO()
-        torch.save(env_state, buffer)
-        return buffer.getvalue()
-
 
 # PYTHONPATH="/mnt/project_rlinf/jzn/workspace/release/DiffSynth-Studio:$PYTHONPATH" python -m rlinf.envs.world_model.world_model_wan_env
 if __name__ == "__main__":

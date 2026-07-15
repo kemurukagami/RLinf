@@ -6,8 +6,8 @@ Status: implemented for the scoped same-actor synchronous contract. Common,
 OpenSora, and Wan world-environment continuation state, worker
 cursor/snapshot/restore integration, exactly-once bootstrap consumption, and
 two-chunk Wan equivalence tests are complete. The implementation is verified
-with CPU fakes; real Wan/DiffSynth accelerator integration remains a hardware
-validation item.
+with CPU fakes and a real Wan/DiffSynth accelerator run. Real OpenSora
+accelerator validation remains pending.
 
 Implementation progress:
 
@@ -27,6 +27,8 @@ Implementation progress:
 - [x] Add two-chunk equivalence and regression tests.
 - [x] Run final formatting, lint, focused tests, and the broader embodied unit
   subset.
+- [x] Run real OpenVLA-OFT-to-Wan two-chunk snapshot/offload/restore
+  equivalence on two RTX 4090 GPUs.
 
 This document expands Task T1, "Versioned continuation state," from:
 
@@ -1109,8 +1111,64 @@ From `/root/VLAMultipipeline/RLinf`:
   tests/unit_tests/test_world_model_resume.py
 ```
 
-GPU acceptance is intentionally deferred to T8. CPU tests use deterministic
-fake inference to prove state completeness and ordering.
+### 15.1 Recorded real-model result
+
+From the current workspace, run:
+
+```bash
+cd /root/_VLAMP/RLinf
+bash tests/e2e_tests/embodied/run_task1_snapshot_resume.sh
+```
+
+The model-explicit configuration is
+`tests/e2e_tests/embodied/task1_wan_snapshot_resume.yaml`. It uses:
+
+- GPU 0: `/workspace/WM/RLinf-Wan-LIBERO-Spatial`;
+- GPU 1: `/workspace/VLA/Openvla-oft-SFT-libero-spatial-traj1`;
+- one world-model environment and `num_inference_steps: 1`;
+- `/root/.venv` with Python 3.11, PyTorch 2.6.0/CUDA 12.4,
+  Transformers 4.40.1, and `huggingface-hub` 0.36.2.
+
+Result recorded on 2026-07-15 on a 4-CPU-core, 128-GB-RAM server with 8 RTX
+4090 GPUs: pass. OpenVLA generated both real action chunks. After chunk 0, the
+test captured and validated a CPU-only snapshot. It then compared uninterrupted
+chunk 1 against chunk 1 after Wan offload, prepare/commit restore into the same
+environment instance, and onload. Observations, rewards,
+termination/truncation flags, metrics, and the full final
+`WorldEnvResumeState` matched within `rtol=atol=1e-5`. The captured
+`current_obs` shape was `(1, 3, 1, 13, 256, 256)`. The focused unit suite
+reported `31 passed`; Ruff, format, Python compilation, shell syntax, and diff
+checks passed for the new harness.
+
+This run validates real Wan T1 continuation and offload/restore behavior. It
+does not prove drain coordination, scheduler release, bundle reuse by a second
+pipeline, or resumed worker-channel ordering. Those remain T2-T8 work. Full T8
+GPU acceptance is still intentionally deferred, and OpenSora hardware
+equivalence remains pending because `/workspace/WM` contains no OpenSora
+checkpoint.
+
+### 15.2 Recorded collocated real-model result
+
+The same equivalence harness also has an explicit one-GPU placement:
+
+```bash
+cd /root/_VLAMP/RLinf
+CUDA_VISIBLE_DEVICES=2 \
+  bash tests/e2e_tests/embodied/run_task1_snapshot_resume_collocated.sh
+```
+
+The logical device in
+`tests/e2e_tests/embodied/task1_wan_snapshot_resume_collocated.yaml` is
+`cuda:0` for both OpenVLA and Wan. Because their combined weights exceed a
+24 GB RTX 4090, the harness offloads Wan before policy inference and offloads
+OpenVLA before each world-model chunk. It asserts that collocated placement
+uses one device and fails rather than silently falling back to two GPUs.
+
+Result recorded on 2026-07-15: pass on one RTX 4090. OpenVLA generated two real
+action chunks, Wan generated the corresponding frame chunks, and the resumed
+second-chunk output and final continuation state matched the uninterrupted
+path within `rtol=atol=1e-5`. The snapshot `current_obs` shape was
+`(1, 3, 1, 13, 256, 256)`.
 
 ## 16. Definition of done
 

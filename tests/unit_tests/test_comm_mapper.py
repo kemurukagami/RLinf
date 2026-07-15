@@ -22,6 +22,7 @@ from rlinf.scheduler import (
     merge_batches,
     split_batch,
 )
+from rlinf.workers.elastic_rollout_lifecycle import RolloutTransitionIdentity
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
@@ -184,6 +185,12 @@ def test_split_and_merge_nested_batches():
 
 
 def test_rollout_result_split_merge_invariant():
+    transition_id = RolloutTransitionIdentity(
+        lifecycle_generation=1,
+        env_worker_rank=0,
+        stage_id=0,
+        sequence=2,
+    )
     rollout_result = RolloutResult(
         actions=torch.arange(12, dtype=torch.float32).view(6, 2),
         prev_logprobs=torch.arange(12, dtype=torch.float32).view(6, 2),
@@ -195,6 +202,7 @@ def test_rollout_result_split_merge_invariant():
             "states": torch.arange(18, dtype=torch.float32).view(6, 3),
         },
         versions=torch.arange(6, dtype=torch.float32).view(6, 1),
+        transition_id=transition_id,
     )
 
     worker = object.__new__(MultiStepRolloutWorker)
@@ -213,6 +221,8 @@ def test_rollout_result_split_merge_invariant():
         merged.forward_inputs["states"], rollout_result.forward_inputs["states"]
     )
     assert torch.equal(merged.versions, rollout_result.versions)
+    assert all(shard.transition_id == transition_id for shard in shards)
+    assert merged.transition_id == transition_id
 
 
 def test_merge_env_outputs_with_partial_optional_fields():

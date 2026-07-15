@@ -144,9 +144,7 @@ class WanEnv(BaseWorldEnv):
         if state.diffusion_generator_state is not None:
             raise ValueError("Wan diffusion_generator_state must be None")
         if state.diffusion_seed != self._diffusion_seed:
-            raise ValueError(
-                f"Wan diffusion_seed must equal {self._diffusion_seed}"
-            )
+            raise ValueError(f"Wan diffusion_seed must equal {self._diffusion_seed}")
 
         current_obs = state.current_obs
         if not isinstance(current_obs, torch.Tensor):
@@ -866,6 +864,9 @@ class WanEnv(BaseWorldEnv):
         self._clear_accelerator_cache()
         self._is_offloaded = True
 
+    def _elastic_residency_modules(self) -> tuple[object, ...]:
+        return (self.pipe.vae, self.pipe.dit, self.reward_model)
+
     def onload(self):
         """Move models and runtime tensors back to execution device."""
         if not self._is_offloaded:
@@ -881,6 +882,7 @@ class WanEnv(BaseWorldEnv):
             self.success_once = self.success_once.to(self.device)
             self.returns = self.returns.to(self.device)
         self._is_offloaded = False
+
 
 # PYTHONPATH="/mnt/project_rlinf/jzn/workspace/release/DiffSynth-Studio:$PYTHONPATH" python -m rlinf.envs.world_model.world_model_wan_env
 if __name__ == "__main__":

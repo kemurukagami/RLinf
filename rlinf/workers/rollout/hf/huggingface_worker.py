@@ -16,6 +16,8 @@ import asyncio
 import copy
 import gc
 import time
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable, Literal, Optional
 
 import numpy as np
@@ -26,13 +28,65 @@ from tqdm import tqdm
 from rlinf.algorithms.rlt.rollout import predict_rlt_actions
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import (
+    ElasticRolloutRequest,
+    ElasticRolloutRequestKind,
     RolloutResult,
+    RolloutTransitionIdentity,
+    infer_elastic_rollout_request_batch_size,
+    merge_elastic_rollout_requests,
 )
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.workers.elastic_rollout_lifecycle import (
+    DrainRequest,
+    ElasticRankState,
+    ElasticRankStatus,
+    ElasticRunOutcome,
+    ElasticRunResult,
+    ResidencyReceipt,
+    SafePointToken,
+    validate_elastic_state_transition,
+)
+
+
+class RolloutPeerPhase(str, Enum):
+    """Position of an elastic rollout peer between channel transactions."""
+
+    IDLE = "idle"
+    WAITING_FOR_ENV = "waiting_for_env"
+    PREDICTING = "predicting"
+    SENDING_RESULT = "sending_result"
+    PAUSE_READY = "pause_ready"
+    FINALIZING = "finalizing"
+    COMPLETED = "completed"
+
+
+@dataclass(slots=True)
+class RolloutPeerCursor:
+    """Persistent remaining-work cursor for one local elastic rollout shard."""
+
+    lifecycle_generation: int
+    policy_version: int
+    epoch_index: int
+    committed_chunk_count: int
+    expected_transition_id: RolloutTransitionIdentity
+    phase: RolloutPeerPhase
+
+    def __post_init__(self) -> None:
+        if (
+            self.lifecycle_generation
+            != self.expected_transition_id.lifecycle_generation
+        ):
+            raise ValueError("rollout cursor lifecycle does not match transition")
+        if self.policy_version < 0:
+            raise ValueError("rollout cursor policy_version must be non-negative")
+        if self.epoch_index < 0 or self.committed_chunk_count < 0:
+            raise ValueError("rollout cursor progress must be non-negative")
+        if not isinstance(self.phase, RolloutPeerPhase):
+            raise TypeError("rollout cursor phase must be a RolloutPeerPhase")
 
 
 class MultiStepRolloutWorker(Worker):
@@ -109,6 +163,15 @@ class MultiStepRolloutWorker(Worker):
             )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
+        self._elastic_cursor: RolloutPeerCursor | None = None
+        self._elastic_state = ElasticRankState.INACTIVE_COLD
+        self._elastic_expected_policy_version: int | None = None
+        self._elastic_drain_request: DrainRequest | None = None
+        self._elastic_safe_point_token: SafePointToken | None = None
+        self._elastic_failure: str | None = None
+        self._elastic_dagger_epoch_index: int | None = None
+        self._model_resident = False
+        self._cuda_graph_captured = False
         self.finished_episodes = None
 
         self.weight_syncer = None
@@ -180,10 +243,164 @@ class MultiStepRolloutWorker(Worker):
                 train_batch_size=self.per_node_train_batch_size,
                 eval_batch_size=self.per_node_eval_batch_size,
             )
+            self._cuda_graph_captured = True
 
         self.setup_sample_params()
         if self.enable_offload:
             self.offload_model()
+        else:
+            self._model_resident = True
+
+    def _elastic_status(self) -> ElasticRankStatus:
+        cursor = self._elastic_cursor
+        return ElasticRankStatus(
+            state=self._elastic_state,
+            worker_rank=self._rank,
+            lifecycle_generation=(
+                cursor.lifecycle_generation if cursor is not None else None
+            ),
+            policy_version=cursor.policy_version if cursor is not None else None,
+            expected_transition_id=(
+                cursor.expected_transition_id if cursor is not None else None
+            ),
+            drain_request_id=(
+                self._elastic_drain_request.request_id
+                if self._elastic_drain_request is not None
+                else None
+            ),
+            snapshot_ready=self._elastic_safe_point_token is not None,
+            model_resident=self._model_resident,
+            cuda_graph_captured=self._cuda_graph_captured,
+            failure=self._elastic_failure,
+        )
+
+    def get_elastic_status(self) -> ElasticRankStatus:
+        """Return the local elastic lifecycle status for this rollout rank."""
+
+        return self._elastic_status()
+
+    def _validate_elastic_rollout_capability(self) -> None:
+        if not self.enable_train:
+            raise NotImplementedError("Elastic rollout requires training mode")
+        if self.num_pipeline_stages != 1:
+            raise NotImplementedError("Elastic rollout requires one pipeline stage")
+        if self.env_decoupled_mode:
+            raise NotImplementedError("Elastic rollout does not support decoupled mode")
+        if not self.enable_offload:
+            raise NotImplementedError("Elastic rollout requires rollout offload")
+        rollout_world_size = self.placement.get_world_size("rollout")
+        env_world_size = self.placement.get_world_size("env")
+        if rollout_world_size != env_world_size:
+            raise NotImplementedError(
+                "Elastic rollout requires equal rollout and environment world sizes"
+            )
+
+    def prepare_elastic_collection(
+        self,
+        *,
+        lifecycle_generation: int,
+        expected_policy_version: int,
+    ) -> ElasticRankStatus:
+        """Prepare this rank for a new local elastic collection lifecycle."""
+
+        self._validate_elastic_rollout_capability()
+        if not isinstance(lifecycle_generation, int) or isinstance(
+            lifecycle_generation, bool
+        ):
+            raise TypeError("lifecycle_generation must be an integer")
+        if lifecycle_generation <= 0:
+            raise ValueError("lifecycle_generation must be positive")
+        if not isinstance(expected_policy_version, int) or isinstance(
+            expected_policy_version, bool
+        ):
+            raise TypeError("expected_policy_version must be an integer")
+        if expected_policy_version < 0:
+            raise ValueError("expected_policy_version must be non-negative")
+        if self.version != expected_policy_version:
+            raise ValueError("applied rollout policy version does not match activation")
+        if self._elastic_state not in {
+            ElasticRankState.INACTIVE_COLD,
+            ElasticRankState.COMPLETED,
+        }:
+            raise RuntimeError(
+                f"Cannot prepare elastic collection from {self._elastic_state.value}"
+            )
+        if (
+            self._elastic_state is ElasticRankState.COMPLETED
+            and self._elastic_cursor is not None
+            and lifecycle_generation <= self._elastic_cursor.lifecycle_generation
+        ):
+            raise ValueError("A completed worker requires a newer lifecycle generation")
+
+        validate_elastic_state_transition(
+            self._elastic_state, ElasticRankState.EXPANDING
+        )
+        self._elastic_state = ElasticRankState.EXPANDING
+        self._elastic_expected_policy_version = expected_policy_version
+        self._elastic_drain_request = None
+        self._elastic_safe_point_token = None
+        self._elastic_failure = None
+        self._elastic_dagger_epoch_index = None
+        self._elastic_cursor = RolloutPeerCursor(
+            lifecycle_generation=lifecycle_generation,
+            policy_version=expected_policy_version,
+            epoch_index=0,
+            committed_chunk_count=0,
+            expected_transition_id=RolloutTransitionIdentity(
+                lifecycle_generation=lifecycle_generation,
+                env_worker_rank=self._rank,
+                stage_id=0,
+                sequence=0,
+            ),
+            phase=RolloutPeerPhase.IDLE,
+        )
+        try:
+            if not self._model_resident:
+                self.reload_model()
+        except Exception as exc:
+            self._record_elastic_failure(exc)
+            raise
+        return self._elastic_status()
+
+    async def request_elastic_drain(self, request: DrainRequest) -> ElasticRankStatus:
+        """Record drain intent without interrupting an in-flight prediction."""
+
+        if not isinstance(request, DrainRequest):
+            raise TypeError("request must be a DrainRequest")
+        cursor = self._elastic_cursor
+        if cursor is None:
+            raise RuntimeError("Elastic rollout cursor is not initialized")
+        if request.worker_rank != self._rank:
+            raise ValueError("Drain request worker rank does not match rollout rank")
+        if request.lifecycle_generation != cursor.lifecycle_generation:
+            raise ValueError("Drain request lifecycle does not match active rollout")
+        if request.expected_policy_version != cursor.policy_version:
+            raise ValueError(
+                "Drain request policy version does not match active rollout"
+            )
+        if self._elastic_drain_request is not None:
+            if self._elastic_drain_request == request:
+                return self._elastic_status()
+            raise RuntimeError("A different elastic drain request is already pending")
+        if self._elastic_state is not ElasticRankState.ACTIVE:
+            raise RuntimeError(
+                f"Cannot request elastic drain from {self._elastic_state.value}"
+            )
+        validate_elastic_state_transition(
+            self._elastic_state, ElasticRankState.DRAIN_REQUESTED
+        )
+        self._elastic_drain_request = request
+        self._elastic_state = ElasticRankState.DRAIN_REQUESTED
+        return self._elastic_status()
+
+    def _record_elastic_failure(self, exc: BaseException) -> None:
+        self._elastic_failure = f"{type(exc).__name__}: {exc}"
+        if self._elastic_state is ElasticRankState.FAILED_RESIDENT:
+            return
+        validate_elastic_state_transition(
+            self._elastic_state, ElasticRankState.FAILED_RESIDENT
+        )
+        self._elastic_state = ElasticRankState.FAILED_RESIDENT
 
     def setup_sample_params(self):
         # sampling parameters for rollout
@@ -582,6 +799,8 @@ class MultiStepRolloutWorker(Worker):
     async def sync_model_from_actor(self):
         """Sync model parameters from the actor worker."""
 
+        self._assert_elastic_model_mutation_allowed("weight synchronization")
+
         async def recv_func() -> Any:
             return await self.broadcast(
                 None,
@@ -626,6 +845,324 @@ class MultiStepRolloutWorker(Worker):
         gc.collect()
         self.torch_platform.empty_cache()
 
+    def _assert_elastic_model_mutation_allowed(self, operation: str) -> None:
+        if self._elastic_state not in {
+            ElasticRankState.INACTIVE_COLD,
+            ElasticRankState.COMPLETED,
+        }:
+            raise RuntimeError(
+                f"Cannot perform {operation} while elastic rank is "
+                f"{self._elastic_state.value}"
+            )
+
+    def _validate_elastic_request(self, request: ElasticRolloutRequest) -> None:
+        cursor = self._elastic_cursor
+        if cursor is None:
+            raise RuntimeError("Elastic rollout cursor is not initialized")
+        if request.transition_id != cursor.expected_transition_id:
+            raise ValueError(
+                "Elastic rollout request does not match the expected transition"
+            )
+        if self.version != cursor.policy_version:
+            raise ValueError("Applied rollout policy version changed during collection")
+
+    def _build_train_rollout_result(
+        self,
+        env_output: dict[str, Any],
+        *,
+        final_bootstrap: bool,
+        transition_id: RolloutTransitionIdentity | None = None,
+    ) -> RolloutResult:
+        actions, result = self._predict_rollout_actions(
+            env_output["obs"],
+            final_obs=env_output.get("final_obs"),
+            rlt_switch_flags=env_output.get("rlt_switch_flags"),
+        )
+        if final_bootstrap:
+            return RolloutResult(
+                actions=actions,
+                prev_values=(
+                    result["prev_values"] if self.collect_prev_infos else None
+                ),
+                bootstrap_values=self.get_bootstrap_values(env_output.get("final_obs")),
+                forward_inputs=result["forward_inputs"],
+                transition_id=transition_id,
+            )
+
+        save_flags = None
+        if result.get("expert_label_flag", False):
+            save_flags = torch.full(
+                (actions.shape[0], self.model_cfg.num_action_chunks),
+                True,
+                dtype=torch.bool,
+                device=actions.device,
+            )
+        return RolloutResult(
+            actions=actions,
+            prev_logprobs=(
+                result["prev_logprobs"] if self.collect_prev_infos else None
+            ),
+            prev_values=result["prev_values"] if self.collect_prev_infos else None,
+            bootstrap_values=self.get_bootstrap_values(env_output.get("final_obs")),
+            save_flags=save_flags,
+            forward_inputs=result["forward_inputs"],
+            versions=torch.full_like(
+                result["prev_logprobs"],
+                float(self.version),
+                dtype=torch.float32,
+            ),
+            transition_id=transition_id,
+        )
+
+    def _advance_elastic_cursor(self, *, final_bootstrap: bool) -> None:
+        cursor = self._elastic_cursor
+        if cursor is None:
+            raise RuntimeError("Elastic rollout cursor is not initialized")
+        identity = cursor.expected_transition_id
+        cursor.expected_transition_id = RolloutTransitionIdentity(
+            lifecycle_generation=identity.lifecycle_generation,
+            env_worker_rank=identity.env_worker_rank,
+            stage_id=identity.stage_id,
+            sequence=identity.sequence + 1,
+        )
+        if final_bootstrap:
+            cursor.epoch_index += 1
+            cursor.committed_chunk_count = 0
+        else:
+            cursor.committed_chunk_count += 1
+        cursor.phase = RolloutPeerPhase.WAITING_FOR_ENV
+
+    async def generate_until_pause_or_complete(
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+    ) -> ElasticRunResult:
+        """Run identified rollout transactions until a barrier or completion."""
+
+        cursor = self._elastic_cursor
+        if cursor is None:
+            raise RuntimeError("Call prepare_elastic_collection before generation")
+        if self._elastic_state is ElasticRankState.EXPANDING:
+            if not self._model_resident:
+                raise RuntimeError("Rollout model is not resident after expansion")
+            validate_elastic_state_transition(
+                self._elastic_state, ElasticRankState.ACTIVE
+            )
+            self._elastic_state = ElasticRankState.ACTIVE
+        elif self._elastic_state not in {
+            ElasticRankState.ACTIVE,
+            ElasticRankState.DRAIN_REQUESTED,
+        }:
+            raise RuntimeError(
+                f"Cannot generate elastically from {self._elastic_state.value}"
+            )
+
+        cursor.phase = RolloutPeerPhase.WAITING_FOR_ENV
+        try:
+            while cursor.epoch_index < self.rollout_epoch:
+                request = await self.recv_from(
+                    group_name=self.cfg.env.group_name,
+                    channel=input_channel,
+                    tag="train_rollout_results",
+                    route_key=0,
+                    async_op=True,
+                    batch_size=self.train_batch_size,
+                    merge_fn=merge_elastic_rollout_requests,
+                    infer_batch_size_fn=infer_elastic_rollout_request_batch_size,
+                ).async_wait()
+                if not isinstance(request, ElasticRolloutRequest):
+                    raise TypeError("Elastic rollout received an invalid request type")
+                self._validate_elastic_request(request)
+
+                if request.kind is ElasticRolloutRequestKind.DRAIN_BARRIER:
+                    drain_request = self._elastic_drain_request
+                    if drain_request is None:
+                        raise ValueError("Drain barrier has no matching local request")
+                    if request.drain_request_id != drain_request.request_id:
+                        raise ValueError("Drain barrier request ID does not match")
+                    if self._elastic_state is not ElasticRankState.DRAIN_REQUESTED:
+                        raise RuntimeError("Drain barrier arrived outside drain state")
+                    token = SafePointToken(
+                        request_id=drain_request.request_id,
+                        worker_rank=self._rank,
+                        lifecycle_generation=cursor.lifecycle_generation,
+                        policy_version=cursor.policy_version,
+                        next_transition_id=cursor.expected_transition_id,
+                    )
+                    validate_elastic_state_transition(
+                        self._elastic_state, ElasticRankState.SNAPSHOTTING
+                    )
+                    self._elastic_safe_point_token = token
+                    self._elastic_state = ElasticRankState.SNAPSHOTTING
+                    cursor.phase = RolloutPeerPhase.PAUSE_READY
+                    return ElasticRunResult(
+                        outcome=ElasticRunOutcome.PAUSE_READY,
+                        token=token,
+                        metrics=None,
+                    )
+
+                if self._elastic_dagger_epoch_index != cursor.epoch_index:
+                    self.update_dagger_beta()
+                    self._elastic_dagger_epoch_index = cursor.epoch_index
+                final_bootstrap = (
+                    cursor.committed_chunk_count == self.n_train_chunk_steps
+                )
+                cursor.phase = (
+                    RolloutPeerPhase.FINALIZING
+                    if final_bootstrap
+                    else RolloutPeerPhase.PREDICTING
+                )
+                if request.env_output is None:
+                    raise ValueError("Observation request is missing env_output")
+                rollout_result = self._build_train_rollout_result(
+                    request.env_output,
+                    final_bootstrap=final_bootstrap,
+                    transition_id=request.transition_id,
+                )
+                cursor.phase = RolloutPeerPhase.SENDING_RESULT
+                await self.send_to(
+                    group_name=self.cfg.env.group_name,
+                    channel=output_channel,
+                    data=rollout_result,
+                    tag="train_rollout_results",
+                    route_key=0,
+                    async_op=True,
+                    batch_size=self.train_batch_size,
+                    split_fn=self._split_rollout_result,
+                ).async_wait()
+                self._advance_elastic_cursor(final_bootstrap=final_bootstrap)
+                await asyncio.sleep(0)
+
+            cursor.phase = RolloutPeerPhase.COMPLETED
+            validate_elastic_state_transition(
+                self._elastic_state, ElasticRankState.COMPLETED
+            )
+            self._elastic_state = ElasticRankState.COMPLETED
+            return ElasticRunResult(
+                outcome=ElasticRunOutcome.COMPLETED,
+                token=None,
+                metrics=None,
+            )
+        except Exception as exc:
+            self._record_elastic_failure(exc)
+            raise
+
+    def _owned_rollout_models(self) -> tuple[Any, ...]:
+        return tuple(
+            model
+            for model in (self.hf_model, self.expert_model, self.rlt_feature_model)
+            if model is not None
+        )
+
+    def _verify_rollout_model_residency(self, *, resident: bool) -> None:
+        tensor_count = 0
+        for model in self._owned_rollout_models():
+            for tensors in (model.parameters(), model.buffers()):
+                for tensor in tensors:
+                    tensor_count += 1
+                    if resident and tensor.device.type == "cpu":
+                        raise RuntimeError(
+                            "Rollout model tensor remained on CPU after onload"
+                        )
+                    if not resident and tensor.device.type != "cpu":
+                        raise RuntimeError(
+                            "Rollout model tensor remained on device after offload"
+                        )
+            verify_hook = getattr(model, "verify_elastic_residency", None)
+            if verify_hook is not None:
+                verify_hook(resident=resident)
+        if not self._owned_rollout_models():
+            raise RuntimeError("Rollout worker has no model to verify")
+        if tensor_count == 0 and not all(
+            hasattr(model, "verify_elastic_residency")
+            for model in self._owned_rollout_models()
+        ):
+            raise RuntimeError("Cannot verify rollout model residency")
+
+    def offload_elastic_rollout(self, token: SafePointToken) -> ResidencyReceipt:
+        """Offload and verify every model owned by a drained rollout rank."""
+
+        if not isinstance(token, SafePointToken):
+            raise TypeError("token must be a SafePointToken")
+        if self._elastic_state is ElasticRankState.PAUSED:
+            if token != self._elastic_safe_point_token:
+                raise ValueError("Pause token does not match the stored safe point")
+            return ResidencyReceipt(
+                token=token,
+                state=ElasticRankState.PAUSED,
+                model_resident=False,
+                cuda_graph_captured=False,
+            )
+        if self._elastic_state is not ElasticRankState.SNAPSHOTTING:
+            raise RuntimeError(
+                f"Cannot offload elastic rollout from {self._elastic_state.value}"
+            )
+        cursor = self._elastic_cursor
+        if cursor is None or cursor.phase is not RolloutPeerPhase.PAUSE_READY:
+            raise RuntimeError("Rollout peer has not closed channel traffic")
+        if token != self._elastic_safe_point_token:
+            raise ValueError("Pause token does not match the stored safe point")
+        if token.next_transition_id != cursor.expected_transition_id:
+            raise ValueError("Pause token transition does not match rollout cursor")
+
+        try:
+            self.offload_model()
+            self._verify_rollout_model_residency(resident=False)
+            self.torch_platform.synchronize()
+            self.torch_platform.empty_cache()
+            validate_elastic_state_transition(
+                self._elastic_state, ElasticRankState.PAUSED
+            )
+            self._elastic_state = ElasticRankState.PAUSED
+            return ResidencyReceipt(
+                token=token,
+                state=ElasticRankState.PAUSED,
+                model_resident=False,
+                cuda_graph_captured=False,
+            )
+        except Exception as exc:
+            self._record_elastic_failure(exc)
+            raise
+
+    def prepare_elastic_resume(self, token: SafePointToken) -> ResidencyReceipt:
+        """Onload a paused rollout peer without consuming its next observation."""
+
+        if not isinstance(token, SafePointToken):
+            raise TypeError("token must be a SafePointToken")
+        if self._elastic_state is not ElasticRankState.PAUSED:
+            raise RuntimeError(
+                f"Cannot resume elastic rollout from {self._elastic_state.value}"
+            )
+        cursor = self._elastic_cursor
+        if cursor is None:
+            raise RuntimeError("Elastic rollout cursor is not initialized")
+        if token != self._elastic_safe_point_token:
+            raise ValueError("Resume token does not match the stored safe point")
+        if token.next_transition_id != cursor.expected_transition_id:
+            raise ValueError("Resume token transition does not match rollout cursor")
+        if self.version != token.policy_version:
+            raise ValueError("Applied rollout policy version changed while paused")
+
+        validate_elastic_state_transition(
+            self._elastic_state, ElasticRankState.EXPANDING
+        )
+        self._elastic_state = ElasticRankState.EXPANDING
+        try:
+            self.reload_model()
+            self._verify_rollout_model_residency(resident=True)
+            receipt = ResidencyReceipt(
+                token=token,
+                state=ElasticRankState.EXPANDING,
+                model_resident=True,
+                cuda_graph_captured=self._cuda_graph_captured,
+            )
+            self._elastic_drain_request = None
+            self._elastic_safe_point_token = None
+            return receipt
+        except Exception as exc:
+            self._record_elastic_failure(exc)
+            raise
+
     @Worker.timer("generate_one_epoch")
     async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
         self.update_dagger_beta()
@@ -641,38 +1178,9 @@ class MultiStepRolloutWorker(Worker):
                     merge_fn=self._merge_obs_batches,
                     infer_batch_size_fn=self._infer_env_batch_size,
                 ).async_wait()
-                actions, result = self._predict_rollout_actions(
-                    env_output["obs"],
-                    final_obs=env_output.get("final_obs", None),
-                    rlt_switch_flags=env_output.get("rlt_switch_flags", None),
-                )
-
-                save_flags = None
-                if result.get("expert_label_flag", False):
-                    save_flags = torch.full(
-                        (actions.shape[0], self.model_cfg.num_action_chunks),
-                        True,
-                        dtype=torch.bool,
-                        device=actions.device,
-                    )
-                rollout_result = RolloutResult(
-                    actions=actions,
-                    prev_logprobs=result["prev_logprobs"]
-                    if self.collect_prev_infos
-                    else None,
-                    prev_values=result["prev_values"]
-                    if self.collect_prev_infos
-                    else None,
-                    bootstrap_values=self.get_bootstrap_values(
-                        env_output.get("final_obs", None)
-                    ),
-                    save_flags=save_flags,
-                    forward_inputs=result["forward_inputs"],
-                    versions=torch.full_like(
-                        result["prev_logprobs"],
-                        float(self.version),
-                        dtype=torch.float32,
-                    ),
+                rollout_result = self._build_train_rollout_result(
+                    env_output,
+                    final_bootstrap=False,
                 )
                 self.send_to(
                     group_name=self.cfg.env.group_name,
@@ -695,19 +1203,9 @@ class MultiStepRolloutWorker(Worker):
                 merge_fn=self._merge_obs_batches,
                 infer_batch_size_fn=self._infer_env_batch_size,
             ).async_wait()
-            actions, result = self._predict_rollout_actions(
-                env_output["obs"],
-                final_obs=env_output.get("final_obs", None),
-                rlt_switch_flags=env_output.get("rlt_switch_flags", None),
-            )
-
-            rollout_result = RolloutResult(
-                actions=actions,
-                prev_values=result["prev_values"] if self.collect_prev_infos else None,
-                bootstrap_values=self.get_bootstrap_values(
-                    env_output.get("final_obs", None)
-                ),
-                forward_inputs=result["forward_inputs"],
+            rollout_result = self._build_train_rollout_result(
+                env_output,
+                final_bootstrap=True,
             )
             self.send_to(
                 group_name=self.cfg.env.group_name,
@@ -726,6 +1224,7 @@ class MultiStepRolloutWorker(Worker):
         input_channel: Channel,
         output_channel: Channel,
     ):
+        self._assert_elastic_model_mutation_allowed("legacy generation")
         if self.enable_offload:
             self.reload_model()
 
@@ -740,6 +1239,7 @@ class MultiStepRolloutWorker(Worker):
             self.offload_model()
 
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
+        self._assert_elastic_model_mutation_allowed("evaluation")
         if self.enable_offload:
             self.reload_model()
         if self.env_decoupled_mode:
@@ -814,13 +1314,19 @@ class MultiStepRolloutWorker(Worker):
     def offload_model(self):
         if self.enable_cuda_graph:
             self.hf_model.release_cuda_graph()
+            self._cuda_graph_captured = False
         self.hf_model.to("cpu")
+        if self.expert_model is not None:
+            self.expert_model.to("cpu")
         if self.rlt_feature_model is not None:
             self.rlt_feature_model.to("cpu")
+        self._model_resident = False
         self.torch_platform.empty_cache()
 
     def reload_model(self):
         self.hf_model.to(self.device)
+        if self.expert_model is not None:
+            self.expert_model.to(self.device)
         if self.rlt_feature_model is not None:
             self.rlt_feature_model.to(self.device)
         if self.enable_cuda_graph:
@@ -828,6 +1334,8 @@ class MultiStepRolloutWorker(Worker):
                 train_batch_size=self.per_node_train_batch_size,
                 eval_batch_size=self.per_node_eval_batch_size,
             )
+            self._cuda_graph_captured = True
+        self._model_resident = True
 
     @staticmethod
     def _infer_env_batch_size(obs_batch: dict[str, Any]) -> int:
@@ -938,10 +1446,12 @@ class MultiStepRolloutWorker(Worker):
                 save_flags=split_save_flags[idx],
                 forward_inputs=split_forward_inputs[idx],
                 versions=split_versions[idx],
+                transition_id=rollout_result.transition_id,
             )
             for idx in range(len(sizes))
         ]
 
     def set_global_step(self, global_step: int):
+        self._assert_elastic_model_mutation_allowed("global-step mutation")
         if hasattr(self.hf_model, "set_global_step"):
             self.hf_model.set_global_step(global_step)

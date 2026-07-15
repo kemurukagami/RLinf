@@ -18,7 +18,7 @@ This document uses the shared project task list:
 | --- | --- | --- |
 | T0 | Fixed allocation foundation | Completed |
 | T1 | Versioned continuation state | Pending |
-| T2 | Local safe-point lifecycle | Pending |
+| T2 | Local safe-point lifecycle | Completed (MVP) |
 | T3 | Composite bundle scheduling | Pending |
 | T4 | Elastic progress and release | Pending |
 | T5 | RLinf resize coordinator | Pending |
@@ -216,10 +216,36 @@ Exit condition:
 
 ### T2: Local safe-point lifecycle
 
+Detailed edit-level design and test plan:
+`TASK_2_LOCAL_SAFE_POINT_LIFECYCLE_IMPLEMENTATION_PLAN.md`.
+
 Purpose:
 
 - Prove selected-rank pause/resume without involving scheduler decisions.
 - Make channel and trajectory delivery exactly once.
+
+Status: MVP implementation complete as of 2026-07-15. Implemented foundation work includes
+structured transition identity, strict identity merges, worker snapshot schema
+version 2, a collision-free routed observation/barrier envelope with logical
+batch size, split/merge/inference helpers, validated lifecycle operations and
+receipts, result identity split preservation, and the persistent rollout peer
+cursor. The rollout worker now implements lifecycle activation/status/drain,
+cursor-driven identified generation, awaited sends, final-bootstrap progress,
+barrier/token handling, fail-closed validation, complete owned-model
+offload/onload, and resume preparation. EnvWorker now supplies the matching
+activation/status/drain APIs, identified shared interaction branch,
+post-commit barrier and snapshot, public residency verification, environment
+offload/onload, and resume preparation. A paired in-memory routed test proves
+matching tokens, empty pause queues, verified peer offload/onload, one retained
+transition dispatch, and completion. The current suite passes (`98 passed`) and covers
+core snapshot/offload/onload/restore failures, partial paired offload failure,
+new-lifecycle reuse, late-drain ordering, selective two-rank pause/resume with
+an unaffected completing sibling, the complete functional drain-timing matrix,
+deterministic transition/trajectory ordering equivalence, and richer Wan
+world-state/metric equivalence. Further shared-loop cleanup and specialized
+CUDA-graph/cache-residency failure injection are deferred as non-MVP hardening.
+Full two-pipeline Wan/OpenSora GPU reuse remains T8 acceptance. T2 is not
+connected to RLix.
 
 Files and edits:
 
@@ -238,8 +264,18 @@ INACTIVE_COLD -> EXPANDING -> ACTIVE
 ACTIVE -> DRAIN_REQUESTED -> SNAPSHOTTING -> PAUSED
 PAUSED -> EXPANDING -> ACTIVE
 ACTIVE -> COMPLETED
-unsafe failure -> FAILED_RESIDENT
+COMPLETED -> EXPANDING -> ACTIVE       # strictly newer lifecycle only
+ACTIVE | DRAIN_REQUESTED | SNAPSHOTTING | EXPANDING -> FAILED_RESIDENT
 ```
+
+`RolloutTransitionIdentity` and the collision-free
+`ElasticRolloutRequest` channel envelope belong to
+`rlinf/data/embodied_io_struct.py`. Observation and barrier traffic uses
+`Worker.send_to()`/`recv_from()` rather than direct queue addressing. The
+envelope includes a logical batch size so routed receive validation also works
+for a barrier with no observation body, and all returned route work is awaited.
+Supported environments and rollout models expose public residency verification
+rather than relying on private offload flags.
 
 Legacy pseudocode:
 

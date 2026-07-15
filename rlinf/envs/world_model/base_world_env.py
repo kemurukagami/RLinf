@@ -191,6 +191,54 @@ class BaseWorldEnv(ABC):
     def _clear_accelerator_cache() -> None:
         Worker.torch_platform.empty_cache()
 
+    def _elastic_residency_modules(self) -> tuple[Any, ...]:
+        """Return model modules whose device residency this environment owns."""
+
+        return ()
+
+    def verify_elastic_residency(self, *, resident: bool) -> None:
+        """Verify model residency and CPU safety for elastic pause/resume."""
+
+        if not hasattr(self, "_is_offloaded"):
+            raise NotImplementedError(
+                "world environment does not expose an offload residency state"
+            )
+        if bool(self._is_offloaded) == resident:
+            raise RuntimeError("world environment offload state does not match receipt")
+        modules = self._elastic_residency_modules()
+        if not modules:
+            raise NotImplementedError(
+                "world environment does not declare elastic residency modules"
+            )
+        tensor_count = 0
+        for module in modules:
+            for tensors in (module.parameters(), module.buffers()):
+                for tensor in tensors:
+                    tensor_count += 1
+                    if resident and tensor.device.type == "cpu":
+                        raise RuntimeError(
+                            "world-environment model remained on CPU after onload"
+                        )
+                    if not resident and tensor.device.type != "cpu":
+                        raise RuntimeError(
+                            "world-environment model remained on device after offload"
+                        )
+        if tensor_count == 0:
+            raise RuntimeError("world-environment residency has no tensors to verify")
+        if not resident:
+            self.assert_cpu_only(
+                (
+                    getattr(self, "current_obs", None),
+                    getattr(self, "image_queue", None),
+                    getattr(self, "condition_action", None),
+                    self.prev_step_reward,
+                    self.reset_state_ids,
+                    getattr(self, "success_once", None),
+                    getattr(self, "returns", None),
+                ),
+                "world_environment_continuation",
+            )
+
     def _environment_type(self) -> str:
         return type(self).__name__
 

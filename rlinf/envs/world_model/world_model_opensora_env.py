@@ -185,12 +185,13 @@ class OpenSoraEnv(BaseWorldEnv):
             raise ValueError("OpenSora current_obs must have 6 dimensions")
         if tuple(current_obs.shape[:3]) != (self.num_envs, 3, 1):
             raise ValueError(
-                "OpenSora current_obs must start with shape "
-                f"({self.num_envs}, 3, 1)"
+                f"OpenSora current_obs must start with shape ({self.num_envs}, 3, 1)"
             )
         time = current_obs.shape[3]
-        if not self.condition_frame_length <= time <= (
-            self.condition_frame_length + 2 * self.chunk
+        if (
+            not self.condition_frame_length
+            <= time
+            <= (self.condition_frame_length + 2 * self.chunk)
         ):
             raise ValueError("OpenSora current_obs time dimension is out of bounds")
         if tuple(current_obs.shape[-2:]) != self.image_size:
@@ -210,9 +211,7 @@ class OpenSoraEnv(BaseWorldEnv):
                 if not isinstance(frame, torch.Tensor):
                     raise TypeError(f"{path} must be a torch.Tensor")
                 if frame.dtype != self.inference_dtype:
-                    raise ValueError(
-                        f"{path} must have dtype {self.inference_dtype}"
-                    )
+                    raise ValueError(f"{path} must have dtype {self.inference_dtype}")
                 if frame.ndim != 5 or frame.shape[0] != 1 or frame.shape[2] != 1:
                     raise ValueError(f"{path} must have shape [1, C, 1, H, W]")
                 frame_shape = tuple(frame.shape)
@@ -303,6 +302,9 @@ class OpenSoraEnv(BaseWorldEnv):
             )
         self._clear_accelerator_cache()
         self._is_offloaded = True
+
+    def _elastic_residency_modules(self) -> tuple[object, ...]:
+        return (self.vae, self.model, self.reward_model)
 
     def onload(self):
         """Move models and runtime tensors back to execution device."""

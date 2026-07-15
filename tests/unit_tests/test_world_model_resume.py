@@ -15,6 +15,7 @@ from rlinf.data.embodied_io_struct import (
     ChunkStepResult,
     EmbodiedRolloutResult,
     EnvOutput,
+    RolloutTransitionIdentity,
 )
 from rlinf.envs.world_model.base_world_env import (
     WORLD_ENV_RESUME_SCHEMA_VERSION,
@@ -235,18 +236,14 @@ def _load_opensora_env_class(monkeypatch):
     monkeypatch.setitem(sys.modules, "opensora", opensora)
     monkeypatch.setitem(sys.modules, "opensora.registry", registry)
     monkeypatch.setitem(sys.modules, "opensora.utils", utils)
-    monkeypatch.setitem(
-        sys.modules, "opensora.utils.inference_utils", inference_utils
-    )
+    monkeypatch.setitem(sys.modules, "opensora.utils.inference_utils", inference_utils)
     monkeypatch.setitem(sys.modules, "opensora.utils.misc", misc)
     monkeypatch.setitem(sys.modules, "rlinf.data.datasets", datasets)
     monkeypatch.setitem(
         sys.modules, "rlinf.data.datasets.world_model", world_model_dataset
     )
 
-    module = importlib.import_module(
-        "rlinf.envs.world_model.world_model_opensora_env"
-    )
+    module = importlib.import_module("rlinf.envs.world_model.world_model_opensora_env")
     return module.OpenSoraEnv
 
 
@@ -282,9 +279,9 @@ def _make_opensora_env(monkeypatch):
     env._diffusion_generator = env._new_diffusion_generator()
     env.reset_state_ids = torch.tensor([2, 3], dtype=torch.int64)
     env.episode_generations = torch.tensor([4, 5], dtype=torch.int64)
-    env.current_obs = torch.arange(
-        2 * 3 * 1 * 5 * 4 * 5, dtype=torch.float32
-    ).reshape(2, 3, 1, 5, 4, 5)
+    env.current_obs = torch.arange(2 * 3 * 1 * 5 * 4 * 5, dtype=torch.float32).reshape(
+        2, 3, 1, 5, 4, 5
+    )
     env.image_queue = [
         deque(
             [
@@ -440,9 +437,7 @@ def _load_wan_env_class(monkeypatch):
     monkeypatch.setitem(sys.modules, "diffsynth.models", models)
     monkeypatch.setitem(sys.modules, "diffsynth.models.reward_model", reward_model)
     monkeypatch.setitem(sys.modules, "diffsynth.pipelines", pipelines)
-    monkeypatch.setitem(
-        sys.modules, "diffsynth.pipelines.wan_video_new", wan_pipeline
-    )
+    monkeypatch.setitem(sys.modules, "diffsynth.pipelines.wan_video_new", wan_pipeline)
     monkeypatch.setitem(sys.modules, "rlinf.data.datasets", datasets)
     monkeypatch.setitem(
         sys.modules, "rlinf.data.datasets.world_model", world_model_dataset
@@ -528,9 +523,7 @@ def test_wan_round_trip_restores_queue_actions_and_seed(monkeypatch):
         ({"condition_action": None}, "condition_action must be a torch.Tensor"),
     ],
 )
-def test_wan_rejects_invalid_state_before_mutation(
-    monkeypatch, replacement, match
-):
+def test_wan_rejects_invalid_state_before_mutation(monkeypatch, replacement, match):
     env = _make_wan_env(monkeypatch)
     context = _opensora_context(env)
     state = env.snapshot_resume_state(context)
@@ -564,7 +557,9 @@ def test_wan_resumed_next_chunk_matches_queue_and_action_conditioning(monkeypatc
                 {
                     "seed": kwargs["seed"],
                     "action": kwargs["action"].clone(),
-                    "input_image": [np.asarray(image).copy() for image in kwargs["input_image"]],
+                    "input_image": [
+                        np.asarray(image).copy() for image in kwargs["input_image"]
+                    ],
                     "input_image4": [
                         [np.asarray(image).copy() for image in images]
                         for images in kwargs["input_image4"]
@@ -622,7 +617,9 @@ def test_wan_offload_onload_moves_actions_and_keeps_queue_on_cpu(monkeypatch):
     env.offload()
     env.offload()
     assert env.condition_action.device.type == "cpu"
-    assert all(frame.device.type == "cpu" for queue in env.image_queue for frame in queue)
+    assert all(
+        frame.device.type == "cpu" for queue in env.image_queue for frame in queue
+    )
 
     env.onload()
     env.onload()
@@ -730,6 +727,25 @@ def test_wan_worker_snapshot_owns_cpu_state_and_restores(monkeypatch):
     torch.testing.assert_close(
         target.env_list[0].condition_action, state.world_states[0].condition_action
     )
+
+
+def test_elastic_worker_snapshot_preserves_pending_transition_identity(monkeypatch):
+    worker = _make_wan_worker(monkeypatch)
+    identity = RolloutTransitionIdentity(
+        lifecycle_generation=2,
+        env_worker_rank=0,
+        stage_id=0,
+        sequence=1,
+    )
+    worker._current_env_outputs[0].transition_id = identity
+    worker._resume_bootstraps[0].transition_id = identity
+
+    state = worker.snapshot_rollout_stage()
+
+    assert state.current_env_outputs[0].transition_id == identity
+    assert state.resume_bootstraps[0].transition_id == identity
+    assert state.cursor.next_transition_ids[0] == identity.sequence
+    assert state.world_states[0].next_transition_id == identity.sequence
 
 
 def test_wan_worker_restore_rejects_policy_mismatch_before_mutation(monkeypatch):
@@ -843,11 +859,43 @@ def test_wan_worker_two_chunk_resume_matches_uninterrupted(monkeypatch):
         "versions",
     ):
         resumed_values = getattr(resumed.rollout_results[0], field_name)
-        uninterrupted_values = getattr(
-            uninterrupted.rollout_results[0], field_name
-        )
+        uninterrupted_values = getattr(uninterrupted.rollout_results[0], field_name)
         assert len(resumed_values) == len(uninterrupted_values)
         for resumed_value, uninterrupted_value in zip(
             resumed_values, uninterrupted_values
         ):
             torch.testing.assert_close(resumed_value, uninterrupted_value)
+    for field_name in (
+        "prev_step_reward",
+        "success_once",
+        "returns",
+        "episode_generations",
+        "reset_state_ids",
+    ):
+        torch.testing.assert_close(
+            getattr(resumed.env_list[0], field_name),
+            getattr(uninterrupted.env_list[0], field_name),
+        )
+    assert resumed.env_list[0].elapsed_steps == uninterrupted.env_list[0].elapsed_steps
+    assert resumed.env_list[0].is_start == uninterrupted.env_list[0].is_start
+    assert (
+        resumed.env_list[0].task_descriptions
+        == uninterrupted.env_list[0].task_descriptions
+    )
+    for resumed_obs, uninterrupted_obs in zip(
+        resumed.last_obs_list, uninterrupted.last_obs_list
+    ):
+        for key in ("main_images", "states"):
+            torch.testing.assert_close(resumed_obs[key], uninterrupted_obs[key])
+    for resumed_done, uninterrupted_done in zip(
+        resumed.train_prev_done, uninterrupted.train_prev_done
+    ):
+        torch.testing.assert_close(resumed_done, uninterrupted_done)
+    assert (
+        resumed._rollout_env_metrics.keys() == uninterrupted._rollout_env_metrics.keys()
+    )
+    for key in resumed._rollout_env_metrics:
+        for resumed_metric, uninterrupted_metric in zip(
+            resumed._rollout_env_metrics[key], uninterrupted._rollout_env_metrics[key]
+        ):
+            torch.testing.assert_close(resumed_metric, uninterrupted_metric)

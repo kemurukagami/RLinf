@@ -15,6 +15,7 @@
 import copy
 import uuid
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
@@ -30,6 +31,69 @@ from rlinf.utils.nested_dict_process import (
     split_dict_to_chunk,
     stack_list_of_dict_tensor,
 )
+
+
+@dataclass(frozen=True, slots=True, order=True)
+class RolloutTransitionIdentity:
+    """Uniquely identifies one environment-to-rollout channel transaction."""
+
+    lifecycle_generation: int
+    env_worker_rank: int
+    stage_id: int
+    sequence: int
+
+    def __post_init__(self) -> None:
+        fields = {
+            "lifecycle_generation": self.lifecycle_generation,
+            "env_worker_rank": self.env_worker_rank,
+            "stage_id": self.stage_id,
+            "sequence": self.sequence,
+        }
+        for name, value in fields.items():
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(
+                    f"{name} must be an integer, got {type(value).__name__}"
+                )
+        if self.lifecycle_generation <= 0:
+            raise ValueError("lifecycle_generation must be positive")
+        for name in ("env_worker_rank", "stage_id", "sequence"):
+            if fields[name] < 0:
+                raise ValueError(f"{name} must be non-negative")
+
+
+def merge_transition_identities(
+    identities: list[RolloutTransitionIdentity | None],
+) -> RolloutTransitionIdentity | None:
+    """Merge shard-level transition metadata without losing its identity."""
+
+    if not identities:
+        raise ValueError("At least one transition identity is required")
+    if all(identity is None for identity in identities):
+        return None
+    if any(identity is None for identity in identities):
+        raise ValueError("Cannot mix legacy and identified rollout payloads")
+
+    identity = identities[0]
+    if any(candidate != identity for candidate in identities[1:]):
+        raise ValueError("Cannot merge payloads from different rollout transitions")
+    return identity
+
+
+def infer_env_output_batch_size(env_output: dict[str, Any]) -> int:
+    """Infer the logical batch size of one serialized environment output."""
+
+    dones = env_output.get("dones")
+    if isinstance(dones, torch.Tensor):
+        return dones.shape[0]
+
+    obs = env_output["obs"]
+    for key in ("states", "main_images", "task_descriptions"):
+        value = obs.get(key)
+        if isinstance(value, torch.Tensor):
+            return value.shape[0]
+        if isinstance(value, list):
+            return len(value)
+    raise ValueError("Cannot infer batch size from environment output")
 
 
 def get_model_weights_id(versions: torch.Tensor) -> str:
@@ -62,8 +126,13 @@ class EnvOutput:
     intervene_actions: Optional[torch.Tensor] = None  # [B]
     intervene_flags: Optional[torch.Tensor] = None  # [B]
     rlt_switch_flags: Optional[torch.Tensor] = None  # [B] or [B, action_chunk]
+    transition_id: RolloutTransitionIdentity | None = None
 
     def __post_init__(self):
+        if self.transition_id is not None and not isinstance(
+            self.transition_id, RolloutTransitionIdentity
+        ):
+            raise TypeError("transition_id must be a RolloutTransitionIdentity or None")
         self.obs = put_tensor_device(self.obs, "cpu")
         self.final_obs = (
             put_tensor_device(self.final_obs, "cpu")
@@ -146,20 +215,6 @@ class EnvOutput:
             A merged env output dict produced via ``EnvOutput(...).to_dict()``.
         """
 
-        def _get_batch_size(env_output: dict[str, Any]) -> int:
-            dones = env_output.get("dones")
-            if isinstance(dones, torch.Tensor):
-                return dones.shape[0]
-
-            obs = env_output["obs"]
-            for key in ("states", "main_images", "task_descriptions"):
-                value = obs.get(key)
-                if isinstance(value, torch.Tensor):
-                    return value.shape[0]
-                if isinstance(value, list):
-                    return len(value)
-            raise ValueError("Cannot infer batch size from env output.")
-
         def _merge_obs_dicts(obs_dicts: list[dict[str, Any]]) -> dict[str, Any]:
             merged_obs = {}
             for key in obs_dicts[0].keys():
@@ -199,7 +254,7 @@ class EnvOutput:
                 filled_values = []
                 for env_output, value in zip(env_outputs, values):
                     if value is None:
-                        batch_size = _get_batch_size(env_output)
+                        batch_size = infer_env_output_batch_size(env_output)
                         fill_shape = (batch_size, *ref_tensor.shape[1:])
                         filled_values.append(
                             torch.full(
@@ -246,6 +301,9 @@ class EnvOutput:
             allow_partial_none=True,
             fill_value=False,
         )
+        merged_transition_id = merge_transition_identities(
+            [env_output.get("transition_id") for env_output in env_outputs]
+        )
         # turn to EnvOutput and turn to dict to call post init for tensor processing
         return EnvOutput(
             obs=merged_obs,
@@ -257,6 +315,7 @@ class EnvOutput:
             intervene_actions=merged_intervene_actions,
             intervene_flags=merged_intervene_flags,
             rlt_switch_flags=merged_rlt_switch_flags,
+            transition_id=merged_transition_id,
         ).to_dict()
 
     def to_dict(self) -> dict[str, Any]:
@@ -276,6 +335,7 @@ class EnvOutput:
         env_output_dict["intervene_actions"] = self.intervene_actions
         env_output_dict["intervene_flags"] = self.intervene_flags
         env_output_dict["rlt_switch_flags"] = self.rlt_switch_flags
+        env_output_dict["transition_id"] = self.transition_id
 
         return env_output_dict
 
@@ -292,8 +352,13 @@ class RolloutResult:
     save_flags: torch.Tensor = None  # [B, num_action_chunks]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
+    transition_id: RolloutTransitionIdentity | None = None
 
     def __post_init__(self):
+        if self.transition_id is not None and not isinstance(
+            self.transition_id, RolloutTransitionIdentity
+        ):
+            raise TypeError("transition_id must be a RolloutTransitionIdentity or None")
         if self.actions is not None:
             self.actions = self.actions.cpu().contiguous()
         if self.prev_logprobs is not None:
@@ -332,6 +397,9 @@ class RolloutResult:
         merged_bootstrap_values = _merge_optional_tensor("bootstrap_values")
         merged_save_flags = _merge_optional_tensor("save_flags")
         merged_versions = _merge_optional_tensor("versions")
+        merged_transition_id = merge_transition_identities(
+            [rollout_result.transition_id for rollout_result in rollout_results]
+        )
 
         forward_inputs_list = [
             rollout_result.forward_inputs for rollout_result in rollout_results
@@ -348,7 +416,142 @@ class RolloutResult:
             save_flags=merged_save_flags,
             forward_inputs=merged_forward_inputs,
             versions=merged_versions,
+            transition_id=merged_transition_id,
         )
+
+
+class ElasticRolloutRequestKind(str, Enum):
+    """Kind of elastic environment-to-rollout channel request."""
+
+    OBSERVATION = "observation"
+    DRAIN_BARRIER = "drain_barrier"
+
+
+@dataclass(kw_only=True, slots=True)
+class ElasticRolloutRequest:
+    """Elastic channel envelope for an observation or drain barrier."""
+
+    kind: ElasticRolloutRequestKind
+    transition_id: RolloutTransitionIdentity
+    logical_batch_size: int
+    env_output: dict[str, Any] | None
+    drain_request_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ElasticRolloutRequestKind):
+            raise TypeError("kind must be an ElasticRolloutRequestKind")
+        if not isinstance(self.transition_id, RolloutTransitionIdentity):
+            raise TypeError("transition_id must be a RolloutTransitionIdentity")
+        if not isinstance(self.logical_batch_size, int) or isinstance(
+            self.logical_batch_size, bool
+        ):
+            raise TypeError("logical_batch_size must be an integer")
+        if self.logical_batch_size <= 0:
+            raise ValueError("logical_batch_size must be positive")
+        if self.kind is ElasticRolloutRequestKind.OBSERVATION:
+            if self.env_output is None:
+                raise ValueError("An observation request must contain env_output")
+            if self.drain_request_id is not None:
+                raise ValueError(
+                    "An observation request cannot contain a drain_request_id"
+                )
+            payload_identity = self.env_output.get("transition_id")
+            if payload_identity != self.transition_id:
+                raise ValueError(
+                    "Observation envelope and environment output transition identities must match"
+                )
+            payload_batch_size = infer_env_output_batch_size(self.env_output)
+            if payload_batch_size != self.logical_batch_size:
+                raise ValueError(
+                    "Observation envelope logical batch size does not match env_output"
+                )
+        else:
+            if self.env_output is not None:
+                raise ValueError("A drain barrier cannot contain env_output")
+            if not self.drain_request_id:
+                raise ValueError("A drain barrier must contain a drain_request_id")
+
+
+def infer_elastic_rollout_request_batch_size(
+    request: ElasticRolloutRequest,
+) -> int:
+    """Return routed batch metadata for an elastic observation or barrier."""
+
+    if not isinstance(request, ElasticRolloutRequest):
+        raise TypeError("request must be an ElasticRolloutRequest")
+    return request.logical_batch_size
+
+
+def split_elastic_rollout_request(
+    request: ElasticRolloutRequest, split_sizes: list[int]
+) -> list[ElasticRolloutRequest]:
+    """Split an elastic observation request using RLinf route-plan sizes."""
+
+    if not split_sizes or any(size <= 0 for size in split_sizes):
+        raise ValueError("split_sizes must contain positive values")
+    if sum(split_sizes) != request.logical_batch_size:
+        raise ValueError("split sizes must sum to the request logical batch size")
+    if request.kind is ElasticRolloutRequestKind.DRAIN_BARRIER:
+        if len(split_sizes) != 1:
+            raise ValueError("Drain barriers require one-to-one elastic routing")
+        return [request]
+
+    assert request.env_output is not None
+    split_outputs = split_dict(request.env_output, split_sizes)
+    return [
+        ElasticRolloutRequest(
+            kind=ElasticRolloutRequestKind.OBSERVATION,
+            transition_id=request.transition_id,
+            logical_batch_size=size,
+            env_output=env_output,
+        )
+        for size, env_output in zip(split_sizes, split_outputs)
+    ]
+
+
+def merge_elastic_rollout_requests(
+    requests: list[ElasticRolloutRequest],
+) -> ElasticRolloutRequest:
+    """Merge elastic routed requests while preserving transaction metadata."""
+
+    if not requests:
+        raise ValueError("At least one rollout request is required")
+    if any(request.kind is not requests[0].kind for request in requests[1:]):
+        raise ValueError("Cannot merge observation requests with drain barriers")
+
+    transition_id = merge_transition_identities(
+        [request.transition_id for request in requests]
+    )
+    assert transition_id is not None
+    drain_request_ids = {request.drain_request_id for request in requests}
+    if len(drain_request_ids) != 1:
+        raise ValueError(
+            "Cannot merge rollout requests with different drain request IDs"
+        )
+
+    if requests[0].kind is ElasticRolloutRequestKind.DRAIN_BARRIER:
+        if len(requests) != 1:
+            raise ValueError("Drain barriers require one-to-one elastic routing")
+        return ElasticRolloutRequest(
+            kind=ElasticRolloutRequestKind.DRAIN_BARRIER,
+            transition_id=transition_id,
+            logical_batch_size=requests[0].logical_batch_size,
+            env_output=None,
+            drain_request_id=requests[0].drain_request_id,
+        )
+
+    return ElasticRolloutRequest(
+        kind=ElasticRolloutRequestKind.OBSERVATION,
+        transition_id=transition_id,
+        logical_batch_size=sum(request.logical_batch_size for request in requests),
+        env_output=EnvOutput.merge_env_outputs(
+            [
+                request.env_output
+                for request in requests
+                if request.env_output is not None
+            ]
+        ),
+    )
 
 
 @dataclass(kw_only=True)

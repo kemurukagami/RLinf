@@ -17,7 +17,7 @@ This document uses the shared project task list:
 | ID | Task | Status |
 | --- | --- | --- |
 | T0 | Fixed allocation foundation | Completed |
-| T1 | Versioned continuation state | Pending |
+| T1 | Versioned continuation state | Completed |
 | T2 | Local safe-point lifecycle | Completed (MVP) |
 | T3 | Composite bundle scheduling | Pending |
 | T4 | Elastic progress and release | Pending |
@@ -146,6 +146,13 @@ used as the normal supported rollout allocation.
 Detailed edit-level design and test plan:
 `TASK_1_ROLLOUT_SNAPSHOT_RESUME_IMPLEMENTATION_PLAN.md`.
 
+Status: complete for the scoped same-actor synchronous contract. CPU fake
+coverage validates the common, Wan, OpenSora, and EnvWorker continuation
+contracts. Real Wan/DiffSynth equivalence passed in disaggregated and
+collocated configurations on 2026-07-15. Real OpenSora accelerator equivalence
+remains pending and is accelerator evidence rather than a blocker to the T1
+software contract.
+
 Purpose:
 
 - Make world-model and partial rollout state sufficient for exact same-rank
@@ -224,7 +231,8 @@ Purpose:
 - Prove selected-rank pause/resume without involving scheduler decisions.
 - Make channel and trajectory delivery exactly once.
 
-Status: MVP implementation complete as of 2026-07-15. Implemented foundation work includes
+Status: MVP implementation complete as of 2026-07-15 and reverified on
+2026-07-16. Implemented foundation work includes
 structured transition identity, strict identity merges, worker snapshot schema
 version 2, a collision-free routed observation/barrier envelope with logical
 batch size, split/merge/inference helpers, validated lifecycle operations and
@@ -237,7 +245,8 @@ activation/status/drain APIs, identified shared interaction branch,
 post-commit barrier and snapshot, public residency verification, environment
 offload/onload, and resume preparation. A paired in-memory routed test proves
 matching tokens, empty pause queues, verified peer offload/onload, one retained
-transition dispatch, and completion. The current suite passes (`98 passed`) and covers
+transition dispatch, and completion. The current reproducible focused suite
+passes 91 tests and covers
 core snapshot/offload/onload/restore failures, partial paired offload failure,
 new-lifecycle reuse, late-drain ordering, selective two-rank pause/resume with
 an unaffected completing sibling, the complete functional drain-timing matrix,
@@ -304,6 +313,9 @@ Exit condition:
 - Offload failure produces `FAILED_RESIDENT`, never a successful pause.
 
 ### T3: Composite bundle scheduling
+
+Detailed edit-level design and test plan:
+`../TASK_3_COMPOSITE_BUNDLE_SCHEDULING_IMPLEMENTATION_PLAN.md`.
 
 Purpose:
 
@@ -603,9 +615,10 @@ default for supported Wan/OpenSora only after this task passes.
 
 ```text
 T0 completed
-T1 -> T2 -> T3 -> T4 -> T5 -> T6 -> T7 -> T8
+T1 completed
+T2 completed (MVP)
+T3 -> T4 -> T5 -> T6 -> T7 -> T8
 ```
 
-T1 and the framework-neutral parts of T3 may be developed independently, but
-no later task is complete until all earlier exit conditions it depends on are
-met.
+T3 is the next implementation task. No later task is complete until all
+earlier exit conditions it depends on are met.

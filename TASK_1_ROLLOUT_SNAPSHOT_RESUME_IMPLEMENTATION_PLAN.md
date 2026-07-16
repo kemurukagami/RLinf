@@ -51,10 +51,11 @@ The snapshot is held in CPU memory and can optionally be encoded as bytes for
 transport. Restoring it must produce the same next committed chunk and the same
 partial training trajectory as an uninterrupted execution.
 
-T1 provides the continuation primitives. It does not yet interrupt a running
-Ray call or release a scheduler allocation. T2 will call these primitives at a
-drained chunk boundary and will add rollout-worker lifecycle and channel
-transition enforcement.
+T1 provides the continuation primitives. It does not itself interrupt a
+running Ray call or release a scheduler allocation. The completed T2 MVP now
+calls these primitives at a drained chunk boundary and adds rollout-worker
+lifecycle and channel transition enforcement. Scheduler ownership transfer
+still requires T3-T5.
 
 The defining equivalence is:
 
@@ -123,7 +124,11 @@ only for same-actor pause/resume where the wrapper is not recreated or mutated
 while paused. Otherwise it must be rejected or given an explicit wrapper state
 contract.
 
-## 4. Existing implementation and concrete gaps
+## 4. Baseline gaps addressed by T1
+
+This section records the pre-T1 implementation gaps that motivated the edits.
+The status checklist in section 1 and the verification evidence in section 15
+describe the current implementation.
 
 ### 4.1 `BaseWorldEnv`
 
@@ -261,8 +266,9 @@ worker remains resident with its old logical state and the error propagates.
 
 T1 guarantees that restore leaves one pending bootstrap associated with one
 next transition ID. The worker state machine can consume that pending value
-only once. T2 will extend `EnvOutput` and `RolloutResult` with transition IDs so
-the channel peer can reject duplicate or stale traffic after failures.
+only once. The completed T2 MVP extends `EnvOutput` and `RolloutResult` with
+transition IDs so the channel peer rejects duplicate or stale traffic after
+failures.
 
 ## 6. Data model
 
@@ -993,7 +999,7 @@ Then verify:
 Run existing tests most likely to cover affected contracts:
 
 ```bash
-/root/VLAMultipipeline/RLinf/.venv/bin/python -m pytest -q \
+/root/.venv/bin/python -m pytest -q \
   tests/unit_tests/test_world_model_resume.py \
   tests/unit_tests/test_maniskill_offload_env.py \
   tests/unit_tests/test_overlap_env_bootstrap.py \
@@ -1059,7 +1065,8 @@ implementation.
 `rlinf/data/embodied_io_struct.py`
 
 - not required for the initial T1 cursor-local transition identity;
-- expected in T2 for channel-visible transition IDs and merge/split support.
+- subsequently updated by T2 for channel-visible transition IDs and
+  merge/split support.
 
 ## 14. Suggested implementation sequence
 
@@ -1080,15 +1087,17 @@ be reviewed separately from the higher-risk worker-loop refactor.
 
 ## 15. Verification commands
 
-From `/root/VLAMultipipeline/RLinf`:
+From `/root/_VLAMP/RLinf`, using the shared workspace environment:
 
 ```bash
-/root/VLAMultipipeline/RLinf/.venv/bin/python -m pytest -q \
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+/root/.venv/bin/python -m pytest -q \
   tests/unit_tests/test_world_model_resume.py
 ```
 
 ```bash
-/root/VLAMultipipeline/RLinf/.venv/bin/python -m pytest -q \
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+/root/.venv/bin/python -m pytest -q \
   tests/unit_tests/test_world_model_resume.py \
   tests/unit_tests/test_maniskill_offload_env.py \
   tests/unit_tests/test_overlap_env_bootstrap.py \
@@ -1096,7 +1105,7 @@ From `/root/VLAMultipipeline/RLinf`:
 ```
 
 ```bash
-/root/VLAMultipipeline/RLinf/.venv/bin/ruff check \
+/root/.venv/bin/ruff check \
   rlinf/envs/world_model/base_world_env.py \
   rlinf/envs/world_model/world_model_opensora_env.py \
   rlinf/envs/world_model/world_model_wan_env.py \
@@ -1105,7 +1114,7 @@ From `/root/VLAMultipipeline/RLinf`:
 ```
 
 ```bash
-/root/VLAMultipipeline/RLinf/.venv/bin/python -m compileall -q \
+/root/.venv/bin/python -m compileall -q \
   rlinf/envs/world_model \
   rlinf/workers/env \
   tests/unit_tests/test_world_model_resume.py
@@ -1142,10 +1151,11 @@ checks passed for the new harness.
 
 This run validates real Wan T1 continuation and offload/restore behavior. It
 does not prove drain coordination, scheduler release, bundle reuse by a second
-pipeline, or resumed worker-channel ordering. Those remain T2-T8 work. Full T8
-GPU acceptance is still intentionally deferred, and OpenSora hardware
-equivalence remains pending because `/workspace/WM` contains no OpenSora
-checkpoint.
+pipeline, or scheduler-controlled resumed worker-channel ordering. Local drain
+and resumed channel ordering are now covered by T2; scheduler ownership and
+two-pipeline reuse remain T3-T8 work. Full T8 GPU acceptance is still
+intentionally deferred, and OpenSora hardware equivalence remains pending
+because `/workspace/WM` contains no OpenSora checkpoint.
 
 ### 15.2 Recorded collocated real-model result
 
@@ -1191,5 +1201,6 @@ T1 is complete only when all of the following are true:
 - Existing uninterrupted rollout, offload, bootstrap, and history tests pass.
 
 T1 completion does not claim that GPUs can yet be safely released. That claim
-requires T2 rollout-worker lifecycle, drain coordination, transition-bearing
-channel messages, and paired environment/rollout offload verification.
+now has the T2 local lifecycle prerequisite, but still requires T3 composite
+bundle accounting, T4 release semantics, and the T5 scheduler callback
+transaction before logical ownership can move safely.

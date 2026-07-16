@@ -69,8 +69,9 @@ Implementation progress:
   reward/return, reset, episode, and metric equivalence assertions.
 - Deferred from the T2 MVP: specialized CUDA-graph and cache-residency failure
   injection. Core snapshot/offload/onload/restore failures remain covered.
-- [x] Run the complete local T2 verification set after worker integration
-  (`98 passed`), plus Ruff, formatting, Python compilation, and diff checks.
+- [x] Run the complete local T2 verification set after worker integration.
+  The current reproducible focused regression command was re-run on
+  2026-07-16 and passed 91 tests, plus focused Ruff checks.
 
 Foundation status on 2026-07-15: the embodied data layer now defines the
 structured transition identity, collision-free elastic request envelope,
@@ -205,7 +206,12 @@ T2 adds gates for the paired lifecycle itself:
 Production validation of these conditions belongs to T6, but T2 worker APIs
 must still fail locally if called incorrectly.
 
-## 4. Existing implementation and concrete gaps
+## 4. Baseline implementation and gaps addressed by T2
+
+This section records the state inherited from T1 and the gaps that the T2 MVP
+was designed to close. It is retained as implementation rationale; it is not a
+list of currently open T2 work. Current status and explicit non-MVP deferrals
+are listed in section 1.
 
 ### 4.1 `EnvWorker`
 
@@ -219,7 +225,7 @@ T1 added:
 - `snapshot_rollout_stage()`, validation, and two-phase restore; and
 - resume-aware iteration from `BOOTSTRAP_PENDING`.
 
-The remaining T2 gaps are concrete:
+The concrete gaps addressed by T2 were:
 
 - `_run_interact_once()` calls `_send_pending_bootstrap()` immediately after
   `_set_pending_bootstrap()`;

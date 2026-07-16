@@ -1,0 +1,19 @@
+models:
+  vla:
+    checkpoint: /workspace/VLA/Openvla-oft-SFT-libero-spatial-traj1
+    device: cuda:0
+    precision: bf16
+    unnorm_key: libero_spatial_no_noops
+  world_model:
+    checkpoint: /workspace/WM/RLinf-Wan-LIBERO-Spatial
+    device: cuda:0
+    num_inference_steps: 1
+
+benchmark:
+  iterations: 300
+  warmup_iterations: 5
+  num_envs: 1
+  episode_index: 0
+  seed: 0
+  progress_interval: 10
+  output_dir: experiment_results/collocated_vla_wm_300

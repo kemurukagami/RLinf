@@ -21,7 +21,7 @@ This document uses the shared project task list:
 | T2 | Local safe-point lifecycle | Completed (MVP) |
 | T3 | Composite bundle scheduling | Completed |
 | T4 | Elastic progress and release | Completed |
-| T5 | RLinf resize coordinator | Pending |
+| T5 | RLinf resize coordinator | Completed |
 | T6 | Placement and configuration | Pending |
 | T7 | Runner stage integration | Pending |
 | T8 | Verification and GPU acceptance | Pending |
@@ -461,6 +461,9 @@ Purpose:
 - Connect original RLix callback ordering to RLinf worker safe points.
 - Keep the runner and workers RLinf-owned.
 
+Detailed edit-level design and test plan:
+`TASK_5_RLINF_RESIZE_COORDINATOR_IMPLEMENTATION_PLAN.md`.
+
 Files and edits:
 
 - `rlinf/scheduler/rlix/coordinator.py`
@@ -639,8 +642,11 @@ T1 completed
 T2 completed (MVP)
 T3 completed
 T4 completed
-T5 -> T6 -> T7 -> T8
+T5 completed
+T6 -> T7 -> T8
 ```
 
-T5 is the next implementation task. No later task is complete until all
-earlier exit conditions it depends on are met.
+T5 is complete with CPU fake/in-memory-pair transactions, core fail-closed
+integration, and an opt-in local Ray naming/handle test. T6 is the next
+implementation task. No later task is complete until all earlier exit
+conditions it depends on are met.

@@ -41,6 +41,7 @@ from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.elastic_rollout_lifecycle import (
+    CompletedResidencyReceipt,
     DrainRequest,
     ElasticRankState,
     ElasticRankStatus,
@@ -170,6 +171,7 @@ class MultiStepRolloutWorker(Worker):
         self._elastic_safe_point_token: SafePointToken | None = None
         self._elastic_failure: str | None = None
         self._elastic_dagger_epoch_index: int | None = None
+        self._elastic_run_call_active = False
         self._model_resident = False
         self._cuda_graph_captured = False
         self.finished_episodes = None
@@ -401,6 +403,23 @@ class MultiStepRolloutWorker(Worker):
             self._elastic_state, ElasticRankState.FAILED_RESIDENT
         )
         self._elastic_state = ElasticRankState.FAILED_RESIDENT
+
+    def fail_elastic_lifecycle(self, *, reason: str) -> ElasticRankStatus:
+        """Record a coordinator-detected paired lifecycle failure."""
+
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason must be a non-empty string")
+        if self._elastic_state is ElasticRankState.FAILED_RESIDENT:
+            return self._elastic_status()
+        self._elastic_failure = reason.strip()[:512]
+        try:
+            validate_elastic_state_transition(
+                self._elastic_state, ElasticRankState.FAILED_RESIDENT
+            )
+        except ValueError:
+            return self._elastic_status()
+        self._elastic_state = ElasticRankState.FAILED_RESIDENT
+        return self._elastic_status()
 
     def setup_sample_params(self):
         # sampling parameters for rollout
@@ -939,6 +958,8 @@ class MultiStepRolloutWorker(Worker):
     ) -> ElasticRunResult:
         """Run identified rollout transactions until a barrier or completion."""
 
+        if getattr(self, "_elastic_run_call_active", False):
+            raise RuntimeError("Elastic rollout generation call is already active")
         cursor = self._elastic_cursor
         if cursor is None:
             raise RuntimeError("Call prepare_elastic_collection before generation")
@@ -958,6 +979,7 @@ class MultiStepRolloutWorker(Worker):
             )
 
         cursor.phase = RolloutPeerPhase.WAITING_FOR_ENV
+        self._elastic_run_call_active = True
         try:
             while cursor.epoch_index < self.rollout_epoch:
                 request = await self.recv_from(
@@ -1046,6 +1068,8 @@ class MultiStepRolloutWorker(Worker):
         except Exception as exc:
             self._record_elastic_failure(exc)
             raise
+        finally:
+            self._elastic_run_call_active = False
 
     def _owned_rollout_models(self) -> tuple[Any, ...]:
         return tuple(
@@ -1117,6 +1141,37 @@ class MultiStepRolloutWorker(Worker):
             return ResidencyReceipt(
                 token=token,
                 state=ElasticRankState.PAUSED,
+                model_resident=False,
+                cuda_graph_captured=False,
+            )
+        except Exception as exc:
+            self._record_elastic_failure(exc)
+            raise
+
+    def offload_completed_elastic_rollout(self) -> CompletedResidencyReceipt:
+        """Offload and verify a terminal rollout rank without making it resumable."""
+
+        if self._elastic_state is not ElasticRankState.COMPLETED:
+            raise RuntimeError("Completed rollout offload requires COMPLETED state")
+        if getattr(self, "_elastic_run_call_active", False):
+            raise RuntimeError("Cannot offload a completed rollout with active work")
+        cursor = self._elastic_cursor
+        if cursor is None:
+            raise RuntimeError("Completed rollout has no lifecycle cursor")
+        try:
+            if self._model_resident or self._cuda_graph_captured:
+                self.offload_model()
+            self._verify_rollout_model_residency(resident=False)
+            if self._cuda_graph_captured:
+                raise RuntimeError("Completed rollout retained a CUDA graph")
+            self.torch_platform.synchronize()
+            self.torch_platform.empty_cache()
+            self._model_resident = False
+            return CompletedResidencyReceipt(
+                worker_rank=self._rank,
+                lifecycle_generation=cursor.lifecycle_generation,
+                policy_version=cursor.policy_version,
+                state=ElasticRankState.COMPLETED,
                 model_resident=False,
                 cuda_graph_captured=False,
             )

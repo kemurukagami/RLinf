@@ -16,7 +16,10 @@ from rlinf.data.embodied_io_struct import (
     merge_transition_identities,
     split_elastic_rollout_request,
 )
+from rlinf.scheduler.rlix.coordinator import RLixResizeCoordinator
+from rlinf.scheduler.rlix.protocol import ElasticCollectionContext
 from rlinf.workers.elastic_rollout_lifecycle import (
+    CompletedResidencyReceipt,
     DrainRequest,
     ElasticRankState,
     ElasticRunOutcome,
@@ -489,6 +492,7 @@ def test_elastic_rank_state_transition_table():
         (ElasticRankState.SNAPSHOTTING, ElasticRankState.FAILED_RESIDENT),
         (ElasticRankState.PAUSED, ElasticRankState.EXPANDING),
         (ElasticRankState.COMPLETED, ElasticRankState.EXPANDING),
+        (ElasticRankState.COMPLETED, ElasticRankState.FAILED_RESIDENT),
     }
 
     for current in ElasticRankState:
@@ -1747,3 +1751,172 @@ def test_duplicate_observation_fails_after_one_committed_inference():
 
     assert worker.predict_count == 1
     assert worker.get_elastic_status().state is ElasticRankState.FAILED_RESIDENT
+
+
+def test_completed_environment_offload_is_verified_idempotent_and_preserves_progress():
+    worker = _elastic_env_worker()
+    worker.torch_platform = _FakePlatform()
+    worker._rollout_call_active = False
+    worker._policy_request_in_flight = False
+    worker.prepare_elastic_collection(lifecycle_generation=2, expected_policy_version=3)
+    worker._elastic_state = ElasticRankState.COMPLETED
+    worker._elastic_completed_trajectories = 1
+
+    first = worker.offload_completed_elastic_environment()
+    second = worker.offload_completed_elastic_environment()
+
+    assert isinstance(first, CompletedResidencyReceipt)
+    assert second == first
+    assert worker.get_elastic_status().state is ElasticRankState.COMPLETED
+    assert worker.get_elastic_status().model_resident is False
+    assert worker.get_elastic_progress().completed_trajectories == 1
+
+
+def test_completed_rollout_offload_clears_all_model_residency_and_cuda_graphs():
+    worker = _elastic_rollout_worker([])
+    worker.hf_model = _FakeResidentModel()
+    worker.torch_platform = _FakePlatform()
+    worker._elastic_run_call_active = False
+    worker.enable_cuda_graph = False
+    worker.prepare_elastic_collection(lifecycle_generation=2, expected_policy_version=3)
+    worker._elastic_state = ElasticRankState.COMPLETED
+
+    first = worker.offload_completed_elastic_rollout()
+    second = worker.offload_completed_elastic_rollout()
+
+    assert isinstance(first, CompletedResidencyReceipt)
+    assert second == first
+    assert worker.hf_model.device == "cpu"
+    assert worker.get_elastic_status().state is ElasticRankState.COMPLETED
+    assert worker.get_elastic_status().model_resident is False
+    assert worker.get_elastic_status().cuda_graph_captured is False
+
+
+def test_completed_environment_offload_failure_enters_failed_resident():
+    worker = _elastic_env_worker()
+    worker.torch_platform = _FakePlatform()
+    worker._rollout_call_active = False
+    worker._policy_request_in_flight = False
+    worker.prepare_elastic_collection(lifecycle_generation=2, expected_policy_version=3)
+    worker._elastic_state = ElasticRankState.COMPLETED
+    worker.env_list[0].offload = lambda: (_ for _ in ()).throw(
+        RuntimeError("offload failed")
+    )
+
+    with pytest.raises(RuntimeError, match="offload failed"):
+        worker.offload_completed_elastic_environment()
+
+    assert worker.get_elastic_status().state is ElasticRankState.FAILED_RESIDENT
+
+
+def test_completed_rollout_offload_failure_enters_failed_resident():
+    worker = _elastic_rollout_worker([])
+    worker.hf_model = _FakeResidentModel()
+    worker.torch_platform = _FakePlatform()
+    worker._elastic_run_call_active = False
+    worker.prepare_elastic_collection(lifecycle_generation=2, expected_policy_version=3)
+    worker._elastic_state = ElasticRankState.COMPLETED
+    worker.offload_model = lambda: (_ for _ in ()).throw(
+        RuntimeError("rollout offload failed")
+    )
+
+    with pytest.raises(RuntimeError, match="rollout offload failed"):
+        worker.offload_completed_elastic_rollout()
+
+    assert worker.get_elastic_status().state is ElasticRankState.FAILED_RESIDENT
+
+
+@pytest.mark.parametrize(
+    "worker_factory", [_elastic_env_worker, lambda: _elastic_rollout_worker([])]
+)
+def test_public_pair_failure_surface_is_idempotent(worker_factory):
+    worker = worker_factory()
+    worker.prepare_elastic_collection(lifecycle_generation=2, expected_policy_version=3)
+
+    first = worker.fail_elastic_lifecycle(reason="peer token mismatch")
+    second = worker.fail_elastic_lifecycle(reason="ignored replacement")
+
+    assert first.state is ElasticRankState.FAILED_RESIDENT
+    assert second == first
+    assert second.failure == "peer token mismatch"
+
+
+def test_coordinator_drives_existing_in_memory_pair_through_pause_and_resume():
+    env_worker = _elastic_env_worker()
+    _configure_single_chunk_env(
+        env_worker,
+        snapshot_factory=lambda: _FakeEnvResumeState(
+            (env_worker._resume_bootstraps[0],)
+        ),
+    )
+    env_worker.validate_rollout_resume_state = lambda *_args, **_kwargs: None
+    env_worker.restore_rollout_stage = lambda *_args, **_kwargs: None
+    env_worker.torch_platform = _FakePlatform()
+    rollout_worker = _elastic_rollout_worker([])
+    rollout_worker.hf_model = _FakeResidentModel()
+    rollout_worker.device = "cuda"
+    rollout_worker.torch_platform = _FakePlatform()
+
+    async def run_pair():
+        env_to_rollout = asyncio.Queue()
+        rollout_to_env = asyncio.Queue()
+        allow_rollout_receive = asyncio.Event()
+
+        class _GatedQueueGetWork:
+            def __init__(self, queue):
+                self.queue = queue
+
+            async def async_wait(self):
+                await allow_rollout_receive.wait()
+                return await self.queue.get()
+
+        env_worker.send_to = lambda **kwargs: _QueuePutWork(
+            env_to_rollout, kwargs["data"]
+        )
+        env_worker.recv_from = lambda **_kwargs: _QueueGetWork(rollout_to_env)
+        rollout_worker.recv_from = lambda **_kwargs: _GatedQueueGetWork(env_to_rollout)
+        rollout_worker.send_to = lambda **kwargs: _QueuePutWork(
+            rollout_to_env, kwargs["data"]
+        )
+        coordinator = RLixResizeCoordinator(
+            pipeline_id="embodied_abc123def456",
+            env_workers={0: env_worker},
+            rollout_workers={0: rollout_worker},
+            operation_timeout_s=1.0,
+            activation_poll_interval_s=0.001,
+        )
+        await coordinator.configure_collection(
+            ElasticCollectionContext(1, 3, (0,)),
+            env_input_channel=object(),
+            rollout_request_channel=object(),
+        )
+        await coordinator.resize_infer([], [0])
+        shrink = asyncio.create_task(coordinator.resize_infer([0], []))
+        for _ in range(100):
+            if (
+                env_worker._elastic_state is ElasticRankState.DRAIN_REQUESTED
+                and rollout_worker._elastic_state is ElasticRankState.DRAIN_REQUESTED
+            ):
+                break
+            await asyncio.sleep(0)
+        allow_rollout_receive.set()
+        await shrink
+        paused = await coordinator.get_status()
+        assert paused.paused_ranks == (0,)
+        assert not env_worker._environment_resident
+        assert not rollout_worker._model_resident
+
+        allow_rollout_receive.clear()
+        await coordinator.resize_infer([], [0])
+        allow_rollout_receive.set()
+        results = await coordinator.get_rank_results(0, wait=True)
+        completed = await coordinator.get_status()
+        return results, completed, env_to_rollout, rollout_to_env
+
+    results, completed, env_to_rollout, rollout_to_env = asyncio.run(run_pair())
+
+    assert results[0].outcome is ElasticRunOutcome.COMPLETED
+    assert results[1].outcome is ElasticRunOutcome.COMPLETED
+    assert completed.completed_ranks == (0,)
+    assert env_to_rollout.empty()
+    assert rollout_to_env.empty()

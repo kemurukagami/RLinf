@@ -46,7 +46,9 @@ _ALLOWED_STATE_TRANSITIONS = {
         {ElasticRankState.PAUSED, ElasticRankState.FAILED_RESIDENT}
     ),
     ElasticRankState.PAUSED: frozenset({ElasticRankState.EXPANDING}),
-    ElasticRankState.COMPLETED: frozenset({ElasticRankState.EXPANDING}),
+    ElasticRankState.COMPLETED: frozenset(
+        {ElasticRankState.EXPANDING, ElasticRankState.FAILED_RESIDENT}
+    ),
     ElasticRankState.FAILED_RESIDENT: frozenset(),
 }
 
@@ -214,6 +216,32 @@ class ResidencyReceipt:
                 raise ValueError("EXPANDING residency must have a resident model")
         else:
             raise ValueError("Residency receipts require PAUSED or EXPANDING state")
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedResidencyReceipt:
+    """Verified non-residency for terminal work without a resumable token."""
+
+    worker_rank: int
+    lifecycle_generation: int
+    policy_version: int
+    state: ElasticRankState
+    model_resident: bool
+    cuda_graph_captured: bool
+
+    def __post_init__(self) -> None:
+        _validate_request_identity(
+            request_id="completed-residency",
+            worker_rank=self.worker_rank,
+            lifecycle_generation=self.lifecycle_generation,
+            policy_version=self.policy_version,
+        )
+        if self.state is not ElasticRankState.COMPLETED:
+            raise ValueError("Completed residency receipts require COMPLETED state")
+        if self.model_resident or self.cuda_graph_captured:
+            raise ValueError(
+                "Completed residency receipts require CPU-only state with no CUDA graph"
+            )
 
 
 def _validate_request_identity(

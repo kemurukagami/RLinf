@@ -65,6 +65,7 @@ from rlinf.utils.utils import (
     preprocess_embodied_batch,
 )
 from rlinf.workers.elastic_rollout_lifecycle import (
+    CompletedResidencyReceipt,
     DrainRequest,
     ElasticRankProgress,
     ElasticRankState,
@@ -457,6 +458,23 @@ class EnvWorker(Worker):
             self._elastic_state, ElasticRankState.FAILED_RESIDENT
         )
         self._elastic_state = ElasticRankState.FAILED_RESIDENT
+
+    def fail_elastic_lifecycle(self, *, reason: str) -> ElasticRankStatus:
+        """Record a coordinator-detected paired lifecycle failure."""
+
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason must be a non-empty string")
+        if self._elastic_state is ElasticRankState.FAILED_RESIDENT:
+            return self._elastic_status()
+        self._elastic_failure = reason.strip()[:512]
+        try:
+            validate_elastic_state_transition(
+                self._elastic_state, ElasticRankState.FAILED_RESIDENT
+            )
+        except ValueError:
+            return self._elastic_status()
+        self._elastic_state = ElasticRankState.FAILED_RESIDENT
+        return self._elastic_status()
 
     def _prepare_rollout_results(self, rollout_results: list | None = None) -> list:
         if self.enable_online_lerobot and rollout_results is not None:
@@ -1716,6 +1734,38 @@ class EnvWorker(Worker):
             return ResidencyReceipt(
                 token=token,
                 state=ElasticRankState.PAUSED,
+                model_resident=False,
+                cuda_graph_captured=False,
+            )
+        except Exception as exc:
+            self._record_elastic_failure(exc)
+            raise
+
+    def offload_completed_elastic_environment(self) -> CompletedResidencyReceipt:
+        """Offload and verify a terminal environment rank without making it resumable."""
+
+        if self._elastic_state is not ElasticRankState.COMPLETED:
+            raise RuntimeError("Completed environment offload requires COMPLETED state")
+        if self._rollout_call_active or self._policy_request_in_flight:
+            raise RuntimeError(
+                "Cannot offload a completed environment with active work"
+            )
+        cursor = self._rollout_cursor
+        if cursor is None:
+            raise RuntimeError("Completed environment has no lifecycle cursor")
+        try:
+            for env in self.env_list:
+                if self._environment_resident:
+                    get_env_attr(env, "offload")()
+                get_env_attr(env, "verify_elastic_residency")(resident=False)
+            self.torch_platform.synchronize()
+            self.torch_platform.empty_cache()
+            self._environment_resident = False
+            return CompletedResidencyReceipt(
+                worker_rank=self._rank,
+                lifecycle_generation=cursor.lifecycle_generation,
+                policy_version=cursor.policy_version,
+                state=ElasticRankState.COMPLETED,
                 model_resident=False,
                 cuda_graph_captured=False,
             )

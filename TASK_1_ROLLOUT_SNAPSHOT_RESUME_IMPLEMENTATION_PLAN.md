@@ -54,8 +54,9 @@ partial training trajectory as an uninterrupted execution.
 T1 provides the continuation primitives. It does not itself interrupt a
 running Ray call or release a scheduler allocation. The completed T2 MVP now
 calls these primitives at a drained chunk boundary and adds rollout-worker
-lifecycle and channel transition enforcement. Scheduler ownership transfer
-still requires T3-T5.
+lifecycle and channel transition enforcement. T3 now supplies composite
+scheduler ownership; runtime ownership transfer still requires T4 release
+semantics and the T5 callback transaction.
 
 The defining equivalence is:
 
@@ -1152,8 +1153,10 @@ checks passed for the new harness.
 This run validates real Wan T1 continuation and offload/restore behavior. It
 does not prove drain coordination, scheduler release, bundle reuse by a second
 pipeline, or scheduler-controlled resumed worker-channel ordering. Local drain
-and resumed channel ordering are now covered by T2; scheduler ownership and
-two-pipeline reuse remain T3-T8 work. Full T8 GPU acceptance is still
+and resumed channel ordering are now covered by T2, while T3 now covers the
+framework-neutral ownership and bundle scheduler. Runtime release,
+coordination, placement, runner integration, and two-pipeline reuse remain
+T4-T8 work. Full T8 GPU acceptance is still
 intentionally deferred, and OpenSora hardware equivalence remains pending
 because `/workspace/WM` contains no OpenSora checkpoint.
 
@@ -1200,7 +1203,9 @@ T1 is complete only when all of the following are true:
 - Unsupported stateful modes fail closed.
 - Existing uninterrupted rollout, offload, bootstrap, and history tests pass.
 
-T1 completion does not claim that GPUs can yet be safely released. That claim
-now has the T2 local lifecycle prerequisite, but still requires T3 composite
-bundle accounting, T4 release semantics, and the T5 scheduler callback
-transaction before logical ownership can move safely.
+T1 completion does not claim that GPUs can yet be safely released. T2 now
+supplies the local lifecycle prerequisite and T3 supplies composite bundle
+accounting. T4 release semantics and the T5 scheduler callback transaction are
+still required before logical ownership can move safely; T6-T8 remain required
+for production placement, runner integration, and real two-pipeline
+acceptance.

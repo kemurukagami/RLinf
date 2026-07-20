@@ -19,7 +19,7 @@ This document uses the shared project task list:
 | T0 | Fixed allocation foundation | Completed |
 | T1 | Versioned continuation state | Completed |
 | T2 | Local safe-point lifecycle | Completed (MVP) |
-| T3 | Composite bundle scheduling | Pending |
+| T3 | Composite bundle scheduling | Completed |
 | T4 | Elastic progress and release | Pending |
 | T5 | RLinf resize coordinator | Pending |
 | T6 | Placement and configuration | Pending |
@@ -159,7 +159,7 @@ Purpose:
   continuation.
 - Reject stale, wrong-rank, or malformed recovery state before mutation.
 
-Files and edits:
+Implemented files and edits:
 
 - `rlinf/envs/world_model/base_world_env.py`
   - Define `WorldEnvResumeState` and snapshot/onload/offload capability.
@@ -204,7 +204,7 @@ Wan saves partial state, omits image_queue and condition_action, has no loader
 EnvWorker loop cursor lives only in coroutine locals
 ```
 
-After edit:
+Implemented behavior:
 
 ```text
 snapshot validates identity and contains CPU tensors only
@@ -256,7 +256,7 @@ CUDA-graph/cache-residency failure injection are deferred as non-MVP hardening.
 Full two-pipeline Wan/OpenSora GPU reuse remains T8 acceptance. T2 is not
 connected to RLix.
 
-Files and edits:
+Implemented files and edits:
 
 - `rlinf/workers/env/env_worker.py`
   - Persist loop cursors, observe drain after `chunk_step()`, retain next output,
@@ -294,7 +294,7 @@ next observation is sent immediately
 models offload when the whole method returns
 ```
 
-After edit:
+Implemented behavior:
 
 ```text
 drain waits for current predict/send and chunk_step
@@ -314,6 +314,9 @@ Exit condition:
 
 ### T3: Composite bundle scheduling
 
+Status: completed in `rlix-core` on 2026-07-20 (`71 passed, 1 skipped`; Ruff
+lint, compilation, and dependency-boundary checks pass).
+
 Detailed edit-level design and test plan:
 `../TASK_3_COMPOSITE_BUNDLE_SCHEDULING_IMPLEMENTATION_PLAN.md`.
 
@@ -323,7 +326,7 @@ Purpose:
 - Add a short actor-plus-rollout sync allocation without bloating actor training.
 - Preserve all legacy flat TP behavior.
 
-Files and edits:
+Implemented files and edits:
 
 - `rlix-core/src/rlix_core/protocol/types.py`
   - Add `POLICY_SYNC_CLUSTER_NAME` and framework-neutral explicit bundle types.
@@ -363,7 +366,7 @@ worker GPU cost = tp_size
 known clusters exclude policy_sync
 ```
 
-After edit:
+Implemented behavior:
 
 ```text
 if explicit bundles: use exact registered bundle and its length
@@ -373,6 +376,12 @@ policy_sync is fixed and handled before elastic generation at the same priority
 
 Keep existing `SchedGuidedAllocationOp.dp_rank_to_gpus_to_add`; it already
 preserves canonical rank identity for initial and later elastic activation.
+
+Mappings are disjoint within one pipeline. Different pipelines may register
+overlapping candidate GPU mappings because registration does not reserve
+devices; scheduler allocation and plan validation prevent simultaneous global
+ownership. Width-one mappings represent collocated scheduler ownership only.
+The T2 offload/onload lifecycle is connected to live scheduling by T5-T7.
 
 Exit condition:
 
@@ -617,8 +626,9 @@ default for supported Wan/OpenSora only after this task passes.
 T0 completed
 T1 completed
 T2 completed (MVP)
-T3 -> T4 -> T5 -> T6 -> T7 -> T8
+T3 completed
+T4 -> T5 -> T6 -> T7 -> T8
 ```
 
-T3 is the next implementation task. No later task is complete until all
+T4 is the next implementation task. No later task is complete until all
 earlier exit conditions it depends on are met.

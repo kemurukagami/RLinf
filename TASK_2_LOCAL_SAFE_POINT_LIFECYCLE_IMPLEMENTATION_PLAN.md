@@ -1740,6 +1740,7 @@ T2 is complete only when all of the following are true:
   remain unchanged except for the intentional worker schema version bump.
 
 T2 completion does not mean a GPU can yet be returned to the shared scheduler.
-That claim additionally requires T3 composite bundle accounting, T4 release
-semantics, T5 callback transaction ordering, T6 production placement and actor
-concurrency, T7 runner barriers, and T8 two-pipeline GPU acceptance.
+T3 now supplies the composite bundle-accounting prerequisite. Safe runtime
+return still requires T4 release semantics, T5 callback transaction ordering,
+T6 production placement and actor concurrency, T7 runner barriers, and T8
+two-pipeline GPU acceptance.

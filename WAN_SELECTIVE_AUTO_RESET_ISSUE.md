@@ -3,7 +3,8 @@
 ## Status
 
 Open. This is a follow-up design and implementation issue, not part of the
-current Task 1 rollout snapshot/resume scope.
+completed T1 rollout snapshot/resume scope or the currently approved T0-T8
+elastic integration work.
 
 ## Summary
 

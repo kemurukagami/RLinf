@@ -214,6 +214,8 @@ def _elastic_env_worker(*, rank=0, world_size=1):
     worker.enable_train = True
     worker.train_enable_offload = True
     worker.train_batch_size = 1
+    worker.train_num_envs_per_stage = 1
+    worker.rollout_epoch = 1
     worker.env_decoupled_mode = False
     worker._component_placement = SimpleNamespace(
         get_world_size=lambda _group_name: world_size
@@ -940,6 +942,9 @@ def test_paired_workers_produce_the_same_safe_point_token():
     assert rollout_run.token.next_transition_id == _identity(sequence=1)
     assert rollout_complete.outcome is ElasticRunOutcome.COMPLETED
     assert env_complete.outcome is ElasticRunOutcome.COMPLETED
+    progress = env_worker.get_elastic_progress()
+    assert progress.completed_trajectories == progress.assigned_trajectories == 1
+    assert progress.state is ElasticRankState.COMPLETED
     assert rollout_worker.predict_count == 2
     assert env_to_rollout.empty()
     assert rollout_to_env.empty()

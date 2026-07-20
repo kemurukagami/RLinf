@@ -133,6 +133,53 @@ class ElasticRankStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class ElasticRankProgress:
+    """Durable progress reported by an activated environment rank."""
+
+    dp_rank: int
+    lifecycle_generation: int
+    state: ElasticRankState
+    assigned_trajectories: int
+    completed_trajectories: int
+    snapshot_ready: bool
+    failed: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dp_rank, int) or isinstance(self.dp_rank, bool):
+            raise TypeError("dp_rank must be an integer")
+        if self.dp_rank < 0:
+            raise ValueError("dp_rank must be non-negative")
+        if not isinstance(self.lifecycle_generation, int) or isinstance(
+            self.lifecycle_generation, bool
+        ):
+            raise TypeError("lifecycle_generation must be an integer")
+        if self.lifecycle_generation <= 0:
+            raise ValueError("lifecycle_generation must be positive")
+        if not isinstance(self.state, ElasticRankState):
+            raise TypeError("state must be an ElasticRankState")
+        for name, value in (
+            ("assigned_trajectories", self.assigned_trajectories),
+            ("completed_trajectories", self.completed_trajectories),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer")
+        if self.assigned_trajectories <= 0:
+            raise ValueError("assigned_trajectories must be positive")
+        if not 0 <= self.completed_trajectories <= self.assigned_trajectories:
+            raise ValueError(
+                "completed_trajectories must be between zero and assigned_trajectories"
+            )
+        if self.state is ElasticRankState.COMPLETED and (
+            self.completed_trajectories != self.assigned_trajectories
+        ):
+            raise ValueError(
+                "COMPLETED progress must include every assigned trajectory"
+            )
+        if self.failed != (self.state is ElasticRankState.FAILED_RESIDENT):
+            raise ValueError("failed must match FAILED_RESIDENT state")
+
+
+@dataclass(frozen=True, slots=True)
 class ElasticRunResult:
     """Result returned when a worker pauses at a boundary or completes."""
 

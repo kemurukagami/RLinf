@@ -66,6 +66,7 @@ from rlinf.utils.utils import (
 )
 from rlinf.workers.elastic_rollout_lifecycle import (
     DrainRequest,
+    ElasticRankProgress,
     ElasticRankState,
     ElasticRankStatus,
     ElasticRunOutcome,
@@ -155,6 +156,7 @@ class EnvWorker(Worker):
         self._elastic_safe_point_token: SafePointToken | None = None
         self._elastic_resume_state: EnvRolloutResumeState | None = None
         self._elastic_failure: str | None = None
+        self._elastic_completed_trajectories = 0
         self._environment_resident = False
         self.enable_rlt = (
             OmegaConf.select(self.cfg, "algorithm.loss_type", default="") == "rlt_ac"
@@ -290,6 +292,32 @@ class EnvWorker(Worker):
 
         return self._elastic_status()
 
+    def _elastic_assigned_trajectory_count(self) -> int:
+        return (
+            int(self.train_num_envs_per_stage)
+            * int(self.stage_num)
+            * int(self.rollout_epoch)
+        )
+
+    def get_elastic_progress(self) -> ElasticRankProgress:
+        """Return durable progress after this rank has entered a lifecycle."""
+
+        cursor = self._rollout_cursor
+        if cursor is None:
+            raise RuntimeError(
+                "Cold rank progress is controller-owned until elastic preparation"
+            )
+        assigned = self._elastic_assigned_trajectory_count()
+        return ElasticRankProgress(
+            dp_rank=self._rank,
+            lifecycle_generation=cursor.lifecycle_generation,
+            state=self._elastic_state,
+            assigned_trajectories=assigned,
+            completed_trajectories=self._elastic_completed_trajectories,
+            snapshot_ready=self._elastic_resume_state is not None,
+            failed=self._elastic_state is ElasticRankState.FAILED_RESIDENT,
+        )
+
     def _elastic_expected_transition_id(
         self,
     ) -> RolloutTransitionIdentity | None:
@@ -366,6 +394,7 @@ class EnvWorker(Worker):
         self._elastic_safe_point_token = None
         self._elastic_resume_state = None
         self._elastic_failure = None
+        self._elastic_completed_trajectories = 0
         self._lifecycle_generation = lifecycle_generation
         self._rollout_cursor = EnvRolloutCursor(
             schema_version=ENV_ROLLOUT_RESUME_SCHEMA_VERSION,
@@ -2160,6 +2189,9 @@ class EnvWorker(Worker):
                 self._elastic_state, ElasticRankState.COMPLETED
             )
             self._elastic_state = ElasticRankState.COMPLETED
+            self._elastic_completed_trajectories = (
+                self._elastic_assigned_trajectory_count()
+            )
             return ElasticRunResult(
                 outcome=ElasticRunOutcome.COMPLETED,
                 token=None,

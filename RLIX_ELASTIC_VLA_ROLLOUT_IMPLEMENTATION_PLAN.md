@@ -20,7 +20,7 @@ This document uses the shared project task list:
 | T1 | Versioned continuation state | Completed |
 | T2 | Local safe-point lifecycle | Completed (MVP) |
 | T3 | Composite bundle scheduling | Completed |
-| T4 | Elastic progress and release | Pending |
+| T4 | Elastic progress and release | Completed |
 | T5 | RLinf resize coordinator | Pending |
 | T6 | Placement and configuration | Pending |
 | T7 | Runner stage integration | Pending |
@@ -66,7 +66,7 @@ Intentional RLinf deviations are assigned to tasks:
 | --- | --- | --- |
 | T3 | A DP worker is one inference TP bundle costing `tp_size` GPUs. | A DP worker is a rollout/environment bundle whose actual width is its GPU cost. |
 | T3 | No separate policy-sync cluster. | Add fixed `policy_sync` for the actor-plus-rollout union. |
-| T4 | Every inactive rank can expand. | Only paused ranks with remaining work can expand. |
+| T4 | Every inactive rank can expand. | Only eligible cold or paused ranks with assigned remaining work can expand. |
 | T4 | Planned release targets all active ranks. | Add rank-specific release while retaining the old API. |
 | T2/T5 | Shrink aborts an inference request immediately. | Shrink drains at the end of the current world-model chunk. |
 | T2 | Caller retries prompt/token state on any worker. | EnvWorker resumes saved embodied state on the same rank. |
@@ -391,6 +391,12 @@ Exit condition:
 
 ### T4: Elastic progress and release
 
+Status: completed on 2026-07-20 (`rlix-core`: `99 passed, 1 skipped`; focused
+RLinf T1/T2/T4: `56 passed`; touched-file Ruff checks pass).
+
+Detailed edit-level design and test plan:
+`../TASK_4_ELASTIC_PROGRESS_RELEASE_IMPLEMENTATION_PLAN.md`.
+
 Purpose:
 
 - Prevent expansion of ranks with no work.
@@ -442,6 +448,11 @@ Exit condition:
 - Paused ranks can expand.
 - Completed active ranks release immediately without sibling release.
 - Legacy clients remain behaviorally unchanged.
+
+Implemented behavior includes validated optional rank snapshots, controller-
+owned cold eligibility, activated EnvWorker durable progress, canonical planner
+and validation enforcement, background wakeup filtering, and exact selective
+release batches that preserve sibling ownership and lock-gap waiter ordering.
 
 ### T5: RLinf resize coordinator
 
@@ -627,8 +638,9 @@ T0 completed
 T1 completed
 T2 completed (MVP)
 T3 completed
-T4 -> T5 -> T6 -> T7 -> T8
+T4 completed
+T5 -> T6 -> T7 -> T8
 ```
 
-T4 is the next implementation task. No later task is complete until all
+T5 is the next implementation task. No later task is complete until all
 earlier exit conditions it depends on are met.

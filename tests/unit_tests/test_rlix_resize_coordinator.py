@@ -39,9 +39,18 @@ from rlinf.workers.elastic_rollout_lifecycle import (
 
 
 class _FakeElasticWorker:
-    def __init__(self, rank: int, *, token_suffix: str = "") -> None:
+    def __init__(
+        self,
+        rank: int,
+        *,
+        token_suffix: str = "",
+        event_log: list[str] | None = None,
+        label: str = "worker",
+    ) -> None:
         self.rank = rank
         self.token_suffix = token_suffix
+        self.event_log = event_log
+        self.label = label
         self.state = ElasticRankState.INACTIVE_COLD
         self.lifecycle: int | None = None
         self.policy_version: int | None = None
@@ -90,6 +99,8 @@ class _FakeElasticWorker:
     ) -> ElasticRankStatus:
         if self.fail_prepare:
             raise RuntimeError("injected preparation failure")
+        if self.event_log is not None:
+            self.event_log.append(f"prepare:{self.label}")
         self.lifecycle = lifecycle_generation
         self.policy_version = expected_policy_version
         self.transition = RolloutTransitionIdentity(
@@ -177,6 +188,8 @@ class _FakeElasticWorker:
     def _offload_pause(self, token: SafePointToken) -> ResidencyReceipt:
         if self.fail_pause_offload:
             raise RuntimeError("injected pause offload failure")
+        if self.event_log is not None:
+            self.event_log.append(f"pause-offload:{self.label}")
         self.state = ElasticRankState.PAUSED
         self.resident = False
         return ResidencyReceipt(
@@ -212,11 +225,23 @@ class _FakeElasticWorker:
 
 
 def _coordinator(
-    *, ranks: int = 1, timeout: float = 1.0, rollout_token_suffix: str = ""
+    *,
+    ranks: int = 1,
+    timeout: float = 1.0,
+    rollout_token_suffix: str = "",
+    event_log: list[str] | None = None,
 ):
-    env = {rank: _FakeElasticWorker(rank) for rank in range(ranks)}
+    env = {
+        rank: _FakeElasticWorker(rank, event_log=event_log, label=f"env-{rank}")
+        for rank in range(ranks)
+    }
     rollout = {
-        rank: _FakeElasticWorker(rank, token_suffix=rollout_token_suffix)
+        rank: _FakeElasticWorker(
+            rank,
+            token_suffix=rollout_token_suffix,
+            event_log=event_log,
+            label=f"rollout-{rank}",
+        )
         for rank in range(ranks)
     }
     coordinator = RLixResizeCoordinator(
@@ -417,33 +442,26 @@ def test_selected_rank_resize_leaves_sibling_active() -> None:
 
 def test_direct_mixed_callback_finishes_all_shrinks_before_expansion() -> None:
     async def run() -> None:
-        coordinator, _env, _rollout = _coordinator(ranks=2)
+        events: list[str] = []
+        coordinator, _env, _rollout = _coordinator(ranks=2, event_log=events)
         await _configure(coordinator, ranks=2)
         await coordinator.resize_infer([], [0])
-        events = []
-        original_shrink = coordinator._shrink_rank
-        original_expand = coordinator._expand_rank
-
-        async def traced_shrink(rank: int) -> None:
-            events.append(f"shrink-start-{rank}")
-            await original_shrink(rank)
-            events.append(f"shrink-end-{rank}")
-
-        async def traced_expand(rank: int) -> None:
-            events.append(f"expand-start-{rank}")
-            await original_expand(rank)
-            events.append(f"expand-end-{rank}")
-
-        coordinator._shrink_rank = traced_shrink
-        coordinator._expand_rank = traced_expand
+        events.clear()
         await coordinator.resize_infer([0], [1])
 
-        assert events == [
-            "shrink-start-0",
-            "shrink-end-0",
-            "expand-start-1",
-            "expand-end-1",
+        offload_indices = [
+            index
+            for index, event in enumerate(events)
+            if event in {"pause-offload:env-0", "pause-offload:rollout-0"}
         ]
+        prepare_indices = [
+            index
+            for index, event in enumerate(events)
+            if event in {"prepare:env-1", "prepare:rollout-1"}
+        ]
+        assert len(offload_indices) == 2
+        assert len(prepare_indices) == 2
+        assert max(offload_indices) < min(prepare_indices)
 
     asyncio.run(run())
 

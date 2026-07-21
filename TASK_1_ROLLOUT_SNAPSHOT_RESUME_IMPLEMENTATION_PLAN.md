@@ -55,8 +55,9 @@ T1 provides the continuation primitives. It does not itself interrupt a
 running Ray call or release a scheduler allocation. The completed T2 MVP now
 calls these primitives at a drained chunk boundary and adds rollout-worker
 lifecycle and channel transition enforcement. T3 now supplies composite
-scheduler ownership; runtime ownership transfer still requires T4 release
-semantics and the T5 callback transaction.
+scheduler ownership, T4 supplies release semantics, and T5 supplies the
+callback transaction. Production ownership transfer still requires T6
+placement/concurrency and T7 runner invocation; T8 owns accelerator acceptance.
 
 The defining equivalence is:
 

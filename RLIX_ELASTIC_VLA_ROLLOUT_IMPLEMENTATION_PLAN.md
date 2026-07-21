@@ -381,7 +381,8 @@ Mappings are disjoint within one pipeline. Different pipelines may register
 overlapping candidate GPU mappings because registration does not reserve
 devices; scheduler allocation and plan validation prevent simultaneous global
 ownership. Width-one mappings represent collocated scheduler ownership only.
-The T2 offload/onload lifecycle is connected to live scheduling by T5-T7.
+T5 now connects the T2 offload/onload lifecycle to scheduler callbacks. T6/T7
+still own production actor construction and runner-stage invocation.
 
 Exit condition:
 
@@ -455,6 +456,9 @@ and validation enforcement, background wakeup filtering, and exact selective
 release batches that preserve sibling ownership and lock-gap waiter ordering.
 
 ### T5: RLinf resize coordinator
+
+Status: completed on 2026-07-20. Production construction and runner invocation
+remain in T6/T7; real two-pipeline GPU acceptance remains in T8.
 
 Purpose:
 
@@ -646,7 +650,8 @@ T5 completed
 T6 -> T7 -> T8
 ```
 
-T5 is complete with CPU fake/in-memory-pair transactions, core fail-closed
-integration, and an opt-in local Ray naming/handle test. T6 is the next
-implementation task. No later task is complete until all earlier exit
-conditions it depends on are met.
+T5 is complete with CPU fake and stubbed-backend in-memory worker protocol
+transactions, core fail-closed integration, and an opt-in local Ray
+naming/handle test. None is a production end-to-end runner test; that requires
+T6-T8. T6 is the next implementation task. No later task is complete until all
+earlier exit conditions it depends on are met.

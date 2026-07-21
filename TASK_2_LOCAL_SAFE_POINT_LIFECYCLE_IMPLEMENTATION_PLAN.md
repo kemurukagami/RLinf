@@ -161,7 +161,8 @@ to RLix.
 ### 3.2 Explicitly not implemented by T2
 
 - RLix registration, allocation, planning, release, or callback lookup.
-- The `RLixResizeCoordinator`; T5 consumes the APIs defined here.
+- The `RLixResizeCoordinator`; the subsequently completed T5 implementation
+  consumes the APIs defined here.
 - Rank-specific progress reporting or voluntary scheduler release; those are
   T4 responsibilities.
 - Placement conversion, configuration validation, or production worker launch
@@ -864,8 +865,8 @@ def get_elastic_resume_state(
 ) -> EnvRolloutResumeState: ...
 ```
 
-It must validate the exact token and return a detached CPU clone. T5 should not
-normally transfer this state through Ray.
+It must validate the exact token and return a detached CPU clone. The T5
+coordinator does not normally transfer this state through Ray.
 
 ### 8.9 Environment offload
 
@@ -1159,7 +1160,8 @@ call sites must not be changed as part of T2.
 ## 10. Local paired transaction protocol
 
 T2 does not add the T5 coordinator actor, but its tests need a small local
-harness that uses the public worker APIs in the order T5 will later implement.
+harness that uses the public worker APIs in the order T5 subsequently
+implemented.
 
 ### 10.1 Activation
 
@@ -1739,8 +1741,8 @@ T2 is complete only when all of the following are true:
 - Existing standalone `interact()`/`generate()` ordering and T1 snapshot tests
   remain unchanged except for the intentional worker schema version bump.
 
-T2 completion does not mean a GPU can yet be returned to the shared scheduler.
-T3 now supplies the composite bundle-accounting prerequisite. Safe runtime
-return still requires T4 release semantics, T5 callback transaction ordering,
-T6 production placement and actor concurrency, T7 runner barriers, and T8
+T2 completion alone does not mean a GPU can be returned to the shared
+scheduler. T3/T4 now supply composite bundle accounting and release semantics,
+and T5 supplies callback transaction ordering. Safe production runtime return
+still requires T6 placement and actor concurrency, T7 runner barriers, and T8
 two-pipeline GPU acceptance.

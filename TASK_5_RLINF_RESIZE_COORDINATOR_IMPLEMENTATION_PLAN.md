@@ -3,9 +3,15 @@
 ## 1. Status and source of truth
 
 Status: completed on 2026-07-20. The coordinator transaction, driver
-controller, worker hardening, fake-peer and existing in-memory-pair suites,
-core fail-closed integration, and opt-in local Ray naming/handle test pass.
-Production T6/T7 construction and runner wiring remain intentionally deferred.
+controller, worker hardening, fake-peer and stubbed-backend in-memory worker
+suites, core fail-closed integration, and opt-in local Ray naming/handle test
+pass. Production T6/T7 construction and runner wiring remain intentionally
+deferred.
+
+Test-double audit reverified on 2026-07-21: the coordinator/worker-focused
+suite passed `78 passed, 1 skipped`; the opt-in real-Ray named-actor test passed
+separately; and Ruff lint/format plus diff checks passed. The skip is the
+opt-in real-Ray case in the restricted run, not missing coordinator coverage.
 
 This document expands Task T5, "RLinf resize coordinator," from:
 
@@ -1013,6 +1019,33 @@ after completed offload verification. Never fabricate a resumable token.
 
 ## 16. Test plan
 
+### 16.0 Test classification and doubles audit
+
+T5 has no production end-to-end test. That is intentional at this task
+boundary: T6 must construct placement and worker concurrency, T7 must route the
+real runner through the coordinator, and T8 owns real Wan/OpenSora two-pipeline
+GPU reuse. Do not describe the following scoped evidence as end to end:
+
+- fake-peer unit tests run the production coordinator transaction with
+  deterministic async worker protocol doubles;
+- the in-memory worker protocol test runs production coordinator and public
+  `EnvWorker`/`MultiStepRolloutWorker` lifecycle methods, but stubs model/world
+  computation, channel transport, and snapshot validation/restore backends;
+- the core fail-closed integration test runs production `SchedulerImpl` and
+  production coordinator code, with fake workers and a thin `.remote()` adapter
+  that invokes the real coordinator coroutine;
+- the opt-in local Ray integration test uses real `ray.remote`, named actor
+  creation, cross-actor handles, namespace lookup, status RPC, guarded close,
+  and actor termination, while its workers expose only cold status; and
+- the controller-options unit test monkeypatches `ray.remote` only to inspect
+  construction options and is backed by the separate real-Ray integration
+  test.
+
+No mock replaces `RLixResizeCoordinator.resize_infer()` in tests that claim to
+exercise coordinator behavior. Ordering is asserted from worker-observable
+offload/prepare events without wrapping coordinator internals. These tests
+satisfy T5's CPU callback-transaction boundary, not T6-T8 runtime acceptance.
+
 ### 16.1 Protocol validation
 
 Add `tests/unit_tests/test_rlix_resize_coordinator.py` and cover:
@@ -1050,9 +1083,9 @@ Cover drains requested while fake peers model each T2 timing case:
 Assert the callback returns only after matching results, tokens, offload
 receipts, and final residency checks.
 
-T2 already proves channel-level correctness. T5 fakes should model public
-outcomes rather than duplicate the entire channel implementation, plus retain
-one integration test using the existing in-memory T2 pair.
+T2 already proves channel-level correctness. T5 fakes model public outcomes
+rather than duplicate the entire channel implementation, plus one protocol
+integration test uses the stubbed-backend in-memory worker pair.
 
 ### 16.4 Paused expansion
 
@@ -1201,7 +1234,8 @@ Run:
 
 - completed offload receipts/failures;
 - public failed-lifecycle method; and
-- one local pair driven through the coordinator transaction order.
+- one stubbed-backend local worker pair driven through the coordinator
+  transaction order.
 
 `tests/unit_tests/test_rlix_progress.py`
 
@@ -1211,9 +1245,9 @@ Run:
 Core tests should change only if the actor lookup integration needs a focused
 fixture. Do not rewrite existing callback-order tests around RLinf.
 
-### 17.4 Documentation updates after implementation
+### 17.4 Completed documentation updates
 
-Only after all T5 exit criteria pass:
+After all T5 exit criteria passed:
 
 - mark T5 complete in `../VLA_COMPATIBILITY_DESIGN.md`;
 - mark T5 complete and record commands/results in
@@ -1240,7 +1274,7 @@ GPU acceptance configs/scripts and operator docs
 
 - T8 owns real two-pipeline Wan/OpenSora acceptance and utilization evidence.
 
-## 18. Suggested implementation sequence
+## 18. Completed implementation sequence (preserved plan)
 
 1. Add pure T5 protocol types and validation tests.
 2. Add `CompletedResidencyReceipt` and the failure-only completed transition.

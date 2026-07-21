@@ -1841,7 +1841,7 @@ def test_public_pair_failure_surface_is_idempotent(worker_factory):
     assert second.failure == "peer token mismatch"
 
 
-def test_coordinator_drives_existing_in_memory_pair_through_pause_and_resume():
+def test_coordinator_drives_stubbed_backend_pair_through_pause_and_resume():
     env_worker = _elastic_env_worker()
     _configure_single_chunk_env(
         env_worker,

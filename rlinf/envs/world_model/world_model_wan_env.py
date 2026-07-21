@@ -853,7 +853,10 @@ class WanEnv(BaseWorldEnv):
         self.current_obs = recursive_to_device(self.current_obs, "cpu")
         self.condition_action = self.condition_action.cpu()
         self.image_queue = [
-            [frame.detach().cpu().contiguous() for frame in queue]
+            [
+                frame.detach().cpu().contiguous() if frame is not None else None
+                for frame in queue
+            ]
             for queue in self.image_queue
         ]
         self.prev_step_reward = self.prev_step_reward.cpu()

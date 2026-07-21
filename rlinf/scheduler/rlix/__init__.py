@@ -2,6 +2,14 @@
 
 from typing import Any
 
+from .placement import (
+    ResolvedGPUWorker,
+    ResolvedPlacementStrategy,
+    ResolvedRLixPlacements,
+    RLixPlacementPlan,
+    build_rlix_placement_plan,
+    resolve_rlix_placements,
+)
 from .progress import ElasticPipelineProgress, ElasticProgressTracker
 from .protocol import CoordinatorStatus, ElasticCollectionContext, PolicySyncLease
 
@@ -11,8 +19,16 @@ __all__ = [
     "ElasticPipelineProgress",
     "ElasticProgressTracker",
     "PolicySyncLease",
+    "RLixPlacementPlan",
     "RLixResizeCoordinator",
     "RLixStageController",
+    "RegisteredRLixPipeline",
+    "ResolvedGPUWorker",
+    "ResolvedPlacementStrategy",
+    "ResolvedRLixPlacements",
+    "bootstrap_registered_rlix_pipeline",
+    "build_rlix_placement_plan",
+    "resolve_rlix_placements",
 ]
 
 
@@ -26,4 +42,14 @@ def __getattr__(name: str) -> Any:
         from .controller import RLixStageController
 
         return RLixStageController
+    if name in {"RegisteredRLixPipeline", "bootstrap_registered_rlix_pipeline"}:
+        from .runtime import (
+            RegisteredRLixPipeline,
+            bootstrap_registered_rlix_pipeline,
+        )
+
+        return {
+            "RegisteredRLixPipeline": RegisteredRLixPipeline,
+            "bootstrap_registered_rlix_pipeline": bootstrap_registered_rlix_pipeline,
+        }[name]
     raise AttributeError(name)

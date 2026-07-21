@@ -5,8 +5,8 @@
 Status: completed on 2026-07-20. The coordinator transaction, driver
 controller, worker hardening, fake-peer and stubbed-backend in-memory worker
 suites, core fail-closed integration, and opt-in local Ray naming/handle test
-pass. Production T6/T7 construction and runner wiring remain intentionally
-deferred.
+pass. T6 has since completed production construction and registration; T7
+runner wiring remains intentionally deferred.
 
 Test-double audit reverified on 2026-07-21: the coordinator/worker-focused
 suite passed `78 passed, 1 skipped`; the opt-in real-Ray named-actor test passed
@@ -49,14 +49,17 @@ Current T5 dependency and implementation status:
 - [x] A named RLinf coordinator actor and driver-side construction helper use
   the exact `rlix-core` actor prefix and caller-supplied registered namespace.
 - [x] `resize_infer` drives direct same-ranked worker handles in CPU fake tests;
-  production construction remains T6/T7 wiring rather than a T5 entrypoint edit.
+  production construction was subsequently completed by T6 rather than a T5
+  entrypoint edit.
 - [x] Completed elastic workers have public verified token-free offload
   operations and a failure-only `COMPLETED -> FAILED_RESIDENT` transition.
 - [x] Coordinator protocol read models and a narrow public paired-failure
   worker surface are implemented with focused CPU tests.
 - [x] Policy synchronization and resize share an exact condition-based lease
   gate with bounded callback waits and no automatic lease expiry.
-- [ ] T6 placement/configuration and T7 runner adoption remain pending.
+- [x] T6 placement/configuration, production construction, registration, and
+  admission are complete.
+- [ ] T7 runner adoption remains pending.
 
 ## 2. Required outcome
 
@@ -194,8 +197,8 @@ core regression rather than duplicating allocation logic in RLinf.
 - lazy public exports in `__init__.py` so unrelated RLinf imports do not eagerly
   require `rlix-core`.
 
-The production embodied entrypoint does not construct these surfaces yet; that
-placement/configuration work remains T6 and runner adoption remains T7.
+The production embodied entrypoint now constructs these surfaces through T6;
+runner adoption remains T7.
 
 ### 4.2 Existing core callback lookup
 
@@ -1044,7 +1047,8 @@ GPU reuse. Do not describe the following scoped evidence as end to end:
 No mock replaces `RLixResizeCoordinator.resize_infer()` in tests that claim to
 exercise coordinator behavior. Ordering is asserted from worker-observable
 offload/prepare events without wrapping coordinator internals. These tests
-satisfy T5's CPU callback-transaction boundary, not T6-T8 runtime acceptance.
+satisfy T5's CPU callback-transaction boundary, not T6 placement or T7-T8
+runtime acceptance; T6 is verified separately by its own suites and smoke.
 
 ### 16.1 Protocol validation
 
@@ -1255,7 +1259,9 @@ After all T5 exit criteria passed:
 - update T5 status in `RLIX_ELASTIC_VLA_ROLLOUT_IMPLEMENTATION_PLAN.md`; and
 - record the completed-offload lifecycle clarification in the architecture.
 
-Do not mark T6-T8 complete or claim live cross-pipeline GPU reuse.
+At T5 completion, T6-T8 were intentionally left incomplete and no live
+cross-pipeline GPU reuse was claimed. T6 has since completed independently;
+T7-T8 remain pending.
 
 ### 17.5 Explicitly deferred files
 
@@ -1416,6 +1422,7 @@ T5 is complete only when all of the following are true:
   pre-existing findings are recorded precisely.
 
 T5 completion means the callback transaction is implemented and tested with
-CPU fakes/local Ray integration. It does not mean production placement is
-validated, `EmbodiedRunner` uses the coordinator, or another pipeline has
-reused a real Wan/OpenSora bundle. Those claims remain T6, T7, and T8.
+CPU fakes/local Ray integration. T6 has since validated production placement,
+constructed the named coordinator, and registered/admitted the inactive
+pipeline. `EmbodiedRunner` adoption and real Wan/OpenSora cross-pipeline bundle
+reuse remain T7 and T8.

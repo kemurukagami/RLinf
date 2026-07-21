@@ -56,8 +56,9 @@ running Ray call or release a scheduler allocation. The completed T2 MVP now
 calls these primitives at a drained chunk boundary and adds rollout-worker
 lifecycle and channel transition enforcement. T3 now supplies composite
 scheduler ownership, T4 supplies release semantics, and T5 supplies the
-callback transaction. Production ownership transfer still requires T6
-placement/concurrency and T7 runner invocation; T8 owns accelerator acceptance.
+callback transaction. T6 now supplies production placement/concurrency and
+registration; production ownership transfer still requires T7 runner
+invocation, while T8 owns accelerator acceptance.
 
 The defining equivalence is:
 
@@ -1157,8 +1158,9 @@ pipeline, or scheduler-controlled resumed worker-channel ordering. Local drain
 and resumed channel ordering are now covered by T2, while T3 now covers the
 framework-neutral ownership and bundle scheduler. Runtime release,
 coordination, placement, runner integration, and two-pipeline reuse remain
-T4-T8 work. Full T8 GPU acceptance is still
-intentionally deferred, and OpenSora hardware equivalence remains pending
+outside this T1 result. T4-T6 now supply release, coordination, and placement;
+T7 runner integration and full T8 GPU acceptance are still intentionally
+deferred, and OpenSora hardware equivalence remains pending
 because `/workspace/WM` contains no OpenSora checkpoint.
 
 ### 15.2 Recorded collocated real-model result
@@ -1206,7 +1208,7 @@ T1 is complete only when all of the following are true:
 
 T1 completion does not claim that GPUs can yet be safely released. T2 now
 supplies the local lifecycle prerequisite and T3 supplies composite bundle
-accounting. T4 release semantics and the T5 scheduler callback transaction are
-still required before logical ownership can move safely; T6-T8 remain required
-for production placement, runner integration, and real two-pipeline
-acceptance.
+accounting. T4 release semantics, the T5 scheduler callback transaction, and
+T6 production placement/registration are now complete. T7 runner integration
+and T8 real two-pipeline acceptance remain required before logical ownership
+can move safely in production.

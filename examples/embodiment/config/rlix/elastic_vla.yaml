@@ -1,0 +1,7 @@
+enabled: true
+rollout_allocation_policy: elastic
+rollout_safe_point: world_model_chunk
+progress_unit: trajectories
+worker_max_concurrency: 2
+operation_timeout_s: 300.0
+enable_gpu_tracing: false

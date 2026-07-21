@@ -626,6 +626,27 @@ def test_wan_offload_onload_moves_actions_and_keeps_queue_on_cpu(monkeypatch):
     assert env.condition_action.device == env.device
 
 
+def test_wan_offload_preserves_uninitialized_image_queue(monkeypatch):
+    class _FakeModel:
+        def to(self, *args):
+            return self
+
+    env = _make_wan_env(monkeypatch)
+    env.pipe = SimpleNamespace(vae=_FakeModel(), dit=_FakeModel())
+    env.reward_model = _FakeModel()
+    env.current_obs = None
+    env.image_queue = [[None] * env.condition_frame_length for _ in range(env.num_envs)]
+    env._clear_accelerator_cache = lambda: None
+
+    env.offload()
+
+    assert env._is_offloaded
+    assert env.current_obs is None
+    assert env.image_queue == [
+        [None] * env.condition_frame_length for _ in range(env.num_envs)
+    ]
+
+
 def _make_wan_worker(monkeypatch):
     env = _make_wan_env(monkeypatch)
     worker = object.__new__(EnvWorker)

@@ -33,6 +33,9 @@ mp.set_start_method("spawn", force=True)
     version_base="1.1", config_path="config", config_name="maniskill_ppo_openvlaoft"
 )
 def main(cfg) -> None:
+    from rlinf.scheduler.rlix.validation import validate_rlix_entrypoint
+
+    validate_rlix_entrypoint(cfg, entrypoint="train_embodied_agent")
     cfg = validate_cfg(cfg)
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 
@@ -40,9 +43,19 @@ def main(cfg) -> None:
         cluster_cfg=cfg.cluster, distributed_log_dir=cfg.runner.per_worker_log_path
     )
     component_placement = HybridComponentPlacement(cfg, cluster)
+    rlix_enabled = bool(cfg.rlix.enabled)
+    resolved_rlix = None
+    if rlix_enabled:
+        from rlinf.scheduler.rlix.entrypoint import preflight_rlix_placements
+
+        resolved_rlix = preflight_rlix_placements(component_placement, cluster)
 
     # Create actor worker group
-    actor_placement = component_placement.get_strategy("actor")
+    actor_placement = (
+        resolved_rlix.actor_strategy
+        if resolved_rlix is not None
+        else component_placement.get_strategy("actor")
+    )
     use_training_pipeline = bool(cfg.runner.get("use_training_pipeline", False))
 
     if cfg.algorithm.loss_type == "embodied_sac":
@@ -91,21 +104,58 @@ def main(cfg) -> None:
 
             actor_worker_cls = EmbodiedFSDPActor
 
-    actor_group = actor_worker_cls.create_group(cfg).launch(
-        cluster, name=cfg.actor.group_name, placement_strategy=actor_placement
-    )
-
     # Create rollout worker group
-    rollout_placement = component_placement.get_strategy("rollout")
-    rollout_group = MultiStepRolloutWorker.create_group(cfg).launch(
-        cluster, name=cfg.rollout.group_name, placement_strategy=rollout_placement
+    rollout_placement = (
+        resolved_rlix.rollout_strategy
+        if resolved_rlix is not None
+        else component_placement.get_strategy("rollout")
     )
-
     # Create env worker group
-    env_placement = component_placement.get_strategy("env")
-    env_group = EnvWorker.create_group(cfg).launch(
-        cluster, name=cfg.env.group_name, placement_strategy=env_placement
+    env_placement = (
+        resolved_rlix.env_strategy
+        if resolved_rlix is not None
+        else component_placement.get_strategy("env")
     )
+    rlix_runtime = None
+    if rlix_enabled:
+        from rlinf.scheduler.rlix.entrypoint import launch_registered_rlix_workers
+        from rlinf.scheduler.rlix.runtime import (
+            bootstrap_registered_rlix_pipeline,
+        )
+
+        launched = launch_registered_rlix_workers(
+            cluster=cluster,
+            actor_group=actor_worker_cls.create_group(cfg),
+            rollout_group=MultiStepRolloutWorker.create_group(cfg),
+            env_group=EnvWorker.create_group(cfg),
+            actor_name=cfg.actor.group_name,
+            rollout_name=cfg.rollout.group_name,
+            env_name=cfg.env.group_name,
+            resolved=resolved_rlix,
+            worker_max_concurrency=cfg.rlix.worker_max_concurrency,
+            operation_timeout_s=cfg.rlix.operation_timeout_s,
+            enable_gpu_tracing=cfg.rlix.enable_gpu_tracing,
+            bootstrapper=bootstrap_registered_rlix_pipeline,
+        )
+        actor_group = launched.actor
+        rollout_group = launched.rollout
+        env_group = launched.env
+        rlix_runtime = launched.runtime
+    else:
+        from rlinf.scheduler.rlix.entrypoint import launch_standalone_worker_groups
+
+        actor_group, rollout_group, env_group = launch_standalone_worker_groups(
+            cluster=cluster,
+            actor_group_factory=lambda: actor_worker_cls.create_group(cfg),
+            rollout_group_factory=lambda: MultiStepRolloutWorker.create_group(cfg),
+            env_group_factory=lambda: EnvWorker.create_group(cfg),
+            actor_name=cfg.actor.group_name,
+            rollout_name=cfg.rollout.group_name,
+            env_name=cfg.env.group_name,
+            actor_placement=actor_placement,
+            rollout_placement=rollout_placement,
+            env_placement=env_placement,
+        )
 
     reward_group = None
     if cfg.get("reward", {}).get("use_reward_model", False) and not cfg.get(
@@ -117,12 +167,16 @@ def main(cfg) -> None:
             cluster, name=cfg.reward.group_name, placement_strategy=reward_placement
         )
 
+    runner_kwargs = {}
+    if rlix_runtime is not None:
+        runner_kwargs["rlix_runtime"] = rlix_runtime
     runner = EmbodiedRunner(
         cfg=cfg,
         actor=actor_group,
         rollout=rollout_group,
         env=env_group,
         reward=reward_group,
+        **runner_kwargs,
     )
 
     runner.init_workers()

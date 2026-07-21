@@ -63,6 +63,7 @@ class EmbodiedRunner:
         env: Union["EnvWorker", "AsyncEnvWorker"],
         reward: Union["EmbodiedRewardWorker"] = None,
         critic=None,
+        rlix_runtime=None,
     ):
         self.cfg = cfg
         self.actor = actor
@@ -70,6 +71,7 @@ class EmbodiedRunner:
         self.env = env
         self.critic = critic
         self.reward = reward
+        self.rlix_runtime = rlix_runtime
         self.weight_sync_interval = self.cfg.runner.weight_sync_interval
         self.overlap_env_bootstrap = bool(
             self.cfg.runner.get("overlap_env_bootstrap", False)

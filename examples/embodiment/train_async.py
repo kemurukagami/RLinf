@@ -34,6 +34,9 @@ mp.set_start_method("spawn", force=True)
     version_base="1.1", config_path="config", config_name="maniskill_sac_mlp_async"
 )
 def main(cfg) -> None:
+    from rlinf.scheduler.rlix.validation import validate_rlix_entrypoint
+
+    validate_rlix_entrypoint(cfg, entrypoint="train_async")
     cfg = validate_cfg(cfg)
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 

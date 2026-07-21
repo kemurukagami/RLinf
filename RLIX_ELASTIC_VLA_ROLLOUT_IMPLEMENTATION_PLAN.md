@@ -22,7 +22,7 @@ This document uses the shared project task list:
 | T3 | Composite bundle scheduling | Completed |
 | T4 | Elastic progress and release | Completed |
 | T5 | RLinf resize coordinator | Completed |
-| T6 | Placement and configuration | Pending |
+| T6 | Placement and configuration | Completed |
 | T7 | Runner stage integration | Pending |
 | T8 | Verification and GPU acceptance | Pending |
 
@@ -66,6 +66,7 @@ Intentional RLinf deviations are assigned to tasks:
 | --- | --- | --- |
 | T3 | A DP worker is one inference TP bundle costing `tp_size` GPUs. | A DP worker is a rollout/environment bundle whose actual width is its GPU cost. |
 | T3 | No separate policy-sync cluster. | Add fixed `policy_sync` for the actor-plus-rollout union. |
+| T6 | No explicit initialization/evaluation cluster names. | Add fixed auxiliary `initialization` and `evaluation` unions through the existing non-generation fixed path. |
 | T4 | Every inactive rank can expand. | Only eligible cold or paused ranks with assigned remaining work can expand. |
 | T4 | Planned release targets all active ranks. | Add rank-specific release while retaining the old API. |
 | T2/T5 | Shrink aborts an inference request immediately. | Shrink drains at the end of the current world-model chunk. |
@@ -381,8 +382,9 @@ Mappings are disjoint within one pipeline. Different pipelines may register
 overlapping candidate GPU mappings because registration does not reserve
 devices; scheduler allocation and plan validation prevent simultaneous global
 ownership. Width-one mappings represent collocated scheduler ownership only.
-T5 now connects the T2 offload/onload lifecycle to scheduler callbacks. T6/T7
-still own production actor construction and runner-stage invocation.
+T5 now connects the T2 offload/onload lifecycle to scheduler callbacks, and T6
+owns production actor construction and registration. T7 still owns
+runner-stage invocation.
 
 Exit condition:
 
@@ -457,8 +459,9 @@ release batches that preserve sibling ownership and lock-gap waiter ordering.
 
 ### T5: RLinf resize coordinator
 
-Status: completed on 2026-07-20. Production construction and runner invocation
-remain in T6/T7; real two-pipeline GPU acceptance remains in T8.
+Status: completed on 2026-07-20. T6 has since completed production construction
+and registration; runner invocation remains in T7 and real two-pipeline GPU
+acceptance remains in T8.
 
 Purpose:
 
@@ -512,15 +515,38 @@ Exit condition:
 
 ### T6: Placement and configuration
 
+Status: completed on 2026-07-21. Production now performs fail-closed config
+and live-topology validation, immutable one-time placement conversion,
+enabled-only worker concurrency, named coordinator creation, five-cluster
+registration/admission, inactive runner handoff, and reverse bootstrap cleanup.
+The focused T1-T6 RLinf suite passed 236 tests with 1 skip; the complete core
+suite passed 107 tests with 1 skip. T7 allocation/stage ownership remains
+pending.
+
+The hardware-gated Task 6 bootstrap and model-loading smoke defaults to the
+verified local OpenVLA-OFT checkpoint
+`/workspace/VLA/Openvla-oft-SFT-libero-spatial-traj1` and Wan checkpoint
+`/workspace/WM/RLinf-Wan-LIBERO-Spatial`; environment variables may override
+both paths on another host. It initializes the real Hugging Face rollout and
+Wan environment after registration but deliberately leaves actor training
+initialization to later-stage acceptance. On 2026-07-21 it passed on three RTX
+4090 GPUs in 176.18 seconds with the expected `[1, 2]` actor-infer bundle and
+both initialized components in `inactive_cold` state.
+
 Purpose:
 
 - Ensure registered bundle identity matches actual Ray worker placement.
 - Fail unsupported semantics before expensive initialization.
 
+Detailed edit-level design and test plan:
+`TASK_6_PLACEMENT_CONFIGURATION_IMPLEMENTATION_PLAN.md`.
+
 Files and edits:
 
+- `rlix-core/src/rlix_core/protocol/types.py`
 - `rlinf/scheduler/rlix/placement.py`
 - `rlinf/scheduler/rlix/validation.py`
+- `rlinf/scheduler/rlix/runtime.py`
 - `rlinf/config.py`
 - `examples/embodiment/train_embodied_agent.py`
 - Placement/validation unit tests and an elastic config group.
@@ -528,6 +554,13 @@ Files and edits:
 Placement uses resolved `get_placement()` and `local_hardware_ranks`, pairs
 equal rollout/environment process ranks, unions collocated IDs, and registers
 `tp_size=1` regardless of bundle width.
+
+Register exact fixed mappings for `initialization`
+(actor+rollout+environment) and `evaluation` (rollout+environment), in addition
+to actor-only `actor_train`, elastic explicit-bundle `actor_infer`, and
+actor+rollout `policy_sync`. The two new names use the existing generic fixed
+path at `Priority.INITIALIZATION`; they carry no DP ownership and invoke no
+resize callback.
 
 Reject:
 
@@ -542,6 +575,12 @@ async, decoupled, training-pipeline, or bootstrap-overlap modes
 missing offload or unsupported stateful wrappers/GPU reward
 ```
 
+After worker launch and before model/environment initialization, construct the
+T5 named coordinator, register the checked topology with the same namespace,
+and admit it. Hand the inactive registered runtime to T7 without requesting an
+allocation. Bootstrap failure unregisters if needed, closes the coordinator,
+and closes the newly launched groups while preserving the primary error.
+
 Exit condition: CPU tests cover both valid topologies and every rejection.
 
 ### T7: Runner stage integration
@@ -555,7 +594,7 @@ Purpose:
 Files and edits:
 
 - `rlinf/runners/embodied_runner.py`
-- RLix controller protocol/factory
+- registered RLix runtime protocol
 - runner/config tests
 
 Legacy pseudocode:
@@ -585,6 +624,10 @@ per step:
     compute advantages
     acquire fixed all-rank actor_train
     train, advance version, offload, release
+
+    if evaluation is due:
+        acquire fixed evaluation rollout+environment union
+        evaluate, offload, release
 ```
 
 Evaluation remains fixed initially. Failure cleanup preserves the original
@@ -647,11 +690,12 @@ T2 completed (MVP)
 T3 completed
 T4 completed
 T5 completed
-T6 -> T7 -> T8
+T6 completed
+T7 -> T8
 ```
 
 T5 is complete with CPU fake and stubbed-backend in-memory worker protocol
 transactions, core fail-closed integration, and an opt-in local Ray
 naming/handle test. None is a production end-to-end runner test; that requires
-T6-T8. T6 is the next implementation task. No later task is complete until all
+T7-T8. T7 is the next implementation task. No later task is complete until all
 earlier exit conditions it depends on are met.

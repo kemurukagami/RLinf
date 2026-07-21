@@ -1743,6 +1743,6 @@ T2 is complete only when all of the following are true:
 
 T2 completion alone does not mean a GPU can be returned to the shared
 scheduler. T3/T4 now supply composite bundle accounting and release semantics,
-and T5 supplies callback transaction ordering. Safe production runtime return
-still requires T6 placement and actor concurrency, T7 runner barriers, and T8
-two-pipeline GPU acceptance.
+T5 supplies callback transaction ordering, and T6 supplies placement, launch
+concurrency, registration, and admission. Safe production runtime return still
+requires T7 runner barriers and T8 two-pipeline GPU acceptance.

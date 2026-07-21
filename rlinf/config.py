@@ -1332,6 +1332,10 @@ def validate_coding_online_rl_cfg(cfg: DictConfig) -> DictConfig:
 def validate_cfg(cfg: DictConfig) -> DictConfig:
     OmegaConf.set_struct(cfg, True)
 
+    from rlinf.scheduler.rlix.validation import validate_elastic_vla_config
+
+    validate_elastic_vla_config(cfg)
+
     with open_dict(cfg):
         cfg.runner.per_worker_log = cfg.runner.get("per_worker_log", False)
         cfg.runner.per_worker_log_path = None

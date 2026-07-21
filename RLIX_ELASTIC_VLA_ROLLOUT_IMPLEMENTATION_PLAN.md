@@ -591,6 +591,9 @@ Purpose:
 - Seal and train only complete version-consistent batches.
 - Preserve the no-op standalone path.
 
+Detailed edit-level design and test plan:
+`TASK_7_RUNNER_STAGE_INTEGRATION_IMPLEMENTATION_PLAN.md`.
+
 Files and edits:
 
 - `rlinf/runners/embodied_runner.py`

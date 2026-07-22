@@ -29,6 +29,7 @@ from rlinf.scheduler.rlix.protocol import (
 )
 from rlinf.workers.elastic_rollout_lifecycle import (
     CompletedResidencyReceipt,
+    ElasticRankProgress,
     ElasticRankState,
     ElasticRankStatus,
     ElasticRunOutcome,
@@ -93,6 +94,20 @@ class _FakeElasticWorker:
 
     def get_elastic_status(self) -> ElasticRankStatus:
         return self._status()
+
+    def get_elastic_progress(self) -> ElasticRankProgress:
+        return ElasticRankProgress(
+            dp_rank=self.rank,
+            lifecycle_generation=self.lifecycle,
+            state=self.state,
+            assigned_trajectories=2,
+            completed_trajectories=(
+                2 if self.state is ElasticRankState.COMPLETED else 0
+            ),
+            snapshot_ready=self.state
+            in {ElasticRankState.SNAPSHOTTING, ElasticRankState.PAUSED},
+            failed=self.state is ElasticRankState.FAILED_RESIDENT,
+        )
 
     def prepare_elastic_collection(
         self, *, lifecycle_generation: int, expected_policy_version: int
@@ -376,6 +391,29 @@ def test_completed_rank_result_and_token_free_release() -> None:
         assert after.callback_applied_active_ranks == ()
         assert env[0].completed_offload_count == 1
         assert rollout[0].completed_offload_count == 1
+
+    asyncio.run(run())
+
+
+def test_rank_observation_is_repeatable_and_includes_durable_completion() -> None:
+    async def run() -> None:
+        coordinator, env, rollout = _coordinator()
+        await _configure(coordinator)
+        cold = await coordinator.get_rank_observation(0)
+        assert cold.progress is None
+        assert not cold.callback_applied_active
+
+        await coordinator.resize_infer([], [0])
+        env[0].complete_event.set()
+        rollout[0].complete_event.set()
+        await coordinator.get_rank_results(0, wait=True)
+
+        first = await coordinator.get_rank_observation(0)
+        second = await coordinator.get_rank_observation(0)
+        assert first == second
+        assert first.progress.completed_trajectories == 2
+        assert first.paired_results is not None
+        assert first.callback_applied_active
 
     asyncio.run(run())
 

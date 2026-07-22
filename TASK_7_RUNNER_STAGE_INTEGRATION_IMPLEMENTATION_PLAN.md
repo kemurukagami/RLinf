@@ -2,8 +2,82 @@
 
 ## 1. Status and source of truth
 
-Status: planned. T0-T6 are complete; T7 is the next implementation task and
-T8 two-pipeline accelerator acceptance remains pending.
+Status: completed as of 2026-07-22. T0-T7 are complete; T8 two-pipeline
+accelerator acceptance remains pending.
+
+Implemented T7 slice (2026-07-22):
+
+- immutable runner-stage, fixed-worker residency, fixed-stage residency, and
+  elastic-batch receipt types;
+- a synchronous registered-runtime bridge with explicit stage state, exact
+  fixed-device validation, typed completion, fail-closed ownership retention,
+  safe close preconditions, and primary-error preservation;
+- fixed initialization around the existing peak-memory worker initialization
+  and checkpoint-restore order;
+- public per-rank actor, rollout, and environment residency verification;
+- fixed all-rank policy synchronization nested inside the exact T5
+  policy-sync lease, including per-rank applied-version validation and lease
+  completion before scheduler release; and
+- disabled-mode initialization and policy-sync call-order regression tests.
+
+This fixed-stage slice was subsequently integrated with the elastic collection,
+training, evaluation, checkpoint, and entrypoint work described below.
+
+In-progress elastic-collection slice (2026-07-22):
+
+- the runtime now creates a monotonic collection session from canonical bundle
+  ranks and immutable per-rank assignments;
+- coordinator configuration and cold/resumable progress publication precede
+  actor receiver startup and the blocking generation request;
+- partial initial activation is projected only from complete canonical bundles,
+  while split, duplicate, empty, and unknown grants fail closed;
+- a durable, repeatable coordinator rank observation combines peer status,
+  EnvWorker progress, paired results, callback-applied activity, and failure;
+- one monitor pass validates monotonic progress and paired completion, reports
+  durable completion before exact rank release, waits for scheduler commit, and
+  only then reports the rank inactive; and
+- CPU tests cover cold progress ordering, one-rank initial activation, split-
+  bundle ownership retention, repeatable completion observation, and batched
+  completed-rank release ordering;
+- the supported actor now rejects missing, non-CPU, partial, or mixed-version
+  batches and produces a one-use immutable batch receipt; and
+- collection sealing waits for actor receive completion, validates one receipt
+  per actor rank, aggregates the exact trajectory total, clears scheduler
+  progress, and returns the runtime to inactive only after generation ownership
+  is gone.
+
+The production enabled runner uses bounded monitoring/backoff, waits for
+the sealed batch, trains under fixed actor ownership, evaluates and checkpoints
+under fixed ownership, aggregates elastic environment metrics without legacy
+group handles, and closes the runtime through the enabled entrypoint. Elastic
+transition identities now survive trajectory splitting and actor routing, and
+the seal rejects missing, duplicate, stale-lifecycle, or wrong-rank identity
+sets. Checkpoint restore runs inside initialization ownership and reestablishes
+actor CPU residency before release. Component-scoped profiling remains
+explicitly unsupported by enabled-mode validation rather than running outside
+stage ownership.
+
+Final T7 evidence on 2026-07-22: the focused T1-T7 RLinf command passed 231
+tests with 1 optional local-Ray skip; the complete `rlix-core` suite passed 107
+tests with 1 skip. Changed-file Ruff lint and format, compilation, whitespace,
+Wan example composition/pure enabled and disabled validation, and the disabled
+entrypoint import with `rlix_core` deliberately unavailable all passed. A real
+single-pipeline Task 7 smoke entrypoint now exists at
+`tests/e2e_tests/embodied/run_task7_real_runner_smoke.sh`; it runs one
+registered enabled runner iteration and verifies sealed collection, completed
+rank release, post-training offload residency, and runtime close. The launcher
+uses the local OpenVLA-OFT spatial and Wan LIBERO spatial checkpoints by
+default, a three-rank FSDP actor on GPUs 1-3, rollout on GPU 4, and environment
+on GPU 5, with per-GPU and checkpoint environment overrides. Static validation
+of the smoke script passed on 2026-07-22. On the available 128 GB host, the
+full real-model smoke is resource-gated: it reaches real worker initialization
+and fixed policy sync, then Ray kills a worker at host-memory saturation while
+actor ranks extract rollout state (`128.00GB / 128.00GB` observed). This is a
+local capacity limit for the full OpenVLA optimizer/state-sync footprint, not a
+replacement for the T8 accelerator acceptance. The repository-wide core format
+check retains the four documented pre-existing findings in `client.py`,
+`test_gap_ratio.py`, `test_scheduling_cycle.py`, and `test_tracer.py`; Task 7
+did not modify those files.
 
 This document expands Task T7, "Runner stage integration," from these sources,
 in descending order of authority:
@@ -30,37 +104,37 @@ paired-rank design only.
 
 Implementation checklist:
 
-- [ ] Add a synchronous, runner-facing stage API to the registered runtime.
-- [ ] Make fixed-stage acquisition and verified release one fail-closed
+- [x] Add a synchronous, runner-facing stage API to the registered runtime.
+- [x] Make fixed-stage acquisition and verified release one fail-closed
   transaction.
-- [ ] Acquire `initialization` before model/environment initialization and
+- [x] Acquire `initialization` before model/environment initialization and
   establish the all-offloaded baseline before release.
-- [ ] Serialize fixed `policy_sync` allocation with the T5 coordinator lease.
-- [ ] Configure one immutable elastic collection lifecycle before generation
+- [x] Serialize fixed `policy_sync` allocation with the T5 coordinator lease.
+- [x] Configure one immutable elastic collection lifecycle before generation
   allocation is requested.
-- [ ] Publish the initial cold-rank progress snapshot before the blocking
+- [x] Publish the initial cold-rank progress snapshot before the blocking
   `actor_infer` request.
-- [ ] Monitor rank completion, publish durable progress, and request exact
+- [x] Monitor rank completion, publish durable progress, and request exact
   completed-rank release in the T4/T5 order.
-- [ ] Seal the actor batch only after every assigned trajectory has arrived and
+- [x] Seal the actor batch only after every assigned trajectory has arrived and
   every transition has the expected policy version.
-- [ ] Clear progress and release any remaining generation ownership only after
+- [x] Clear progress and release any remaining generation ownership only after
   the complete batch is sealed and worker residency is verified.
-- [ ] Compute advantages only from the sealed CPU batch, then acquire
+- [x] Compute advantages only from the sealed CPU batch, then acquire
   `actor_train` around all-rank FSDP training and verify actor offload before
   release.
-- [ ] Advance the runner policy version only after successful optimizer
+- [x] Advance the runner policy version only after successful optimizer
   completion.
-- [ ] Acquire fixed `evaluation` around evaluation after an all-rank policy
+- [x] Acquire fixed `evaluation` around evaluation after an all-rank policy
   sync, then verify rollout/environment offload before release.
-- [ ] Preserve the exact standalone call order when `rlix_runtime is None`.
-- [ ] Close the registered runtime on normal exit and preserve the primary
+- [x] Preserve the exact standalone call order when `rlix_runtime is None`.
+- [x] Close the registered runtime on normal exit and preserve the primary
   exception when cleanup also fails.
-- [ ] Add CPU fake-worker/runtime tests for ordering, partial activation, live
+- [x] Add CPU fake-worker/runtime tests for ordering, partial activation, live
   resize, sealing, failure, cleanup, and disabled-mode parity.
-- [ ] Run the focused T1-T7, complete `rlix-core`, lint, format, compilation,
+- [x] Run the focused T1-T7, complete `rlix-core`, lint, format, compilation,
   configuration, and dependency-boundary checks.
-- [ ] Update the canonical status documents only after every definition-of-done
+- [x] Update the canonical status documents only after every definition-of-done
   item in section 19 passes.
 
 Do not mark T7 complete from unit tests alone if no production entrypoint uses

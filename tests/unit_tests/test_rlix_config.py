@@ -88,6 +88,7 @@ def test_enabled_mode_inserts_documented_defaults() -> None:
         ("rlix.operation_timeout_s", 0, "operation_timeout_s"),
         ("rlix.enable_gpu_tracing", 1, "enable_gpu_tracing"),
         ("cluster.num_nodes", 2, "cluster.num_nodes"),
+        ("cluster.profiling.enabled", True, "cluster.profiling.enabled"),
         ("runner.task_type", "embodied_eval", "runner.task_type"),
         ("runner.only_eval", True, "runner.only_eval"),
         ("runner.enable_decoupled_mode", True, "enable_decoupled_mode"),

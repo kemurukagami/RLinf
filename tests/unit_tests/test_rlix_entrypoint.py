@@ -10,6 +10,7 @@ from rlinf.scheduler.rlix.entrypoint import (
     launch_registered_rlix_workers,
     launch_standalone_worker_groups,
     preflight_rlix_placements,
+    run_registered_rlix_runner,
 )
 
 
@@ -246,3 +247,32 @@ def test_enabled_launch_failure_closes_all_groups_in_reverse_order() -> None:
         "close:rollout",
         "close:actor",
     ]
+
+
+def test_registered_runner_closes_runtime_after_success() -> None:
+    events: list[str] = []
+    runner = SimpleNamespace(
+        init_workers=lambda: events.append("init"),
+        run=lambda: events.append("run"),
+    )
+    runtime = SimpleNamespace(close_sync=lambda: events.append("close"))
+
+    run_registered_rlix_runner(runner=runner, runtime=runtime)
+
+    assert events == ["init", "run", "close"]
+
+
+def test_registered_runner_preserves_primary_error_when_close_fails() -> None:
+    def fail_run() -> None:
+        raise ValueError("run failed")
+
+    def fail_close() -> None:
+        raise RuntimeError("close failed")
+
+    runner = SimpleNamespace(init_workers=lambda: None, run=fail_run)
+    runtime = SimpleNamespace(close_sync=fail_close)
+
+    with pytest.raises(ValueError, match="run failed") as exc_info:
+        run_registered_rlix_runner(runner=runner, runtime=runtime)
+
+    assert any("close failed" in note for note in exc_info.value.__notes__)

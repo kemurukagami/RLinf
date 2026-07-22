@@ -49,6 +49,7 @@ from rlinf.envs.world_model.base_world_env import (
 )
 from rlinf.envs.wrappers import RecordVideo
 from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
+from rlinf.scheduler.rlix.protocol import FixedWorkerResidency
 from rlinf.utils.data_iter_utils import split_list
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
 from rlinf.utils.metric_utils import compute_split_num
@@ -286,6 +287,27 @@ class EnvWorker(Worker):
             model_resident=self._environment_resident,
             cuda_graph_captured=False,
             failure=self._elastic_failure,
+        )
+
+    def get_rlix_fixed_residency(self) -> FixedWorkerResidency:
+        """Verify training and evaluation world environments are offloaded."""
+        if self.enable_train and not self.train_enable_offload:
+            raise RuntimeError("RLix environment residency requires train offload")
+        if self._environment_resident:
+            raise RuntimeError("training environment remains resident")
+        for env in (*self.env_list, *self.eval_env_list):
+            verifier = get_env_attr(env, "verify_elastic_residency")
+            if not callable(verifier):
+                raise RuntimeError(
+                    "environment does not expose public residency verification"
+                )
+            verifier(resident=False)
+        return FixedWorkerResidency(
+            component="environment",
+            rank=self._rank,
+            model_resident=False,
+            optimizer_resident=False,
+            cuda_graph_captured=False,
         )
 
     def get_elastic_status(self) -> ElasticRankStatus:
@@ -2027,6 +2049,7 @@ class EnvWorker(Worker):
                         ),
                         forward_inputs=rollout_result.forward_inputs,
                         versions=rollout_result.versions,
+                        transition_id=rollout_result.transition_id,
                         dones=env_output.dones,
                         truncations=env_output.truncations,
                         terminations=env_output.terminations,
@@ -2191,6 +2214,7 @@ class EnvWorker(Worker):
                     truncations=env_output.truncations,
                     terminations=env_output.terminations,
                     rewards=rewards,
+                    transition_id=rollout_result.transition_id,
                 )
                 self.rollout_results[stage_id].append_step_result(chunk_step_result)
                 if (

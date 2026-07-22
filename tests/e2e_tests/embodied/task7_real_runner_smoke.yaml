@@ -1,0 +1,26 @@
+models:
+  vla:
+    checkpoint: ${oc.env:RLINF_VLA_CHECKPOINT,/workspace/VLA/Openvla-oft-SFT-libero-spatial-traj1}
+    precision: bf16
+    unnorm_key: libero_spatial_no_noops
+  world_model:
+    checkpoint: ${oc.env:RLINF_WM_CHECKPOINT,/workspace/WM/RLinf-Wan-LIBERO-Spatial}
+    num_inference_steps: 1
+
+smoke:
+  base_config: wan_libero_spatial_grpo_openvlaoft_rlix
+  actor_gpus:
+    - ${oc.env:RLINF_TASK7_ACTOR_GPU_0,1}
+    - ${oc.env:RLINF_TASK7_ACTOR_GPU_1,2}
+    - ${oc.env:RLINF_TASK7_ACTOR_GPU_2,3}
+  rollout_gpu: ${oc.env:RLINF_TASK7_ROLLOUT_GPU,4}
+  env_gpu: ${oc.env:RLINF_TASK7_ENV_GPU,5}
+  operation_timeout_s: 900.0
+  output_dir: ${oc.env:RLINF_TASK7_SMOKE_OUTPUT,/tmp/rlinf_task7_real_runner_smoke}
+  total_num_envs: 3
+  rollout_epoch: 1
+  max_episode_steps: 8
+  max_steps_per_rollout_epoch: 8
+  max_train_steps: 1
+  run_evaluation: ${oc.env:RLINF_TASK7_RUN_EVALUATION,false}
+  save_checkpoint: ${oc.env:RLINF_TASK7_SAVE_CHECKPOINT,false}

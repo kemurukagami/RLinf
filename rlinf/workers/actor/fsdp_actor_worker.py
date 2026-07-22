@@ -43,6 +43,7 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Channel, Cluster, Worker
+from rlinf.scheduler.rlix.protocol import ElasticBatchReceipt, FixedWorkerResidency
 from rlinf.utils.data_iter_utils import (
     get_iterator_k_split,
     get_reverse_idx,
@@ -1058,6 +1059,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self._rollout_all_ranks = list(
             range(self._component_placement.get_world_size("rollout"))
         )
+        self._rlix_batch_receipt: ElasticBatchReceipt | None = None
 
     def init_worker(self) -> None:
         """
@@ -1068,6 +1070,46 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         if self.enable_offload:
             self.offload_param_and_grad()
+            self.offload_optimizer()
+
+    def get_rlix_fixed_residency(self) -> FixedWorkerResidency:
+        """Verify actor model, gradients, and optimizer are CPU-resident."""
+        if not self.enable_offload:
+            raise RuntimeError("RLix actor residency requires actor offload")
+        if not self.is_weight_offloaded or not self.is_optimizer_offloaded:
+            raise RuntimeError("actor weights or optimizer are not marked offloaded")
+        for parameter in self.model.parameters():
+            if parameter.device.type != "cpu":
+                raise RuntimeError("actor parameter remains accelerator-resident")
+            if parameter.grad is not None and parameter.grad.device.type != "cpu":
+                raise RuntimeError("actor gradient remains accelerator-resident")
+        for buffer in self.model.buffers():
+            if buffer.device.type != "cpu":
+                raise RuntimeError("actor buffer remains accelerator-resident")
+        pending: list[object] = [self.optimizer.state]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, torch.Tensor) and value.device.type != "cpu":
+                raise RuntimeError("actor optimizer state remains accelerator-resident")
+            if isinstance(value, dict):
+                pending.extend(value.values())
+            elif isinstance(value, (list, tuple)):
+                pending.extend(value)
+        return FixedWorkerResidency(
+            component="actor",
+            rank=self._rank,
+            model_resident=False,
+            optimizer_resident=False,
+            cuda_graph_captured=False,
+            policy_version=self.version,
+        )
+
+    def load_rlix_checkpoint(self, load_path: str) -> None:
+        """Restore a checkpoint under a fixed grant, then reestablish CPU residency."""
+        self.load_checkpoint(load_path)
+        if not self.is_weight_offloaded:
+            self.offload_param_and_grad(True)
+        if not self.is_optimizer_offloaded:
             self.offload_optimizer()
 
     def model_provider_func(self) -> nn.Module:
@@ -1141,6 +1183,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         Args:
             input_channel: The input channel to read from.
         """
+        if self._rlix_batch_receipt is not None:
+            raise RuntimeError("previous RLix actor batch has not been consumed")
         clear_memory(sync=False)
 
         send_num = self._component_placement.get_world_size("env") * self.stage_num
@@ -1152,9 +1196,101 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
             recv_list.append(trajectory)
 
+        transition_ids = tuple(
+            transition_id
+            for trajectory in recv_list
+            for transition_id in trajectory.transition_ids
+        )
+        if transition_ids and len(set(transition_ids)) != len(transition_ids):
+            raise ValueError("actor received duplicate elastic transition identities")
+        self._rlix_received_transition_ids = transition_ids
+
         self.rollout_batch = convert_trajectories_to_batch(recv_list)
 
         self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
+
+    def seal_rlix_batch(
+        self,
+        *,
+        lifecycle_generation: int,
+        policy_version: int,
+        contributing_dp_ranks: tuple[int, ...],
+        expected_trajectories: int,
+    ) -> ElasticBatchReceipt:
+        """Validate the received CPU batch before advantages or training."""
+        if self._rlix_batch_receipt is not None:
+            raise RuntimeError("RLix actor batch is already sealed")
+        if not isinstance(getattr(self, "rollout_batch", None), dict):
+            raise RuntimeError("actor has no received rollout batch")
+        versions = self.rollout_batch.get("versions")
+        if not isinstance(versions, torch.Tensor) or versions.numel() == 0:
+            raise RuntimeError("actor rollout batch has no policy versions")
+        if versions.device.type != "cpu":
+            raise RuntimeError("actor rollout batch must be CPU-owned at seal time")
+        if not bool(torch.all(versions == policy_version).item()):
+            raise ValueError("actor rollout batch contains mixed policy versions")
+        if versions.ndim < 2:
+            raise ValueError("actor rollout versions must include a batch dimension")
+        transition_ids = getattr(self, "_rlix_received_transition_ids", ())
+        if not transition_ids:
+            raise RuntimeError("actor rollout batch has no transition identities")
+        if len(set(transition_ids)) != len(transition_ids):
+            raise ValueError("actor rollout batch has duplicate transition identities")
+        if any(
+            identity.lifecycle_generation != lifecycle_generation
+            for identity in transition_ids
+        ):
+            raise ValueError("actor transition lifecycle does not match collection")
+        observed_ranks = tuple(
+            sorted({identity.env_worker_rank for identity in transition_ids})
+        )
+        if observed_ranks != contributing_dp_ranks:
+            raise ValueError("actor transition ranks do not match collection")
+        received_trajectories = int(versions.shape[1])
+        receipt = ElasticBatchReceipt(
+            lifecycle_generation=lifecycle_generation,
+            policy_version=policy_version,
+            contributing_dp_ranks=contributing_dp_ranks,
+            expected_trajectories=expected_trajectories,
+            received_trajectories=received_trajectories,
+            transition_count=len(transition_ids),
+        )
+        self._rlix_batch_receipt = receipt
+        return receipt
+
+    def run_rlix_training(self, batch_receipt: ElasticBatchReceipt) -> dict:
+        """Train exactly the sealed batch and establish an offloaded baseline."""
+        local_receipt = self._rlix_batch_receipt
+        if local_receipt is None:
+            raise RuntimeError("actor has no sealed RLix batch")
+        if not isinstance(batch_receipt, ElasticBatchReceipt):
+            raise TypeError("batch_receipt must be an ElasticBatchReceipt")
+        if (
+            batch_receipt.lifecycle_generation != local_receipt.lifecycle_generation
+            or batch_receipt.policy_version != local_receipt.policy_version
+        ):
+            raise ValueError("training receipt does not match the sealed actor batch")
+        primary_error: BaseException | None = None
+        try:
+            metrics = self.run_training()
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                if not self.is_weight_offloaded:
+                    self.offload_param_and_grad(True)
+                if not self.is_optimizer_offloaded:
+                    self.offload_optimizer()
+            except Exception as cleanup_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    "Actor offload after failed RLix training also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+        self._rlix_batch_receipt = None
+        return metrics
 
     def _process_received_rollout_batch(
         self, rollout_batch: dict[str, torch.Tensor]

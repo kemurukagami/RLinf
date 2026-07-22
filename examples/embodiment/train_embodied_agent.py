@@ -179,8 +179,13 @@ def main(cfg) -> None:
         **runner_kwargs,
     )
 
-    runner.init_workers()
-    runner.run()
+    if rlix_runtime is None:
+        runner.init_workers()
+        runner.run()
+    else:
+        from rlinf.scheduler.rlix.entrypoint import run_registered_rlix_runner
+
+        run_registered_rlix_runner(runner=runner, runtime=rlix_runtime)
 
 
 if __name__ == "__main__":

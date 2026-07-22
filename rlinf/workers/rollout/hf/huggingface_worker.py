@@ -39,6 +39,7 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
+from rlinf.scheduler.rlix.protocol import FixedWorkerResidency
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.elastic_rollout_lifecycle import (
     CompletedResidencyReceipt,
@@ -280,6 +281,22 @@ class MultiStepRolloutWorker(Worker):
         """Return the local elastic lifecycle status for this rollout rank."""
 
         return self._elastic_status()
+
+    def get_rlix_fixed_residency(self) -> FixedWorkerResidency:
+        """Verify this rollout rank has no model or CUDA-graph residency."""
+        if not self.enable_offload:
+            raise RuntimeError("RLix rollout residency requires rollout offload")
+        if self._model_resident or self._cuda_graph_captured:
+            raise RuntimeError("rollout model or CUDA graph remains resident")
+        self._verify_rollout_model_residency(resident=False)
+        return FixedWorkerResidency(
+            component="rollout",
+            rank=self._rank,
+            model_resident=False,
+            optimizer_resident=False,
+            cuda_graph_captured=False,
+            policy_version=self.version,
+        )
 
     def _validate_elastic_rollout_capability(self) -> None:
         if not self.enable_train:

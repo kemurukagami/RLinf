@@ -14,6 +14,7 @@ from rlix_core.protocol.types import ActionResponse
 from rlinf.workers.elastic_rollout_lifecycle import (
     CompletedResidencyReceipt,
     DrainRequest,
+    ElasticRankProgress,
     ElasticRankState,
     ElasticRankStatus,
     ElasticRunOutcome,
@@ -22,7 +23,12 @@ from rlinf.workers.elastic_rollout_lifecycle import (
     SafePointToken,
 )
 
-from .protocol import CoordinatorStatus, ElasticCollectionContext, PolicySyncLease
+from .protocol import (
+    CoordinatorStatus,
+    ElasticCollectionContext,
+    ElasticRankObservation,
+    PolicySyncLease,
+)
 
 
 class ResizeCoordinatorError(RuntimeError):
@@ -846,6 +852,48 @@ class RLixResizeCoordinator:
         record.last_env_result = env_result
         record.last_rollout_result = rollout_result
         return env_result, rollout_result
+
+    async def get_rank_observation(self, rank: int) -> ElasticRankObservation:
+        """Return status, progress, and durable results without consuming them."""
+        if rank not in self._records:
+            raise ValueError(f"unknown rank {rank}")
+        context = self._require_collection()
+        env_status, rollout_status = await self._get_pair_status(rank)
+        self._validate_status_identity(
+            rank,
+            env_status,
+            context,
+            allow_cold=True,
+        )
+        self._validate_status_identity(
+            rank,
+            rollout_status,
+            context,
+            allow_cold=True,
+        )
+        progress = None
+        if env_status.state is not ElasticRankState.INACTIVE_COLD:
+            progress_task = self._launch(
+                self._env_workers[rank], "get_elastic_progress"
+            )
+            (progress,) = await self._wait_tasks(
+                (progress_task,), operation=f"rank {rank} progress query"
+            )
+            if not isinstance(progress, ElasticRankProgress):
+                raise ResizeCoordinatorError(
+                    f"rank {rank} returned invalid elastic progress"
+                )
+        paired_results = await self.get_rank_results(rank, wait=False)
+        record = self._records[rank]
+        return ElasticRankObservation(
+            dp_rank=rank,
+            env_status=env_status,
+            rollout_status=rollout_status,
+            progress=progress,
+            paired_results=paired_results,
+            callback_applied_active=record.callback_applied_active,
+            failure=record.failure,
+        )
 
     async def close(self) -> None:
         """Close only after all rank work and synchronization have stopped."""

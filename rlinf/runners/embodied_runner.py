@@ -163,6 +163,34 @@ class EmbodiedRunner:
         )
 
     def init_workers(self):
+        if self.rlix_runtime is None:
+            self._initialize_workers_and_resume()
+            return
+
+        from rlix_core.protocol.types import (
+            INITIALIZATION_CLUSTER_NAME,
+            Priority,
+        )
+
+        with self.rlix_runtime.fixed_stage(
+            cluster_name=INITIALIZATION_CLUSTER_NAME,
+            priority=Priority.INITIALIZATION,
+            global_step=self.global_step,
+        ) as stage:
+            self._initialize_workers_and_resume()
+            residencies = self._get_rlix_fixed_residencies(
+                self.actor, self.rollout, self.env
+            )
+            stage.complete(
+                self.rlix_runtime.fixed_residency_receipt(
+                    cluster_name=INITIALIZATION_CLUSTER_NAME,
+                    worker_residencies=residencies,
+                    policy_version=self.global_step,
+                )
+            )
+
+    def _initialize_workers_and_resume(self) -> None:
+        """Initialize in legacy peak-memory order and restore actor state."""
         # create worker in order to decrease the maximum memory usage
         rollout_handle = self.rollout.init_worker()
         env_handle = self.env.init_worker()
@@ -183,16 +211,148 @@ class EmbodiedRunner:
         assert os.path.exists(actor_checkpoint_path), (
             f"resume_dir {actor_checkpoint_path} does not exist."
         )
-        self.actor.load_checkpoint(actor_checkpoint_path).wait()
+        if self.rlix_runtime is None:
+            self.actor.load_checkpoint(actor_checkpoint_path).wait()
+        else:
+            self.actor.load_rlix_checkpoint(actor_checkpoint_path).wait()
         self.global_step = int(resume_dir.split("global_step_")[-1])
 
+    @staticmethod
+    def _get_rlix_fixed_residencies(*worker_groups) -> list:
+        """Collect public per-rank residency observations from worker groups."""
+        residencies = []
+        for worker_group in worker_groups:
+            results = worker_group.get_rlix_fixed_residency().wait()
+            if not isinstance(results, list):
+                raise TypeError("RLix worker residency query must return a list")
+            residencies.extend(results)
+        return residencies
+
     def update_rollout_weights(self):
+        if self.rlix_runtime is None:
+            self._sync_rollout_weights()
+            return
+
+        from rlix_core.protocol.types import POLICY_SYNC_CLUSTER_NAME
+
+        with self.rlix_runtime.policy_sync_stage(
+            expected_policy_version=self.global_step
+        ) as stage:
+            self._sync_rollout_weights()
+            residencies = self._get_rlix_fixed_residencies(self.actor, self.rollout)
+            stage.complete(
+                self.rlix_runtime.fixed_residency_receipt(
+                    cluster_name=POLICY_SYNC_CLUSTER_NAME,
+                    worker_residencies=residencies,
+                    policy_version=self.global_step,
+                )
+            )
+
+    def _sync_rollout_weights(self) -> None:
+        """Run the existing all-rank actor/rollout collective pair."""
         rollout_handle: Handle = self.rollout.sync_model_from_actor()
         actor_handle: Handle = self.actor.sync_model_to_rollout()
         actor_handle.wait()
         rollout_handle.wait()
 
+    def _collect_rlix_rollouts(self):
+        """Collect and seal one elastic, policy-version-consistent actor batch."""
+        canonical_ranks = tuple(
+            rank for rank, _ in self.rlix_runtime.placement_plan.actor_infer_bundles
+        )
+        total_num_envs = int(self.cfg.env.train.total_num_envs)
+        if total_num_envs % len(canonical_ranks) != 0:
+            raise ValueError("training environments do not divide across RLix ranks")
+        assigned_per_rank = (
+            total_num_envs
+            // len(canonical_ranks)
+            * int(self.cfg.env.train.rollout_epoch)
+        )
+        assignments = dict.fromkeys(canonical_ranks, assigned_per_rank)
+        reward_handle = None
+        if self.reward is not None:
+            reward_handle = self.reward.compute_rewards(
+                input_channel=self.reward_channel,
+                output_channel=self.env_channel,
+            )
+        session = self.rlix_runtime.begin_collection(
+            policy_version=self.global_step,
+            assigned_trajectories_by_rank=assignments,
+            env_input_channel=self.env_channel,
+            rollout_request_channel=self.rollout_channel,
+            reward_channel=self.reward_channel,
+            actor_channel=self.actor_channel,
+            actor_receiver_start=lambda: self.actor.recv_rollout_trajectories(
+                input_channel=self.actor_channel
+            ),
+        )
+        poll_interval_s = float(self.cfg.rlix.get("monitor_poll_interval_s", 0.01))
+        self.rlix_runtime.wait_for_collection(
+            session,
+            poll_interval_s=poll_interval_s,
+        )
+        if reward_handle is not None:
+            reward_handle.wait()
+        self._last_rlix_reward_handle = reward_handle
+        receipt = self.rlix_runtime.seal_collection(
+            session,
+            actor_seal_start=lambda expected: self.actor.seal_rlix_batch(
+                lifecycle_generation=session.context.lifecycle_generation,
+                policy_version=session.context.policy_version,
+                contributing_dp_ranks=session.context.dp_ranks,
+                expected_trajectories=expected,
+            ),
+        )
+        self._last_rlix_collection_session = session
+        return receipt
+
+    def _train_rlix_batch(self, batch_receipt):
+        """Train one sealed batch under fixed all-rank actor ownership."""
+        from rlix_core.protocol.types import ACTOR_TRAIN_CLUSTER_NAME, Priority
+
+        actor_rollout_metrics = self.actor.compute_advantages_and_returns().wait()
+        with self.rlix_runtime.fixed_stage(
+            cluster_name=ACTOR_TRAIN_CLUSTER_NAME,
+            priority=Priority.ACTOR_TRAINING,
+            global_step=self.global_step,
+        ) as stage:
+            training_handle = self.actor.run_rlix_training(batch_receipt)
+            actor_training_metrics = training_handle.wait()
+            residencies = self._get_rlix_fixed_residencies(self.actor)
+            stage.complete(
+                self.rlix_runtime.fixed_residency_receipt(
+                    cluster_name=ACTOR_TRAIN_CLUSTER_NAME,
+                    worker_residencies=residencies,
+                    policy_version=self.global_step,
+                )
+            )
+        self.global_step += 1
+        return actor_rollout_metrics, actor_training_metrics, training_handle
+
     def evaluate(self):
+        if self.rlix_runtime is None:
+            return self._evaluate_workers()
+
+        from rlix_core.protocol.types import EVALUATION_CLUSTER_NAME, Priority
+
+        with self.rlix_runtime.fixed_stage(
+            cluster_name=EVALUATION_CLUSTER_NAME,
+            priority=Priority.INITIALIZATION,
+            global_step=self.global_step,
+        ) as stage:
+            eval_metrics = self._evaluate_workers()
+            residencies = self._get_rlix_fixed_residencies(self.rollout, self.env)
+            stage.complete(
+                self.rlix_runtime.fixed_residency_receipt(
+                    cluster_name=EVALUATION_CLUSTER_NAME,
+                    worker_residencies=residencies,
+                    policy_version=self.global_step,
+                )
+            )
+        return eval_metrics
+
+    def _evaluate_workers(self):
+        """Run the existing paired rollout/environment evaluation."""
         env_handle: Handle = self.env.evaluate(
             input_channel=self.env_channel,
             rollout_channel=self.rollout_channel,
@@ -478,6 +638,8 @@ class EmbodiedRunner:
         self.logger.info(f"Closed profiling window at step {step_idx}")
 
     def run(self):
+        if self.rlix_runtime is not None:
+            return self._run_rlix()
         if self.cfg.runner.get("use_training_pipeline", False):
             return self.run_pipeline()
 
@@ -563,6 +725,101 @@ class EmbodiedRunner:
 
         self._finish_run()
 
+    def _run_rlix(self) -> None:
+        """Run the supported synchronous loop through registered stage ownership."""
+        if self.cfg.runner.get("use_training_pipeline", False):
+            raise RuntimeError("RLix does not support the training pipeline runner")
+        start_step = self.global_step
+        start_time = time.time()
+        for _step in range(start_step, self.max_steps):
+            if self._should_profile_step(self.global_step):
+                raise RuntimeError(
+                    "RLix profiling requires component-scoped stage integration"
+                )
+            self.actor.set_global_step(self.global_step)
+            self.rollout.set_global_step(self.global_step)
+            with self.timer("step"):
+                with self.timer("sync_weights"):
+                    if _step % self.weight_sync_interval == 0:
+                        self.update_rollout_weights()
+                with self.timer("generate_rollouts"):
+                    batch_receipt = self._collect_rlix_rollouts()
+                with self.timer("cal_adv_and_returns"):
+                    (
+                        actor_rollout_metrics,
+                        actor_training_metrics,
+                        _,
+                    ) = self._train_rlix_batch(batch_receipt)
+                eval_metrics = self._maybe_eval_and_checkpoint(_step)
+            self._log_rlix_step_metrics(
+                step=_step,
+                start_time=start_time,
+                start_step=start_step,
+                actor_rollout_metrics=actor_rollout_metrics,
+                actor_training_metrics=actor_training_metrics,
+                eval_metrics=eval_metrics,
+            )
+        self._finish_run()
+
+    def _log_rlix_step_metrics(
+        self,
+        *,
+        step: int,
+        start_time: float,
+        start_step: int,
+        actor_rollout_metrics: list[dict],
+        actor_training_metrics: list[dict],
+        eval_metrics: dict,
+    ) -> None:
+        """Log elastic results without legacy environment group handles."""
+        time_metrics = {
+            f"time/{key}": value
+            for key, value in self.timer.consume_durations().items()
+        }
+        session = self._last_rlix_collection_session
+        env_metrics_list = [
+            session.final_env_metrics[rank]
+            for rank in sorted(session.final_env_metrics)
+        ]
+        env_metrics = (
+            compute_evaluate_metrics(env_metrics_list) if env_metrics_list else {}
+        )
+        env_metrics = {f"env/{key}": value for key, value in env_metrics.items()}
+        rollout_metrics = {
+            f"rollout/{key}": value
+            for key, value in self._aggregate_numeric_metrics(
+                actor_rollout_metrics
+            ).items()
+        }
+        training_metrics = {
+            f"train/{key}": value
+            for key, value in self._aggregate_numeric_metrics(
+                actor_training_metrics
+            ).items()
+        }
+        for metrics in (
+            time_metrics,
+            env_metrics,
+            rollout_metrics,
+            training_metrics,
+            eval_metrics,
+        ):
+            self.metric_logger.log(metrics, step)
+        logging_metrics = {
+            **time_metrics,
+            **env_metrics,
+            **rollout_metrics,
+            **training_metrics,
+            **eval_metrics,
+        }
+        self.print_metrics_table_async(
+            step,
+            self.max_steps,
+            start_time,
+            logging_metrics,
+            start_step,
+        )
+
     def run_pipeline(self):
         start_step = self.global_step
         start_time = time.time()
@@ -643,6 +900,28 @@ class EmbodiedRunner:
         self._finish_run()
 
     def _save_checkpoint(self):
+        if self.rlix_runtime is not None:
+            from rlix_core.protocol.types import ACTOR_TRAIN_CLUSTER_NAME, Priority
+
+            with self.rlix_runtime.fixed_stage(
+                cluster_name=ACTOR_TRAIN_CLUSTER_NAME,
+                priority=Priority.ACTOR_TRAINING,
+                global_step=self.global_step,
+            ) as stage:
+                self._save_checkpoint_workers()
+                residencies = self._get_rlix_fixed_residencies(self.actor)
+                stage.complete(
+                    self.rlix_runtime.fixed_residency_receipt(
+                        cluster_name=ACTOR_TRAIN_CLUSTER_NAME,
+                        worker_residencies=residencies,
+                        policy_version=self.global_step,
+                    )
+                )
+            return
+        self._save_checkpoint_workers()
+
+    def _save_checkpoint_workers(self) -> None:
+        """Save actor state using the existing checkpoint layout."""
         self.logger.info(f"Saving checkpoint at step {self.global_step}.")
         base_output_dir = os.path.join(
             self.cfg.runner.logger.log_path,

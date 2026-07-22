@@ -11,14 +11,29 @@ from .placement import (
     resolve_rlix_placements,
 )
 from .progress import ElasticPipelineProgress, ElasticProgressTracker
-from .protocol import CoordinatorStatus, ElasticCollectionContext, PolicySyncLease
+from .protocol import (
+    CoordinatorStatus,
+    ElasticBatchReceipt,
+    ElasticCollectionContext,
+    ElasticRankObservation,
+    FixedStageResidencyReceipt,
+    FixedWorkerResidency,
+    PolicySyncLease,
+    RunnerStageState,
+)
 
 __all__ = [
     "CoordinatorStatus",
+    "ElasticBatchReceipt",
+    "ElasticCollectionSession",
     "ElasticCollectionContext",
     "ElasticPipelineProgress",
     "ElasticProgressTracker",
+    "ElasticRankObservation",
+    "FixedStageResidencyReceipt",
+    "FixedWorkerResidency",
     "PolicySyncLease",
+    "RunnerStageState",
     "RLixPlacementPlan",
     "RLixResizeCoordinator",
     "RLixStageController",
@@ -42,13 +57,19 @@ def __getattr__(name: str) -> Any:
         from .controller import RLixStageController
 
         return RLixStageController
-    if name in {"RegisteredRLixPipeline", "bootstrap_registered_rlix_pipeline"}:
+    if name in {
+        "ElasticCollectionSession",
+        "RegisteredRLixPipeline",
+        "bootstrap_registered_rlix_pipeline",
+    }:
         from .runtime import (
+            ElasticCollectionSession,
             RegisteredRLixPipeline,
             bootstrap_registered_rlix_pipeline,
         )
 
         return {
+            "ElasticCollectionSession": ElasticCollectionSession,
             "RegisteredRLixPipeline": RegisteredRLixPipeline,
             "bootstrap_registered_rlix_pipeline": bootstrap_registered_rlix_pipeline,
         }[name]

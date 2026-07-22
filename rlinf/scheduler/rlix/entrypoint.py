@@ -117,9 +117,31 @@ def launch_registered_rlix_workers(
     )
 
 
+def run_registered_rlix_runner(*, runner: Any, runtime: Any) -> None:
+    """Run enabled initialization/training and preserve errors during close."""
+    primary_error: BaseException | None = None
+    try:
+        runner.init_workers()
+        runner.run()
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            runtime.close_sync()
+        except Exception as cleanup_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(
+                "RLix runtime close also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+
+
 __all__ = [
     "LaunchedRLixWorkers",
     "launch_registered_rlix_workers",
     "launch_standalone_worker_groups",
     "preflight_rlix_placements",
+    "run_registered_rlix_runner",
 ]

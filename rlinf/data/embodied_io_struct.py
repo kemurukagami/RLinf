@@ -567,8 +567,13 @@ class ChunkStepResult:
     rewards: torch.Tensor = None  # [B, 1]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
+    transition_id: RolloutTransitionIdentity | None = None
 
     def __post_init__(self):
+        if self.transition_id is not None and not isinstance(
+            self.transition_id, RolloutTransitionIdentity
+        ):
+            raise TypeError("transition_id must be a RolloutTransitionIdentity or None")
         if self.actions is not None:
             self.actions = self.actions.cpu().contiguous()
         if self.prev_logprobs is not None:
@@ -606,6 +611,7 @@ class Trajectory:
     prev_logprobs: torch.Tensor = None
     prev_values: torch.Tensor = None
     versions: torch.Tensor = None
+    transition_ids: tuple[RolloutTransitionIdentity, ...] = ()
     forward_inputs: dict[str, Any] = field(default_factory=dict)
 
     curr_obs: dict[str, Any] = field(default_factory=dict)
@@ -706,6 +712,7 @@ class Trajectory:
                 Trajectory(
                     max_episode_length=self.max_episode_length,
                     model_weights_id=self.model_weights_id,
+                    transition_ids=self.transition_ids,
                     actions=actions,
                     intervene_flags=intervene_flags,
                     rewards=rewards,
@@ -751,6 +758,7 @@ class EmbodiedRolloutResult:
         default_factory=list
     )  # trajectory_length + rollout_epoch
     versions: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
+    transition_ids: list[RolloutTransitionIdentity] = field(default_factory=list)
     forward_inputs: list[dict[str, Any]] = field(
         default_factory=list
     )  # trajectory_length
@@ -778,6 +786,8 @@ class EmbodiedRolloutResult:
             self.prev_values.append(result.prev_values)
         if result.versions is not None:
             self.versions.append(result.versions)
+        if result.transition_id is not None:
+            self.transition_ids.append(result.transition_id)
         if result.forward_inputs:
             self.forward_inputs.append(result.forward_inputs)
 
@@ -858,6 +868,7 @@ class EmbodiedRolloutResult:
         self.prev_logprobs.clear()
         self.prev_values.clear()
         self.versions.clear()
+        self.transition_ids.clear()
         self.forward_inputs.clear()
         self.curr_obs.clear()
         self.next_obs.clear()
@@ -866,6 +877,7 @@ class EmbodiedRolloutResult:
         # return [trajectory_length, B, ...]
         trajectory = Trajectory(
             max_episode_length=self.max_episode_length,
+            transition_ids=tuple(self.transition_ids),
         )
         if len(self.actions) > 0:
             trajectory.actions = torch.stack(self.actions, dim=0).cpu().contiguous()
@@ -954,7 +966,7 @@ class EmbodiedRolloutResult:
             if value is None or isinstance(value, dict):
                 continue
 
-            if isinstance(value, int) or isinstance(value, str):
+            if isinstance(value, (int, str, tuple)):
                 for i in range(split_size):
                     setattr(splited_trajectories[i], field_name, value)
                 continue
@@ -980,7 +992,7 @@ class EmbodiedRolloutResult:
             value = getattr(trajectory, field_name)
             if value is None:
                 continue
-            if isinstance(value, (int, str)):
+            if isinstance(value, (int, str, tuple)):
                 for split_trajectory in trajectories:
                     setattr(split_trajectory, field_name, value)
             elif isinstance(value, torch.Tensor):

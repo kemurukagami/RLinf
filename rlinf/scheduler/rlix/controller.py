@@ -111,12 +111,28 @@ class RLixStageController:
         """Observe matching environment and rollout run results for one rank."""
         return await self.coordinator.get_rank_results.remote(rank, wait=wait)
 
+    async def get_rank_observation(self, rank: int) -> Any:
+        """Return one durable rank observation for the runner monitor."""
+        return await self.coordinator.get_rank_observation.remote(rank)
+
+    async def begin_policy_sync(
+        self, *, expected_policy_version: int
+    ) -> PolicySyncLease:
+        """Acquire the coordinator's exclusive policy-mutation lease."""
+        return await self.coordinator.begin_policy_sync.remote(
+            expected_policy_version=expected_policy_version
+        )
+
+    async def end_policy_sync(self, lease: PolicySyncLease) -> None:
+        """Release the exact coordinator policy-mutation lease."""
+        await self.coordinator.end_policy_sync.remote(lease)
+
     @asynccontextmanager
     async def policy_sync(
         self, *, expected_policy_version: int
     ) -> AsyncIterator[PolicySyncLease]:
         """Hold the coordinator's exact policy-sync lease around caller work."""
-        lease = await self.coordinator.begin_policy_sync.remote(
+        lease = await self.begin_policy_sync(
             expected_policy_version=expected_policy_version
         )
         body_error: BaseException | None = None
@@ -127,7 +143,7 @@ class RLixStageController:
             raise
         finally:
             try:
-                await self.coordinator.end_policy_sync.remote(lease)
+                await self.end_policy_sync(lease)
             except Exception as cleanup_error:
                 if body_error is None:
                     raise

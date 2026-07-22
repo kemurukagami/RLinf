@@ -107,6 +107,7 @@ def validate_elastic_vla_config(cfg: DictConfig) -> None:
     _require_false(cfg, "runner.enable_decoupled_mode")
     _require_false(cfg, "runner.use_training_pipeline")
     _require_false(cfg, "runner.overlap_env_bootstrap")
+    _require_false(cfg, "cluster.profiling.enabled")
     weight_sync_interval = _select(cfg, "runner.weight_sync_interval", 1)
     if (
         not isinstance(weight_sync_interval, int)

@@ -23,8 +23,8 @@ This document uses the shared project task list:
 | T4 | Elastic progress and release | Completed |
 | T5 | RLinf resize coordinator | Completed |
 | T6 | Placement and configuration | Completed |
-| T7 | Runner stage integration | Pending |
-| T8 | Verification and GPU acceptance | Pending |
+| T7 | Runner stage integration | Completed |
+| T8 | Verification and GPU acceptance | In progress |
 
 ## 2. Original RLix behavior and deviations
 
@@ -653,6 +653,10 @@ Exit condition:
 Purpose:
 
 - Prove original elastic parity and the GPU-idleness objective.
+- Prove actual Wan/OpenSora GRPO training pipelines, not scheduler-only
+  pipeline objects: at least two linked rollout/reward/seal/advantage/update/
+  policy-sync/next-collection iterations must complete with advancing policy
+  versions.
 
 Test edits:
 
@@ -687,12 +691,41 @@ GPU matrix:
 5. Expand and complete the original episode.
 6. Compare transition IDs, trajectories, versions, rewards, and final
    conditioning state with an uninterrupted reference.
-7. Measure safe-point latency, snapshot size, memory reclaimed, resize cost,
+7. Seal the complete rewarded batch, compute GRPO advantages, update the actor,
+   synchronize the next policy version, and collect with it; repeat for at
+   least two linked iterations.
+8. Measure safe-point latency, snapshot size, memory reclaimed, resize cost,
    utilization, and throughput.
 
 Exit condition: utilization improves with no missing/duplicate transition,
 partial batch training, policy mismatch, or unsafe reuse. Elastic becomes the
 default for supported Wan/OpenSora only after this task passes.
+
+Implementation progress (2026-07-23): Task 8 now has a frozen CPU-tested
+evidence schema and pure analyzers for reference equivalence, batch
+completeness, snapshot size, ownership transfer, direct GPU samples,
+utilization thresholds, and generated report views. The composed core parity
+suite passes five tests. The composed RLinf suite runs two production
+registered runtimes through one production scheduler and two production resize
+coordinators; it proves exact A-to-B-to-A transfer, productive sibling
+completion, same-rank one-use resume, complete batch sealing, and fail-closed
+peer-token/offload failures. The opt-in local-Ray case proves two independent
+subprocess clients share the detached core, use distinct pipeline/role
+identities despite overlapping candidate mappings, and survive one client
+disconnect. Acceptance-only environment, rollout, and runner subclasses
+transparently record chunk/policy, snapshot, residency, restore, policy-sync,
+reward/collection, seal, and training boundaries; CPU tests prove output,
+call-order, RNG, and policy-advance equivalence. Drain/barrier/resume and sealed
+CPU actor batches are now captured and fail-closed enriched into the central
+event schema. Manifest/analysis gates require linked GRPO updates and reuse of
+the produced policy. Core tracing now emits post-commit rank/bundle evidence,
+and acceptance analysis rejects plan markers and correlates the exact transfer
+with worker residency and useful-work boundaries. Focused Task 8 coverage
+passes 42 tests with local Ray skipped by default and 43 when enabled; the
+broader T1-T8 CPU regression passes 284 tests
+with two optional skips, and the complete core suite passes 113 tests with one
+optional skip. The full acceptance orchestrator, remaining actor/driver event
+wiring, and the Wan/OpenSora GPU matrices remain pending.
 
 ## 5. Implementation order
 
@@ -705,11 +738,14 @@ T4 completed
 T5 completed
 T6 completed
 T7 completed
-T8 pending
+T8 in progress
 ```
 
 T7 is complete with CPU fake stage/runner coverage and a passing real
 single-pipeline registered-runner smoke. Production bootstrap connects to the
 shared detached `rlix-core` control plane rather than constructing one locally.
-T8 remains responsible for two-driver, two-pipeline Wan/OpenSora recovery and
-utilization acceptance; no such acceptance claim has yet been made.
+T8 has completed its schema/analyzer, original-parity, composed
+production-boundary CPU, and independent-client shared-core isolation
+foundations. It remains responsible for the full two-driver orchestrator and
+two-pipeline Wan/OpenSora recovery and utilization acceptance; no real
+accelerator acceptance claim has yet been made.

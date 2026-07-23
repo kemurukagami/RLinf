@@ -97,22 +97,23 @@ def _compose_runtime_config(repo_path: Path, smoke_cfg: Any) -> Any:
         cfg.runner.logger.log_path = str(output_dir / "logs")
         cfg.runner.logger.experiment_name = "task7_real_runner_smoke"
         cfg.runner.logger.logger_backends = []
-        cfg.runner.max_epochs = 1
-        cfg.runner.max_steps = int(smoke_cfg.smoke.max_train_steps)
+        max_train_steps = int(smoke_cfg.smoke.max_train_steps)
+        cfg.runner.max_epochs = max_train_steps
+        cfg.runner.max_steps = max_train_steps
         cfg.runner.weight_sync_interval = 1
         cfg.runner.val_check_interval = 1 if run_evaluation else -1
         cfg.runner.save_interval = 1 if save_checkpoint else -1
         cfg.runner.resume_dir = None
         cfg.runner.per_worker_log = False
-        cfg.algorithm.adv_type = "gae"
-        cfg.algorithm.group_size = 1
+        cfg.algorithm.adv_type = str(smoke_cfg.smoke.get("adv_type", "gae"))
+        cfg.algorithm.group_size = int(smoke_cfg.smoke.get("group_size", 1))
         total_num_envs = int(smoke_cfg.smoke.total_num_envs)
         if total_num_envs % len(actor_gpus) != 0:
             raise ValueError(
                 "Task 7 smoke total_num_envs must divide evenly across actor ranks"
             )
         cfg.env.train.total_num_envs = total_num_envs
-        cfg.env.train.group_size = 1
+        cfg.env.train.group_size = int(smoke_cfg.smoke.get("group_size", 1))
         cfg.env.train.rollout_epoch = int(smoke_cfg.smoke.rollout_epoch)
         cfg.env.train.max_episode_steps = int(smoke_cfg.smoke.max_episode_steps)
         cfg.env.train.max_steps_per_rollout_epoch = int(
@@ -130,7 +131,7 @@ def _compose_runtime_config(repo_path: Path, smoke_cfg: Any) -> Any:
             smoke_cfg.models.world_model.num_inference_steps
         )
         cfg.env.eval.total_num_envs = int(smoke_cfg.smoke.total_num_envs)
-        cfg.env.eval.group_size = 1
+        cfg.env.eval.group_size = int(smoke_cfg.smoke.get("group_size", 1))
         cfg.env.eval.rollout_epoch = 1
         cfg.env.eval.max_episode_steps = int(smoke_cfg.smoke.max_episode_steps)
         cfg.env.eval.max_steps_per_rollout_epoch = int(
@@ -241,8 +242,6 @@ def run(config_path: Path) -> None:
     if len(rollout_gpus) != 1 or len(env_gpus) != 1:
         raise ValueError("Task 7 smoke expects one rollout GPU and one environment GPU")
     required_gpu_ids = {*actor_gpus, *rollout_gpus, *env_gpus}
-    if len(required_gpu_ids) != len(actor_gpus) + len(rollout_gpus) + len(env_gpus):
-        raise ValueError("Task 7 real-runner smoke requires distinct GPU IDs")
     if not torch.cuda.is_available() or torch.cuda.device_count() <= max(
         required_gpu_ids
     ):

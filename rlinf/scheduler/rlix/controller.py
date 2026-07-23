@@ -7,6 +7,7 @@ from typing import Any, AsyncIterator
 
 import ray
 from rlix_core.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX
+from rlix_core.protocol.validation import validate_pipeline_id
 
 from .coordinator import RLixResizeCoordinator
 from .protocol import CoordinatorStatus, ElasticCollectionContext, PolicySyncLease
@@ -47,8 +48,7 @@ class RLixStageController:
         worker_max_concurrency: int | None = None,
     ) -> None:
         """Validate ranked handles and create the exact callback actor."""
-        if not isinstance(pipeline_id, str) or not pipeline_id:
-            raise ValueError("pipeline_id must be a non-empty string")
+        validate_pipeline_id(pipeline_id)
         if not isinstance(ray_namespace, str) or not ray_namespace:
             raise ValueError("ray_namespace must be a non-empty string")
         if worker_max_concurrency is not None:

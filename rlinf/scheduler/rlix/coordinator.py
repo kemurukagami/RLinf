@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from rlix_core.protocol.types import ActionResponse
+from rlix_core.protocol.validation import validate_pipeline_id
 
 from rlinf.workers.elastic_rollout_lifecycle import (
     CompletedResidencyReceipt,
@@ -67,8 +68,7 @@ class RLixResizeCoordinator:
         activation_poll_interval_s: float = 0.01,
     ) -> None:
         """Validate and retain exact ranked worker handles."""
-        if not isinstance(pipeline_id, str) or not pipeline_id:
-            raise ValueError("pipeline_id must be a non-empty string")
+        validate_pipeline_id(pipeline_id)
         if not isinstance(env_workers, dict) or not isinstance(rollout_workers, dict):
             raise TypeError("worker mappings must be dictionaries")
         if set(env_workers) != set(rollout_workers):

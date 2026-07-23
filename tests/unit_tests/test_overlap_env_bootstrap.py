@@ -134,6 +134,7 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
         mock_rollout_result.forward_inputs = {"action": torch.zeros(2, 28)}
         mock_rollout_result.versions = torch.zeros(2, 1)
         mock_rollout_result.save_flags = None
+        mock_rollout_result.transition_id = None
 
         # Patch methods on the instance
         self.worker.recv_from = MagicMock(return_value=mock_rollout_result)
@@ -244,6 +245,7 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
         mock_rollout_result.forward_inputs = {"action": torch.zeros(2, 28)}
         mock_rollout_result.versions = torch.zeros(2, 1)
         mock_rollout_result.save_flags = None
+        mock_rollout_result.transition_id = None
 
         self.worker.recv_from = MagicMock(return_value=mock_rollout_result)
         self.worker.env_interact_step = MagicMock(

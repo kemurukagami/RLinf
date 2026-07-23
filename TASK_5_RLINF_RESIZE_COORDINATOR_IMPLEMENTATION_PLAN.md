@@ -6,7 +6,7 @@ Status: completed on 2026-07-20. The coordinator transaction, driver
 controller, worker hardening, fake-peer and stubbed-backend in-memory worker
 suites, core fail-closed integration, and opt-in local Ray naming/handle test
 pass. T6 has since completed production construction and registration; T7
-runner wiring remains intentionally deferred.
+runner wiring subsequently completed on 2026-07-22.
 
 Test-double audit reverified on 2026-07-21: the coordinator/worker-focused
 suite passed `78 passed, 1 skipped`; the opt-in real-Ray named-actor test passed
@@ -59,7 +59,7 @@ Current T5 dependency and implementation status:
   gate with bounded callback waits and no automatic lease expiry.
 - [x] T6 placement/configuration, production construction, registration, and
   admission are complete.
-- [ ] T7 runner adoption remains pending.
+- [x] T7 runner adoption subsequently completed on 2026-07-22.
 
 ## 2. Required outcome
 
@@ -1261,7 +1261,7 @@ After all T5 exit criteria passed:
 
 At T5 completion, T6-T8 were intentionally left incomplete and no live
 cross-pipeline GPU reuse was claimed. T6 has since completed independently;
-T7-T8 remain pending.
+T7 has also completed, while T8 remains pending.
 
 ### 17.5 Explicitly deferred files
 
@@ -1425,4 +1425,5 @@ T5 completion means the callback transaction is implemented and tested with
 CPU fakes/local Ray integration. T6 has since validated production placement,
 constructed the named coordinator, and registered/admitted the inactive
 pipeline. `EmbodiedRunner` adoption and real Wan/OpenSora cross-pipeline bundle
-reuse remain T7 and T8.
+reuse were assigned to T7 and T8 respectively. T7 adoption has since completed;
+T8 reuse acceptance remains pending.

@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from rlix_core.protocol.validation import validate_pipeline_id
+
 
 def _validate_non_negative_integer(name: str, value: int) -> None:
     if not isinstance(value, int) or isinstance(value, bool):
@@ -213,8 +215,7 @@ class CoordinatorStatus:
 
     def __post_init__(self) -> None:
         """Validate the diagnostic read model."""
-        if not isinstance(self.pipeline_id, str) or not self.pipeline_id:
-            raise ValueError("pipeline_id must be a non-empty string")
+        validate_pipeline_id(self.pipeline_id)
         rank_fields = (
             self.callback_applied_active_ranks,
             self.paused_ranks,

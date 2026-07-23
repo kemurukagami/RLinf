@@ -344,6 +344,34 @@ def test_coordinator_status_requires_sorted_unique_rank_sets() -> None:
         )
 
 
+def test_rlinf_adapters_use_core_pipeline_identity_validation() -> None:
+    context = ElasticCollectionContext(2, 3, (0,))
+    with pytest.raises(ValueError, match="must not contain"):
+        CoordinatorStatus(
+            pipeline_id="invalid:pipeline",
+            collection=context,
+            callback_applied_active_ranks=(),
+            paused_ranks=(),
+            completed_ranks=(),
+            failed_ranks=(),
+            resize_in_progress=False,
+            policy_sync_lease=None,
+        )
+    with pytest.raises(ValueError, match="must not contain"):
+        RLixResizeCoordinator(
+            pipeline_id="invalid:pipeline",
+            env_workers={0: object()},
+            rollout_workers={0: object()},
+        )
+    with pytest.raises(ValueError, match="must not contain"):
+        RLixStageController(
+            pipeline_id="invalid:pipeline",
+            ray_namespace="pipeline-namespace",
+            env_worker_group=object(),
+            rollout_worker_group=object(),
+        )
+
+
 def test_cold_expand_pause_shrink_and_exact_token_resume() -> None:
     async def run() -> None:
         coordinator, env, rollout = _coordinator()

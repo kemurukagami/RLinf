@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, TypeVar
 
 import ray
-from rlix_core.control_plane import ControlPlane
+from rlix_core.client import connect as connect_control_plane
 from rlix_core.protocol.types import (
     ACTOR_TRAIN_CLUSTER_NAME,
     EVALUATION_CLUSTER_NAME,
@@ -658,7 +658,11 @@ class RegisteredRLixPipeline:
             )
         primary_error: Exception | None = None
         try:
-            self.control_plane.unregister_pipeline(pipeline_id=self.pipeline_id)
+            _call_sync(
+                self.control_plane,
+                "unregister_pipeline",
+                pipeline_id=self.pipeline_id,
+            )
         except Exception as exc:
             primary_error = exc
         try:
@@ -805,16 +809,21 @@ async def bootstrap_registered_rlix_pipeline(
     worker_max_concurrency: int,
     operation_timeout_s: float,
     enable_gpu_tracing: bool = False,
-    control_plane_factory: Callable[..., Any] = ControlPlane,
+    control_plane_factory: Callable[..., Any] | None = None,
     controller_factory: Callable[..., Any] = RLixStageController,
 ) -> RegisteredRLixPipeline:
     """Create, register, and admit one pipeline without requesting allocation."""
     if not isinstance(enable_gpu_tracing, bool):
         raise TypeError("enable_gpu_tracing must be a boolean")
-    control_plane = control_plane_factory(
+    factory = control_plane_factory or connect_control_plane
+    control_plane = factory(
         env_vars={"RLIX_ENABLE_GPU_TRACING": "1"} if enable_gpu_tracing else {}
     )
-    pipeline_id = control_plane.allocate_pipeline_id(pipeline_type="rlinf")
+    pipeline_id = _call_sync(
+        control_plane,
+        "allocate_pipeline_id",
+        pipeline_type="rlinf",
+    )
     ray_namespace = get_pipeline_namespace(pipeline_id)
     controller = controller_factory(
         pipeline_id=pipeline_id,
@@ -827,16 +836,26 @@ async def bootstrap_registered_rlix_pipeline(
     registration_attempted = False
     try:
         registration_attempted = True
-        control_plane.register_pipeline(
+        _call_sync(
+            control_plane,
+            "register_pipeline",
             pipeline_id=pipeline_id,
             ray_namespace=ray_namespace,
             **placement_plan.registration_payload(),
         )
-        admission = control_plane.admit_pipeline(pipeline_id=pipeline_id)
+        admission = _call_sync(
+            control_plane,
+            "admit_pipeline",
+            pipeline_id=pipeline_id,
+        )
     except BaseException as primary_error:
         if registration_attempted:
             try:
-                control_plane.unregister_pipeline(pipeline_id=pipeline_id)
+                _call_sync(
+                    control_plane,
+                    "unregister_pipeline",
+                    pipeline_id=pipeline_id,
+                )
             except Exception as cleanup_error:
                 _add_cleanup_note(primary_error, "registration", cleanup_error)
         try:

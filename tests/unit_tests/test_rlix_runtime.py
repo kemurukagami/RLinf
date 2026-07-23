@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from rlinf.scheduler.rlix import runtime as runtime_module
 from rlinf.scheduler.rlix.runtime import (
     bootstrap_registered_rlix_pipeline,
     close_worker_groups_after_bootstrap_failure,
@@ -78,6 +79,24 @@ class _ControlPlane:
         self.events.append("unregister")
         if self.fail_unregister:
             raise RuntimeError("unregister failed")
+
+
+class _RemoteMethod:
+    def __init__(self, method) -> None:
+        self._method = method
+
+    def remote(self, **kwargs):
+        return self._method(**kwargs)
+
+
+class _RemoteControlPlane:
+    """Minimal Ray-actor-shaped facade around the direct control-plane fake."""
+
+    def __init__(self, control_plane: _ControlPlane) -> None:
+        self.allocate_pipeline_id = _RemoteMethod(control_plane.allocate_pipeline_id)
+        self.register_pipeline = _RemoteMethod(control_plane.register_pipeline)
+        self.admit_pipeline = _RemoteMethod(control_plane.admit_pipeline)
+        self.unregister_pipeline = _RemoteMethod(control_plane.unregister_pipeline)
 
 
 class _Controller:
@@ -158,6 +177,34 @@ def test_bootstrap_uses_allocated_identity_and_exact_order() -> None:
     assert control_plane.registration["cluster_dp_device_mappings"] == {
         "actor_infer": {0: [0, 1]}
     }
+
+
+def test_bootstrap_uses_detached_core_client_and_remote_actor_api(monkeypatch) -> None:
+    events: list[str] = []
+    control_plane = _ControlPlane(events)
+    connection_args: list[dict[str, str]] = []
+
+    def connect(**kwargs):
+        connection_args.append(kwargs["env_vars"])
+        return _RemoteControlPlane(control_plane)
+
+    monkeypatch.setattr(runtime_module, "connect_control_plane", connect)
+    runtime = asyncio.run(
+        bootstrap_registered_rlix_pipeline(
+            env_worker_group="env-group",
+            rollout_worker_group="rollout-group",
+            placement_plan=_Plan(),
+            worker_max_concurrency=2,
+            operation_timeout_s=15.0,
+            enable_gpu_tracing=True,
+            controller_factory=lambda **kwargs: _Controller(events, **kwargs),
+        )
+    )
+
+    assert connection_args == [{"RLIX_ENABLE_GPU_TRACING": "1"}]
+    assert events == ["allocate:rlinf", "controller", "register", "admit"]
+    asyncio.run(runtime.close())
+    assert events[-2:] == ["unregister", "close_controller"]
 
 
 @pytest.mark.parametrize(

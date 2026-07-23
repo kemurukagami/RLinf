@@ -576,14 +576,21 @@ missing offload or unsupported stateful wrappers/GPU reward
 ```
 
 After worker launch and before model/environment initialization, construct the
-T5 named coordinator, register the checked topology with the same namespace,
-and admit it. Hand the inactive registered runtime to T7 without requesting an
-allocation. Bootstrap failure unregisters if needed, closes the coordinator,
-and closes the newly launched groups while preserving the primary error.
+T5 named coordinator, connect through `rlix_core.client.connect()` to the
+detached core control plane, register the checked topology with the same
+namespace, and admit it. RLinf must not construct a second local control plane
+or registration registry. Hand the inactive registered runtime to T7 without
+requesting an allocation. Bootstrap failure unregisters if needed, closes the
+coordinator, and closes the newly launched groups while preserving the primary
+error.
 
 Exit condition: CPU tests cover both valid topologies and every rejection.
 
 ### T7: Runner stage integration
+
+Status: completed on 2026-07-22. The real single-pipeline Wan/OpenVLA smoke
+subsequently completed 10 iterations on A800 hardware on 2026-07-23; T8
+two-pipeline acceptance remains pending.
 
 Purpose:
 
@@ -656,6 +663,7 @@ Test edits:
 - T5 callback ordering/failure tests.
 - T6 placement/config tests.
 - T7 runner/no-op tests.
+- Detached control-plane connection and two-driver shared-scheduler tests.
 - Wan/OpenSora two-pipeline GPU acceptance configs and documentation.
 
 Original-parity assertions:
@@ -671,13 +679,15 @@ legacy TP clients behave unchanged
 
 GPU matrix:
 
-1. Interrupt one rank during Wan/OpenSora diffusion.
-2. Verify release only after chunk commit and offload.
-3. Run another pipeline on the released exact bundle.
-4. Expand and complete the original episode.
-5. Compare transition IDs, trajectories, versions, rewards, and final
+1. Start two independent RLinf drivers through the same detached control plane
+   and scheduler.
+2. Interrupt one rank during Wan/OpenSora diffusion.
+3. Verify release only after chunk commit and offload.
+4. Run another pipeline on the released exact bundle.
+5. Expand and complete the original episode.
+6. Compare transition IDs, trajectories, versions, rewards, and final
    conditioning state with an uninterrupted reference.
-6. Measure safe-point latency, snapshot size, memory reclaimed, resize cost,
+7. Measure safe-point latency, snapshot size, memory reclaimed, resize cost,
    utilization, and throughput.
 
 Exit condition: utilization improves with no missing/duplicate transition,
@@ -694,11 +704,12 @@ T3 completed
 T4 completed
 T5 completed
 T6 completed
-T7 -> T8
+T7 completed
+T8 pending
 ```
 
-T5 is complete with CPU fake and stubbed-backend in-memory worker protocol
-transactions, core fail-closed integration, and an opt-in local Ray
-naming/handle test. None is a production end-to-end runner test; that requires
-T7-T8. T7 is the next implementation task. No later task is complete until all
-earlier exit conditions it depends on are met.
+T7 is complete with CPU fake stage/runner coverage and a passing real
+single-pipeline registered-runner smoke. Production bootstrap connects to the
+shared detached `rlix-core` control plane rather than constructing one locally.
+T8 remains responsible for two-driver, two-pipeline Wan/OpenSora recovery and
+utilization acceptance; no such acceptance claim has yet been made.

@@ -23,7 +23,7 @@ Implemented T7 slice (2026-07-22):
 This fixed-stage slice was subsequently integrated with the elastic collection,
 training, evaluation, checkpoint, and entrypoint work described below.
 
-In-progress elastic-collection slice (2026-07-22):
+Completed elastic-collection slice (2026-07-22):
 
 - the runtime now creates a monotonic collection session from canonical bundle
   ranks and immutable per-rank assignments;
@@ -64,20 +64,39 @@ Wan example composition/pure enabled and disabled validation, and the disabled
 entrypoint import with `rlix_core` deliberately unavailable all passed. A real
 single-pipeline Task 7 smoke entrypoint now exists at
 `tests/e2e_tests/embodied/run_task7_real_runner_smoke.sh`; it runs one
-registered enabled runner iteration and verifies sealed collection, completed
-rank release, post-training offload residency, and runtime close. The launcher
-uses the local OpenVLA-OFT spatial and Wan LIBERO spatial checkpoints by
-default, a three-rank FSDP actor on GPUs 1-3, rollout on GPU 4, and environment
-on GPU 5, with per-GPU and checkpoint environment overrides. Static validation
-of the smoke script passed on 2026-07-22. On the available 128 GB host, the
-full real-model smoke is resource-gated: it reaches real worker initialization
-and fixed policy sync, then Ray kills a worker at host-memory saturation while
-actor ranks extract rollout state (`128.00GB / 128.00GB` observed). This is a
-local capacity limit for the full OpenVLA optimizer/state-sync footprint, not a
-replacement for the T8 accelerator acceptance. The repository-wide core format
+registered enabled runner iteration by default and verifies sealed collection,
+completed-rank release, post-training offload residency, and runtime close. The
+portable launcher configuration uses the local OpenVLA-OFT spatial and Wan
+LIBERO spatial checkpoints, a three-rank FSDP actor on GPUs 1-3, rollout on GPU
+4, and environment on GPU 5, with per-GPU and checkpoint overrides. The A800
+collocated configuration uses actor and rollout GPU 0, environment GPU 1, GRPO
+group size 2, and a configurable `RLINF_TASK7_MAX_TRAIN_STEPS`. On 2026-07-23
+that configuration passed 10 iterations with
+`RAY_memory_usage_threshold=0.998`, reached global step 10, verified every
+elastic and fixed residency offloaded, and closed the runtime. An earlier run
+with Ray's lower memory threshold was killed at step 8 by the host-memory
+monitor; it was not a CUDA OOM. Neither run replaces T8 two-pipeline
+acceptance. The repository-wide core format
 check retains the four documented pre-existing findings in `client.py`,
 `test_gap_ratio.py`, `test_scheduling_cycle.py`, and `test_tracer.py`; Task 7
 did not modify those files.
+
+Ownership correction (2026-07-23): the registered runtime now obtains the
+detached core actor through `rlix_core.client.connect()` and calls its remote
+allocation, registration, admission, and unregistration API. The earlier local
+`ControlPlane` construction was inconsistent with the architecture and has
+been removed. An audit found no duplicate scheduler, planner, resource manager,
+allocation ledger, or registration registry in the remaining RLinf adapter.
+The coordinator, controller, and status protocol now reuse the core pipeline-ID
+validator rather than maintaining local copies.
+RLinf placement translation, trajectory progress, residency receipts, and
+safe-point coordination remain intentionally RLinf-owned.
+
+Reverification on 2026-07-23 passed the complete documented T1-T7 CPU command
+with 242 tests and 1 optional local-Ray skip. The complete `rlix-core` suite
+passed 107 tests with 1 skip; focused Ruff lint/format and compilation passed.
+The broader command exposed and corrected two stale overlap-bootstrap mocks
+that had implicitly produced invalid `MagicMock` transition identities.
 
 This document expands Task T7, "Runner stage integration," from these sources,
 in descending order of authority:
@@ -1195,7 +1214,7 @@ as reviewable units even if delivered in one pull request.
 From `/root/_VLAMP/RLinf`:
 
 ```bash
-export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="/root/_VLAMP/rlix-core/src:$PWD${PYTHONPATH:+:$PYTHONPATH}"
 /root/.venv/bin/python -m pytest -q \
   tests/unit_tests/test_rlix_runner_runtime.py \
   tests/unit_tests/test_rlix_embodied_runner.py \
@@ -1206,7 +1225,10 @@ export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
   tests/unit_tests/test_elastic_env_rollout.py \
   tests/unit_tests/test_world_model_resume.py \
   tests/unit_tests/test_rlix_placement.py \
-  tests/unit_tests/test_rlix_config.py
+  tests/unit_tests/test_rlix_config.py \
+  tests/unit_tests/test_maniskill_offload_env.py \
+  tests/unit_tests/test_overlap_env_bootstrap.py \
+  tests/unit_tests/test_history_manager.py
 ```
 
 Run Ruff and compilation on every changed production and test file:

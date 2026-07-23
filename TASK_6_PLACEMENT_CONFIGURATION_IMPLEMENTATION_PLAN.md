@@ -2,8 +2,8 @@
 
 ## 1. Status and source of truth
 
-Status: completed on 2026-07-21. T0-T6 are complete; T7 runner integration and
-T8 two-pipeline accelerator acceptance remain pending.
+Status: completed on 2026-07-21. T7 runner integration subsequently completed
+on 2026-07-22; T8 two-pipeline accelerator acceptance remains pending.
 
 This plan refines the T6 requirements in these documents, in descending order
 of authority:
@@ -72,7 +72,8 @@ Implementation progress and inherited foundation:
 - [x] Run focused T1-T6, core auxiliary-cluster, lint, format, compilation, and
   dependency-boundary verification and record exact results here.
 - [x] Mark T6 complete in the canonical design/task documents only after every
-  section 17 acceptance criterion passes; T7/T8 remain pending.
+  section 17 acceptance criterion passes; at the T6 checkpoint T7/T8 remained
+  pending.
 - [x] Add the optional three-GPU T6 bootstrap and real rollout/environment
   model-loading smoke, and cover Wan cold offload before the first explicit
   reset (33 focused tests passed).
@@ -91,8 +92,8 @@ composition/pure validation, and an import test with `rlix_core` deliberately
 unavailable all passed. A repository-wide core format check still reports four
 unrelated pre-existing files; no unrelated formatting was changed. The
 optional T6 bootstrap/model-loading smoke later passed on real accelerators as
-recorded in section 13.7; T7 integration and T8 two-pipeline accelerator
-acceptance remain explicitly pending.
+recorded in section 13.7. T7 integration subsequently completed; T8
+two-pipeline accelerator acceptance remains explicitly pending.
 
 ## 2. Required outcome
 
@@ -402,16 +403,20 @@ When RLix is disabled:
 
 ### 6.9 Registration identity and ordering are atomic bootstrap state
 
-T6 allocates the pipeline ID through `ControlPlane.allocate_pipeline_id()` and
-derives the callback namespace with `get_pipeline_namespace(pipeline_id)`.
-Neither value is accepted from independent user configuration.
+T6 connects through `rlix_core.client.connect()` to the detached core
+`ControlPlane`, allocates the pipeline ID through its remote
+`allocate_pipeline_id()` API, and derives the callback namespace with
+`get_pipeline_namespace(pipeline_id)`. Neither value is accepted from
+independent user configuration. Constructing a local `ControlPlane` would
+duplicate the core registration registry and is not allowed.
 
 After worker launch, bootstrap ordering is:
 
-1. create `RLixStageController` with exact environment/rollout handles;
-2. register the T6 payload with the controller's namespace;
-3. admit the registered pipeline; and
-4. return one runtime context containing the control plane, scheduler handle,
+1. connect to the detached control plane and allocate a pipeline ID;
+2. create `RLixStageController` with exact environment/rollout handles;
+3. register the T6 payload with the controller's namespace;
+4. admit the registered pipeline; and
+5. return one runtime context containing the control-plane actor handle, scheduler handle,
    controller, pipeline identity, and immutable placement plan.
 
 After a registration call is attempted, any registration or admission failure
@@ -609,9 +614,9 @@ T7.
 ### 9.5 Registered runtime context
 
 Add an owner-scoped runtime object, for example `RegisteredRLixPipeline`, that
-contains the `ControlPlane`, admitted scheduler handle, `RLixStageController`,
-pipeline ID, namespace, and `RLixPlacementPlan`. Construction follows section
-6.9 and returns only after admission succeeds.
+contains the detached `ControlPlane` actor handle, admitted scheduler handle,
+`RLixStageController`, pipeline ID, namespace, and `RLixPlacementPlan`.
+Construction follows section 6.9 and returns only after admission succeeds.
 
 Before T7 requests any allocation, T6 bootstrap cleanup is:
 
@@ -815,8 +820,10 @@ objects. Verify:
 ### 13.5 Registration bootstrap
 
 Add `tests/unit_tests/test_rlix_runtime.py` with fake control-plane and
-controller factories. Cover:
+controller factories, including a remote-actor-shaped control-plane facade.
+Cover:
 
+- default bootstrap uses `rlix_core.client.connect()`;
 - pipeline IDs come from `allocate_pipeline_id()`;
 - namespaces come from `get_pipeline_namespace()`;
 - coordinator creation precedes registration and admission;

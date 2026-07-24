@@ -12,7 +12,7 @@ independent clients against one detached `rlix-core` scheduler, but no recorded
 run has yet driven real Wan/OpenSora workers through composite-bundle transfer,
 resumed the interrupted shard, and demonstrated a utilization improvement.
 
-Implementation progress (2026-07-23):
+Implementation progress (2026-07-24):
 
 - `tests/e2e_tests/embodied/task8_acceptance_support.py` contains the frozen
   schema version, fail-closed event sink, deterministic CPU tensor manifests,
@@ -22,7 +22,7 @@ Implementation progress (2026-07-23):
   single-version batches, lifecycle-normalized reference equivalence,
   continuation-state size ceilings, and the exact event/ownership ordering of
   one A-to-B-to-A bundle transfer while a sibling rank continues.
-- `tests/unit_tests/test_rlix_gpu_acceptance.py` currently provides 34 passing
+- `tests/unit_tests/test_rlix_gpu_acceptance.py` currently provides 43 passing
   CPU tests for schema/topology validation, central and producer ordering,
   duplicate terminal rejection, typed manifest comparison, snapshot tensor
   byte accounting and ceilings, transition/batch completeness, ownership
@@ -30,8 +30,15 @@ Implementation progress (2026-07-23):
   five-repetition material-improvement gate.
 - The pure analyzer now generates deterministic JSON-safe and Markdown report
   views only from validated reference, transfer, snapshot, utilization, and
-  raw-artifact inputs. Atomic raw-artifact layout, writing, and completion
-  sealing are implemented; full artifact-set orchestration remains pending.
+  raw-artifact inputs. The artifact finalizer verifies the immutable stored
+  manifest and sealed raw-input digests, requires the exact configured paired
+  repetition set, enforces both throughput and direct-idle-reduction gates, and
+  atomically emits the required correctness, ownership, latency, utilization,
+  and operator-report views without overwriting prior evidence. Report emission
+  also requires exactly two pipelines of linked, complete GRPO iteration
+  evidence and renders batch/policy, transfer, snapshot, GPU, provenance,
+  limitation, invalid-repetition, and exact-command sections from validated
+  inputs.
 - Ruff lint, Ruff format checking, focused pytest, and compilation pass for
   the Task 8 helper and unit-test files. Production scheduling behavior is
   unchanged; `rlix-core` tracing now emits a distinct post-commit marker.
@@ -50,6 +57,60 @@ Implementation progress (2026-07-23):
   register distinct pipeline IDs/namespaces and collision-free role-owned
   worker/channel/event names with intentionally overlapping candidate GPU
   mappings, and prove client B retains the same core after client A exits.
+- `task8_two_pipeline_acceptance.py` now supplies the fail-closed OS-process
+  shell: exact role commands, exclusive stdout/stderr files, atomic
+  ready/start/result rendezvous, one deadline, early-exit detection,
+  terminate/kill cleanup, and validation of shared core identities, distinct
+  pipeline ownership, collision-free names, and intentionally identical
+  candidate mappings. A subprocess test executes two real Python processes.
+- `task8_two_pipeline_driver.py` implements both the connectivity foundation
+  and a model-initialization-only stage for the real driver. The latter uses
+  the production Wan config, placement, worker launch, registered runtime, and
+  runner initialization paths; it verifies every actor, rollout, and
+  environment rank is cold/offloaded before writing readiness. Both scopes
+  always label results `task8_accepted: false` because neither performs the
+  required generation, preemption, or GRPO work.
+- `task8_two_pipeline_acceptance.py` now has an executable preliminary-run
+  interface in addition to its library API. It creates isolated role logs and
+  manifests, enforces exact scope-specific readiness schemas, rejects any
+  accelerator-resident model state, and writes either `pair_result.json` or
+  `pair_failure.json` without allowing a preliminary run to claim acceptance.
+- A single four-A800 model-bearing Wan driver passed cold initialization in
+  `287.14s`. Its immutable readiness evidence covers actor rank 0, rollout
+  ranks 0-1, and environment ranks 0-1; all five records report model,
+  optimizer, and CUDA-graph state non-resident after initialization, with
+  canonical bundles `(0, 2)` and `(1, 3)` and an inactive registered runtime.
+- The first two-driver model-initialization run correctly failed before
+  readiness at the container memory boundary. Although the host exposes about
+  1 TiB RAM, `/sys/fs/cgroup/memory.max` is `137438953472` bytes (128 GiB).
+  One initialized pipeline used about 111 GiB across the actor (57.2 GiB), two
+  rollouts (14.9 GiB each), and two environments (11.5 GiB each); loading the
+  second reached `127.94/128.00 GiB`, after which Ray killed workers. GPU state
+  was fully released. This is retained as failed preliminary evidence and is
+  not a Task 8 acceptance result; the two-driver model stage requires a higher
+  container memory limit or a separately validated memory reduction.
+- After this slice, the focused Task 8 suite passes `51 passed, 1 skipped`, the
+  complete focused Tasks 1-8 regression passes `294 passed, 2 skipped`, and
+  the complete `rlix-core` suite passes `114 passed, 1 skipped`. Ruff lint
+  passes for all changed surfaces. The repository-wide core format check still
+  identifies three pre-existing unmodified tests (`test_gap_ratio.py`,
+  `test_scheduling_cycle.py`, and `test_tracer.py`); changed-file format checks
+  pass and those unrelated files were not rewritten.
+- The new driver passed against a real four-A800 Ray cluster with separate PIDs
+  and pipeline IDs, one shared scheduler actor, and overlapping disaggregated
+  candidates `rank 0 -> (0, 2)` and `rank 1 -> (1, 3)`.
+- `EmbodiedRunner` now accepts an optional exact channel-name mapping while
+  preserving the original `Env`, `Rollout`, `Actor`, and `Reward` defaults.
+  Task 8 role identities project into that mapping, removing the known channel
+  collision when the model-bearing acceptance driver is connected.
+- The driver now applies its role identity to actor, rollout, and environment
+  group names, logger and per-worker output directories, experiment name, and
+  runner channels in one validated configuration projection. This prevents a
+  partially prefixed driver surface.
+- `rlix-core` client creation failures now preserve and report the last actor
+  construction exception. The real connectivity bring-up used that diagnostic
+  to identify the existing Ray dashboard state-API prerequisite immediately;
+  the corrected dashboard-enabled run then passed.
 - `tests/e2e_tests/embodied/task8_acceptance_workers.py` provides
   acceptance-only `RecordingEnvWorker`, `RecordingMultiStepRolloutWorker`, and
   `RecordingEmbodiedRunner` subclasses. Their mixins bracket real chunk/policy,
@@ -84,9 +145,13 @@ Implementation progress (2026-07-23):
   JSON/JSONL/CSV, and seals closed raw inputs with size and SHA-256 evidence.
   Read-side verification rejects missing, unsafe, duplicated, or modified
   artifacts before analysis.
-- The focused Task 8 command passes 42 tests with the local-Ray test skipped by
-  default and 43 tests when `RLINF_RUN_LOCAL_RAY_TEST=1` enables it.
-- The focused T1-T8 CPU regression available at this stage passes 284 tests
+- Acceptance manifest normalization now rejects non-finite scalar, NumPy, and
+  tensor values, strict JSON writers disable `NaN` emission, and linked GRPO
+  evidence explicitly requires finite rewards and advantages. This closes a
+  fail-open evidence path exposed by the real two-step Task 7 run below.
+- The focused Task 8 command passes 48 tests with the local-Ray test skipped by
+  default and 49 tests when `RLINF_RUN_LOCAL_RAY_TEST=1` enables it.
+- The focused T1-T8 CPU regression available at this stage passes 291 tests
   with two optional skips across snapshot, safe-point, progress,
   coordinator, placement, configuration, runtime, runner, entrypoint, Task 8
   analysis, and standalone compatibility coverage.
@@ -103,9 +168,24 @@ Implementation progress (2026-07-23):
   (`client.py`, `test_gap_ratio.py`, `test_scheduling_cycle.py`, and
   `test_tracer.py`) that would be reformatted. The new T8 parity file passes
   its focused Ruff format check; unrelated formatting was not changed.
-- Full artifact-set orchestration/report emission, real trace-processor
-  execution, the two-driver acceptance orchestrator, driver/control event
-  wiring, and real accelerator acceptance remain pending.
+- Real trace-processor execution, the two-driver acceptance orchestrator,
+  driver/control event wiring, and real accelerator acceptance remain pending.
+
+Fresh prerequisite GPU results recorded on 2026-07-24 on one host with four
+NVIDIA A800-SXM4-80GB GPUs:
+
+- the Task 1 Wan/OpenVLA snapshot-resume harness passed in both collocated
+  one-GPU and disaggregated two-GPU modes, with the expected
+  `(1, 3, 1, 13, 256, 256)` CPU snapshot observation shape;
+- the Task 6 three-GPU initialization smoke passed in 134.70 seconds with
+  actor GPU 0 and canonical `actor_infer` bundle `(1, 2)`;
+- the Task 7 collocated real runner passed two linked steps in 353.08 seconds,
+  sealed 2/2 trajectories at final policy version 1, released its bundle, and
+  closed the runtime; and
+- the Task 7 metric table reported non-finite aggregate reward/advantage
+  metrics for its zero-reward smoke batch. The smoke's lifecycle result remains
+  valid, but Task 8 correctness analysis now rejects such evidence and this run
+  does not satisfy the Task 8 GRPO numerical gate.
 
 The existing real-model evidence is useful but does not satisfy T8:
 

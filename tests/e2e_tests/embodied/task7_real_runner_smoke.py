@@ -8,7 +8,7 @@ import os
 import platform
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import ray
 import torch
@@ -68,7 +68,12 @@ def _parse_gpu_ids(value: Any) -> tuple[int, ...]:
     return ids
 
 
-def _compose_runtime_config(repo_path: Path, smoke_cfg: Any) -> Any:
+def _compose_runtime_config(
+    repo_path: Path,
+    smoke_cfg: Any,
+    *,
+    validator: Callable[[Any], Any] = validate_cfg,
+) -> Any:
     config_dir = repo_path / "examples" / "embodiment" / "config"
     os.environ.setdefault("EMBODIED_PATH", str(config_dir.parent))
     with initialize_config_dir(version_base="1.1", config_dir=str(config_dir)):
@@ -81,8 +86,8 @@ def _compose_runtime_config(repo_path: Path, smoke_cfg: Any) -> Any:
     )
     rollout_gpus = _parse_gpu_ids(smoke_cfg.smoke.rollout_gpu)
     env_gpus = _parse_gpu_ids(smoke_cfg.smoke.env_gpu)
-    if len(rollout_gpus) != 1 or len(env_gpus) != 1:
-        raise ValueError("Task 7 smoke expects one rollout GPU and one environment GPU")
+    if len(rollout_gpus) != len(env_gpus):
+        raise ValueError("rollout and environment GPU lists must have equal length")
     run_evaluation = _as_bool(smoke_cfg.smoke.run_evaluation)
     save_checkpoint = _as_bool(smoke_cfg.smoke.save_checkpoint)
     output_dir = Path(smoke_cfg.smoke.output_dir).resolve()
@@ -90,8 +95,8 @@ def _compose_runtime_config(repo_path: Path, smoke_cfg: Any) -> Any:
         cfg.cluster.component_placement = OmegaConf.create(
             {
                 "actor": ",".join(str(gpu) for gpu in actor_gpus),
-                "rollout": str(rollout_gpus[0]),
-                "env": str(env_gpus[0]),
+                "rollout": ",".join(str(gpu) for gpu in rollout_gpus),
+                "env": ",".join(str(gpu) for gpu in env_gpus),
             }
         )
         cfg.runner.logger.log_path = str(output_dir / "logs")
@@ -148,7 +153,7 @@ def _compose_runtime_config(repo_path: Path, smoke_cfg: Any) -> Any:
         cfg.rollout.model.precision = str(smoke_cfg.models.vla.precision)
         cfg.rlix.operation_timeout_s = float(smoke_cfg.smoke.operation_timeout_s)
     validate_rlix_entrypoint(cfg, entrypoint="train_embodied_agent")
-    return validate_cfg(cfg)
+    return validator(cfg)
 
 
 def _assert_fixed_residencies_safe(

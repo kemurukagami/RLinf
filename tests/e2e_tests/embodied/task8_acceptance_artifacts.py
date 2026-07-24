@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -12,11 +13,23 @@ import tempfile
 from dataclasses import asdict, dataclass
 from io import StringIO
 from pathlib import Path
+from statistics import median
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from task8_acceptance_analysis import (
+    GrpoIterationEvidence,
+    SnapshotSizeReport,
+    TransferTimeline,
+    build_analysis_summary,
+    validate_grpo_training_loop,
+)
 from task8_acceptance_support import (
+    GpuUtilizationSummary,
     RunManifest,
     SchedulerCommitRecord,
+    UtilizationAcceptance,
+    UtilizationTrial,
+    evaluate_utilization_trials,
     normalize_manifest,
     normalize_scheduler_commit_marker,
 )
@@ -44,6 +57,338 @@ class AcceptanceArtifactLayout:
     gpu: Path
     reference: Path
     analysis: Path
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptanceReportMetadata:
+    """Operator-supplied provenance rendered into the generated report."""
+
+    root_commit: str
+    rlinf_commit: str
+    dirty_worktree: bool
+    hardware: tuple[str, ...]
+    commands: tuple[str, ...]
+    limitations: tuple[str, ...]
+    invalid_repetitions: tuple[str, ...] = ()
+
+    def validate(self) -> None:
+        """Reject incomplete provenance rather than emitting an ambiguous report."""
+        required = (self.root_commit, self.rlinf_commit, *self.hardware, *self.commands)
+        if (
+            not self.hardware
+            or not self.commands
+            or any(not value.strip() for value in required)
+        ):
+            raise ValueError("report metadata requires commits, hardware, and commands")
+
+
+def emit_acceptance_artifact_set(
+    layout: AcceptanceArtifactLayout,
+    *,
+    run_manifest: RunManifest,
+    reference_differences: tuple[str, ...],
+    transfer_timeline: TransferTimeline,
+    snapshot_report: SnapshotSizeReport,
+    gpu_summaries: Mapping[int, GpuUtilizationSummary],
+    utilization_trials: Sequence[UtilizationTrial],
+    training_iterations: Mapping[str, Sequence[GrpoIterationEvidence]],
+    latencies_ms: Mapping[str, Sequence[float]],
+    raw_artifacts: Mapping[str, str],
+    metadata: AcceptanceReportMetadata,
+) -> tuple[dict[str, Any], str]:
+    """Verify sealed raw evidence and atomically emit the complete derived set."""
+    run_manifest.validate()
+    metadata.validate()
+    _validate_stored_manifest(layout, run_manifest)
+    verified = {path.resolve() for path in verify_completion_marker(layout)}
+    _validate_raw_artifact_links(layout, raw_artifacts, verified)
+    _validate_repetition_set(utilization_trials, run_manifest.repetitions)
+    validated_training = _validate_training_iterations(
+        training_iterations, run_manifest.training_iterations
+    )
+    _validate_gpu_summaries(gpu_summaries)
+
+    minimum_improved_pairs = max(1, (4 * run_manifest.repetitions + 4) // 5)
+    utilization = evaluate_utilization_trials(
+        utilization_trials,
+        minimum_pairs=run_manifest.repetitions,
+        minimum_median_improvement=run_manifest.minimum_throughput_improvement,
+        minimum_improved_pairs=minimum_improved_pairs,
+        minimum_median_idle_reduction=run_manifest.minimum_idle_reduction,
+    )
+    summary, base_report = build_analysis_summary(
+        run_manifest=run_manifest,
+        reference_differences=reference_differences,
+        transfer_timeline=transfer_timeline,
+        snapshot_report=snapshot_report,
+        gpu_summaries=gpu_summaries,
+        utilization=utilization,
+        raw_artifacts=raw_artifacts,
+    )
+    summary["training_iterations"] = {
+        pipeline_id: [asdict(iteration) for iteration in iterations]
+        for pipeline_id, iterations in sorted(validated_training.items())
+    }
+    latency_rows = _latency_rows(latencies_ms)
+    trial_rows = _utilization_rows(utilization_trials, utilization)
+
+    derived_paths = (
+        layout.analysis / "correctness.json",
+        layout.analysis / "ownership.json",
+        layout.analysis / "latency_summary.csv",
+        layout.analysis / "utilization_repetitions.csv",
+        layout.analysis / "utilization_summary.json",
+        layout.analysis / "REPORT.md",
+    )
+    existing = [path for path in derived_paths if path.exists()]
+    if existing:
+        raise FileExistsError(f"refusing to overwrite derived artifacts: {existing!r}")
+    atomic_write_json(layout.analysis / "correctness.json", summary)
+    atomic_write_json(layout.analysis / "ownership.json", asdict(transfer_timeline))
+    atomic_write_csv(
+        layout.analysis / "latency_summary.csv",
+        fieldnames=("metric", "count", "minimum_ms", "median_ms", "maximum_ms"),
+        rows=latency_rows,
+    )
+    atomic_write_csv(
+        layout.analysis / "utilization_repetitions.csv",
+        fieldnames=(
+            "repetition",
+            "static_throughput_per_gpu",
+            "dynamic_throughput_per_gpu",
+            "throughput_improvement",
+            "static_idle_fraction",
+            "dynamic_idle_fraction",
+            "idle_reduction",
+        ),
+        rows=trial_rows,
+    )
+    atomic_write_json(layout.analysis / "utilization_summary.json", asdict(utilization))
+    report = _render_operator_report(
+        base_report,
+        run_manifest,
+        summary,
+        metadata,
+        snapshot_report=snapshot_report,
+        gpu_summaries=gpu_summaries,
+        utilization_trials=utilization_trials,
+        utilization=utilization,
+    )
+    _atomic_write_text(layout.analysis / "REPORT.md", report)
+    return summary, report
+
+
+def _validate_stored_manifest(
+    layout: AcceptanceArtifactLayout, run_manifest: RunManifest
+) -> None:
+    path = layout.root / "run_manifest.json"
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("stored run manifest is missing or unreadable") from exc
+    if stored != normalize_manifest(asdict(run_manifest)):
+        raise ValueError("analysis run manifest does not match the stored manifest")
+
+
+def _validate_repetition_set(
+    trials: Sequence[UtilizationTrial], expected_repetitions: int
+) -> None:
+    repetitions = [trial.repetition for trial in trials]
+    expected = set(range(expected_repetitions))
+    if set(repetitions) != expected or len(repetitions) != 2 * expected_repetitions:
+        raise ValueError(
+            "utilization trials must contain exactly one static and dynamic pair "
+            "for every configured repetition"
+        )
+
+
+def _validate_training_iterations(
+    training: Mapping[str, Sequence[GrpoIterationEvidence]], expected_iterations: int
+) -> dict[str, tuple[GrpoIterationEvidence, ...]]:
+    if len(training) != 2 or any(not pipeline_id for pipeline_id in training):
+        raise ValueError("training evidence requires exactly two pipeline IDs")
+    validated: dict[str, tuple[GrpoIterationEvidence, ...]] = {}
+    for pipeline_id, iterations in training.items():
+        evidence = validate_grpo_training_loop(iterations)
+        if len(evidence) != expected_iterations:
+            raise ValueError(
+                "training evidence must match the configured iteration count"
+            )
+        validated[pipeline_id] = evidence
+    return validated
+
+
+def _validate_gpu_summaries(
+    summaries: Mapping[int, GpuUtilizationSummary],
+) -> None:
+    for gpu_id, summary in summaries.items():
+        if (
+            gpu_id != summary.gpu_id
+            or summary.duration_ns <= 0
+            or not math.isfinite(summary.mean_sm_utilization)
+            or not 0.0 <= summary.mean_sm_utilization <= 100.0
+            or not 0 <= summary.idle_ns <= summary.duration_ns
+        ):
+            raise ValueError(f"invalid direct GPU summary for GPU {gpu_id}")
+
+
+def _validate_raw_artifact_links(
+    layout: AcceptanceArtifactLayout,
+    raw_artifacts: Mapping[str, str],
+    verified: set[Path],
+) -> None:
+    required = {"events", "scheduler", "gpu_samples", "reference"}
+    if set(raw_artifacts) != required:
+        raise ValueError(
+            f"raw artifact links must contain exactly {sorted(required)!r}"
+        )
+    root = layout.root.resolve()
+    for name, relative in raw_artifacts.items():
+        path = Path(relative)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"raw artifact link {name!r} is unsafe")
+        resolved = (root / path).resolve()
+        if resolved not in verified:
+            raise ValueError(f"raw artifact link {name!r} is not sealed")
+
+
+def _latency_rows(latencies_ms: Mapping[str, Sequence[float]]) -> list[dict[str, Any]]:
+    if not latencies_ms:
+        raise ValueError("at least one measured latency family is required")
+    rows: list[dict[str, Any]] = []
+    for metric, values in sorted(latencies_ms.items()):
+        measured = tuple(float(value) for value in values)
+        if (
+            not metric
+            or not measured
+            or any(not math.isfinite(value) or value < 0.0 for value in measured)
+        ):
+            raise ValueError("latency metrics require a name and non-negative samples")
+        rows.append(
+            {
+                "metric": metric,
+                "count": len(measured),
+                "minimum_ms": min(measured),
+                "median_ms": median(measured),
+                "maximum_ms": max(measured),
+            }
+        )
+    return rows
+
+
+def _utilization_rows(
+    trials: Sequence[UtilizationTrial],
+    acceptance: UtilizationAcceptance,
+) -> list[dict[str, Any]]:
+    pairs: dict[int, dict[str, UtilizationTrial]] = {}
+    for trial in trials:
+        pairs.setdefault(trial.repetition, {})[trial.mode] = trial
+    rows: list[dict[str, Any]] = []
+    for index, (repetition, pair) in enumerate(sorted(pairs.items())):
+        static = pair["static"]
+        dynamic = pair["dynamic"]
+        rows.append(
+            {
+                "repetition": repetition,
+                "static_throughput_per_gpu": static.useful_throughput_per_gpu,
+                "dynamic_throughput_per_gpu": dynamic.useful_throughput_per_gpu,
+                "throughput_improvement": acceptance.paired_improvements[index],
+                "static_idle_fraction": static.idle_fraction,
+                "dynamic_idle_fraction": dynamic.idle_fraction,
+                "idle_reduction": acceptance.paired_idle_reductions[index],
+            }
+        )
+    return rows
+
+
+def _render_operator_report(
+    base_report: str,
+    manifest: RunManifest,
+    summary: Mapping[str, Any],
+    metadata: AcceptanceReportMetadata,
+    *,
+    snapshot_report: SnapshotSizeReport,
+    gpu_summaries: Mapping[int, GpuUtilizationSummary],
+    utilization_trials: Sequence[UtilizationTrial],
+    utilization: UtilizationAcceptance,
+) -> str:
+    invalid = metadata.invalid_repetitions or ("None",)
+    reference_differences = summary["reference_differences"] or ["None"]
+    training_rows = tuple(
+        f"| `{pipeline_id}` | {iteration['iteration']} | "
+        f"{iteration['collection_policy_version']} | {iteration['received_trajectories']} | "
+        f"{iteration['produced_policy_version']} |"
+        for pipeline_id, iterations in sorted(summary["training_iterations"].items())
+        for iteration in iterations
+    )
+    gpu_rows = tuple(
+        f"| {gpu_id} | {gpu.mean_sm_utilization:.2f}% | "
+        f"{gpu.idle_ns / gpu.duration_ns:.2%} |"
+        for gpu_id, gpu in sorted(gpu_summaries.items())
+    )
+    trial_rows = _utilization_rows(utilization_trials, utilization)
+    utilization_rows = tuple(
+        f"| {row['repetition']} | {row['static_throughput_per_gpu']:.6f} | "
+        f"{row['dynamic_throughput_per_gpu']:.6f} | "
+        f"{row['throughput_improvement']:.2%} | {row['idle_reduction']:.2%} |"
+        for row in trial_rows
+    )
+    return base_report + "\n".join(
+        (
+            "## Provenance",
+            "",
+            f"- Root commit: `{metadata.root_commit}`",
+            f"- RLinf commit: `{metadata.rlinf_commit}`",
+            f"- Dirty worktree: `{str(metadata.dirty_worktree).lower()}`",
+            *(f"- Hardware: {item}" for item in metadata.hardware),
+            f"- Checkpoint digests: `{json.dumps(dict(manifest.checkpoint_digests), sort_keys=True)}`",
+            "",
+            "## Reference equivalence",
+            "",
+            *(f"- {item}" for item in reference_differences),
+            "",
+            "## Batch and policy versions",
+            "",
+            "| Pipeline | Iteration | Collected policy | Trajectories | Produced policy |",
+            "| --- | ---: | ---: | ---: | ---: |",
+            *training_rows,
+            "",
+            "## Transfer timeline",
+            "",
+            "```json",
+            json.dumps(summary["transfer_timeline"], indent=2, sort_keys=True),
+            "```",
+            "",
+            "## Snapshot and GPU measurements",
+            "",
+            f"- Snapshot logical bytes: {snapshot_report.logical_bytes}",
+            f"- Snapshot encoded bytes: {snapshot_report.encoded_bytes}",
+            "- Latency distributions: `latency_summary.csv`",
+            "",
+            "| GPU | Mean SM utilization | Idle fraction |",
+            "| ---: | ---: | ---: |",
+            *gpu_rows,
+            "",
+            "## Static versus dynamic utilization",
+            "",
+            "| Repetition | Static throughput/GPU | Dynamic throughput/GPU | Improvement | Idle reduction |",
+            "| ---: | ---: | ---: | ---: | ---: |",
+            *utilization_rows,
+            "",
+            "## Invalid repetitions",
+            "",
+            *(f"- {item}" for item in invalid),
+            "",
+            "## Limitations",
+            "",
+            *(f"- {item}" for item in metadata.limitations),
+            "",
+            "## Commands",
+            "",
+            *(f"- `{command}`" for command in metadata.commands),
+            "",
+        )
+    )
 
 
 def prepare_acceptance_artifacts(
@@ -89,14 +434,28 @@ def prepare_acceptance_artifacts(
 def atomic_write_json(path: str | Path, payload: Any) -> None:
     """Write one normalized JSON artifact atomically without overwriting."""
     normalized = normalize_manifest(payload)
-    text = json.dumps(normalized, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    text = (
+        json.dumps(
+            normalized,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    )
     _atomic_write_text(Path(path), text)
 
 
 def atomic_write_jsonl(path: str | Path, rows: Iterable[Any]) -> None:
     """Write normalized JSONL rows atomically without overwriting."""
     encoded = [
-        json.dumps(normalize_manifest(row), sort_keys=True, ensure_ascii=False)
+        json.dumps(
+            normalize_manifest(row),
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
         for row in rows
     ]
     if not encoded:

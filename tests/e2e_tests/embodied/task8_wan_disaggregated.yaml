@@ -1,0 +1,27 @@
+# Four-A800 Task 8 Wan configuration. Both independent drivers resolve this
+# same candidate topology; RLix owns active exclusivity between pipelines.
+models:
+  vla:
+    checkpoint: ${oc.env:RLINF_VLA_CHECKPOINT,/workspace/VLA/Openvla-oft-SFT-libero-spatial-traj1}
+    precision: bf16
+    unnorm_key: libero_spatial_no_noops
+  world_model:
+    checkpoint: ${oc.env:RLINF_WM_CHECKPOINT,/workspace/WM/RLinf-Wan-LIBERO-Spatial}
+    num_inference_steps: 1
+
+smoke:
+  base_config: wan_libero_spatial_grpo_openvlaoft_rlix
+  actor_gpus: [0]
+  rollout_gpu: [0, 1]
+  env_gpu: [2, 3]
+  operation_timeout_s: 900.0
+  output_dir: ${oc.env:RLINF_TASK8_OUTPUT,/tmp/rlinf_task8_wan_disaggregated}
+  total_num_envs: 4
+  adv_type: grpo
+  group_size: 2
+  rollout_epoch: 1
+  max_episode_steps: 16
+  max_steps_per_rollout_epoch: 16
+  max_train_steps: 2
+  run_evaluation: false
+  save_checkpoint: false

@@ -9,9 +9,31 @@ import pytest
 import torch
 
 from rlinf.data.embodied_io_struct import RolloutTransitionIdentity
-from rlinf.runners.embodied_runner import EmbodiedRunner
+from rlinf.runners.embodied_runner import EmbodiedRunner, _resolve_channel_names
 from rlinf.scheduler.rlix.protocol import ElasticBatchReceipt, FixedWorkerResidency
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+
+
+def test_runner_channel_names_preserve_defaults_and_allow_isolation() -> None:
+    assert _resolve_channel_names(None, use_reward=False) == {
+        "env": "Env",
+        "rollout": "Rollout",
+        "actor": "Actor",
+    }
+    assert _resolve_channel_names(None, use_reward=True)["reward"] == "Reward"
+    isolated = {
+        "env": "t8_a_env",
+        "rollout": "t8_a_rollout",
+        "actor": "t8_a_actor",
+    }
+    assert _resolve_channel_names(isolated, use_reward=False) == isolated
+    with pytest.raises(ValueError, match="exactly"):
+        _resolve_channel_names({"env": "only-one"}, use_reward=False)
+    with pytest.raises(ValueError, match="unique"):
+        _resolve_channel_names(
+            {"env": "same", "rollout": "same", "actor": "actor"},
+            use_reward=False,
+        )
 
 
 class _Handle:

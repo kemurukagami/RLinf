@@ -247,6 +247,15 @@ class Task8RoleNames:
         if any(not value.startswith(f"{self.prefix}_") for value in owned):
             raise ValueError("Task 8 role-owned names must use the role prefix")
 
+    def runner_channel_names(self) -> dict[str, str]:
+        """Project role identities into the synchronous runner channel contract."""
+        self.validate()
+        return {
+            "env": self.env_input_channel,
+            "rollout": self.rollout_request_channel,
+            "actor": self.actor_channel,
+        }
+
 
 def derive_role_names(*, run_id: str, role: str) -> Task8RoleNames:
     """Derive deterministic collision-free worker and channel identities."""
@@ -514,6 +523,11 @@ def normalize_manifest(value: Any, *, inline_value_limit: int = 4096) -> Any:
     """Convert nested evidence to deterministic JSON-safe typed records."""
     if isinstance(value, (torch.Tensor, np.ndarray)):
         array = _canonical_array(value)
+        if (
+            np.issubdtype(array.dtype, np.floating)
+            or np.issubdtype(array.dtype, np.complexfloating)
+        ) and not np.isfinite(array).all():
+            raise ValueError("acceptance manifests reject non-finite tensor values")
         raw = array.tobytes(order="C")
         record: dict[str, Any] = {
             "kind": "tensor",
@@ -540,7 +554,9 @@ def normalize_manifest(value: Any, *, inline_value_limit: int = 4096) -> Any:
             for item in value
         ]
     if isinstance(value, np.generic):
-        return value.item()
+        return normalize_manifest(value.item(), inline_value_limit=inline_value_limit)
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("acceptance manifests reject non-finite scalar values")
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     raise TypeError(f"unsupported manifest value {type(value).__name__}")
@@ -915,16 +931,33 @@ class UtilizationTrial:
     completed_transitions: int
     physical_gpu_count: int
     wall_time_s: float
+    idle_fraction: float | None = None
     complete_batch: bool = True
     correctness_passed: bool = True
 
     @property
     def useful_throughput_per_gpu(self) -> float:
         """Compute accepted transitions per physical GPU-second."""
-        if self.physical_gpu_count <= 0 or self.wall_time_s <= 0:
+        if (
+            not isinstance(self.physical_gpu_count, int)
+            or isinstance(self.physical_gpu_count, bool)
+            or self.physical_gpu_count <= 0
+            or not math.isfinite(self.wall_time_s)
+            or self.wall_time_s <= 0
+        ):
             raise ValueError("physical_gpu_count and wall_time_s must be positive")
-        if self.completed_transitions < 0:
+        if (
+            not isinstance(self.completed_transitions, int)
+            or isinstance(self.completed_transitions, bool)
+            or self.completed_transitions < 0
+        ):
             raise ValueError("completed_transitions must be non-negative")
+        if self.idle_fraction is not None and (
+            isinstance(self.idle_fraction, bool)
+            or not math.isfinite(self.idle_fraction)
+            or not 0.0 <= self.idle_fraction <= 1.0
+        ):
+            raise ValueError("idle_fraction must be within [0, 1]")
         if not self.complete_batch or not self.correctness_passed:
             return 0.0
         return self.completed_transitions / (self.physical_gpu_count * self.wall_time_s)
@@ -938,6 +971,8 @@ class UtilizationAcceptance:
     paired_improvements: tuple[float, ...]
     median_improvement: float
     improved_repetitions: int
+    paired_idle_reductions: tuple[float, ...] = ()
+    median_idle_reduction: float | None = None
 
 
 def evaluate_utilization_trials(
@@ -946,6 +981,7 @@ def evaluate_utilization_trials(
     minimum_pairs: int = 5,
     minimum_median_improvement: float = 0.05,
     minimum_improved_pairs: int = 4,
+    minimum_median_idle_reduction: float | None = None,
 ) -> UtilizationAcceptance:
     """Evaluate paired static/dynamic useful-throughput hard gates."""
     paired: dict[int, dict[str, UtilizationTrial]] = {}
@@ -972,6 +1008,7 @@ def evaluate_utilization_trials(
             f"requires at least {minimum_pairs} paired repetitions, got {len(complete_pairs)}"
         )
     improvements: list[float] = []
+    idle_reductions: list[float] = []
     all_dynamic_correct = True
     for modes in complete_pairs:
         static_throughput = modes["static"].useful_throughput_per_gpu
@@ -979,18 +1016,41 @@ def evaluate_utilization_trials(
         if static_throughput <= 0:
             raise ValueError("static trial throughput must be positive")
         improvements.append(dynamic_throughput / static_throughput - 1.0)
+        if minimum_median_idle_reduction is not None:
+            static_idle = modes["static"].idle_fraction
+            dynamic_idle = modes["dynamic"].idle_fraction
+            if static_idle is None or dynamic_idle is None:
+                raise ValueError(
+                    "idle_fraction is required when enforcing idle reduction"
+                )
+            if static_idle <= 0.0:
+                raise ValueError(
+                    "static idle_fraction must be positive when enforcing idle reduction"
+                )
+            idle_reductions.append((static_idle - dynamic_idle) / static_idle)
         all_dynamic_correct &= (
             modes["dynamic"].complete_batch and modes["dynamic"].correctness_passed
         )
     median = float(np.median(np.asarray(improvements, dtype=np.float64)))
+    median_idle_reduction = (
+        float(np.median(np.asarray(idle_reductions, dtype=np.float64)))
+        if idle_reductions
+        else None
+    )
     improved = sum(improvement > 0.0 for improvement in improvements)
     return UtilizationAcceptance(
         passed=(
             all_dynamic_correct
             and median >= minimum_median_improvement
             and improved >= minimum_improved_pairs
+            and (
+                minimum_median_idle_reduction is None
+                or median_idle_reduction >= minimum_median_idle_reduction
+            )
         ),
         paired_improvements=tuple(improvements),
         median_improvement=median,
         improved_repetitions=improved,
+        paired_idle_reductions=tuple(idle_reductions),
+        median_idle_reduction=median_idle_reduction,
     )

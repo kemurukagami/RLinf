@@ -18,7 +18,7 @@ import queue
 import threading
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Mapping, Union
 
 from omegaconf.dictconfig import DictConfig
 
@@ -49,6 +49,31 @@ if TYPE_CHECKING:
     from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
+def _resolve_channel_names(
+    channel_names: Mapping[str, str] | None, *, use_reward: bool
+) -> dict[str, str]:
+    """Validate optional process-owned channel names while preserving defaults."""
+    defaults = {"env": "Env", "rollout": "Rollout", "actor": "Actor"}
+    if use_reward:
+        defaults["reward"] = "Reward"
+    if channel_names is None:
+        return defaults
+    resolved = dict(channel_names)
+    if set(resolved) != set(defaults):
+        raise ValueError(
+            f"channel_names must contain exactly {sorted(defaults)!r}, "
+            f"got {sorted(resolved)!r}"
+        )
+    if any(
+        not isinstance(value, str) or not value or any(char.isspace() for char in value)
+        for value in resolved.values()
+    ):
+        raise ValueError("channel names must be non-empty strings without whitespace")
+    if len(set(resolved.values())) != len(resolved):
+        raise ValueError("channel names must be unique")
+    return resolved
+
+
 class EmbodiedRunner:
     def __init__(
         self,
@@ -64,6 +89,7 @@ class EmbodiedRunner:
         reward: Union["EmbodiedRewardWorker"] = None,
         critic=None,
         rlix_runtime=None,
+        channel_names: Mapping[str, str] | None = None,
     ):
         self.cfg = cfg
         self.actor = actor
@@ -93,11 +119,14 @@ class EmbodiedRunner:
         )
 
         # Data channels
-        self.env_channel = Channel.create("Env")
-        self.rollout_channel = Channel.create("Rollout")
-        self.actor_channel = Channel.create("Actor")
+        resolved_channel_names = _resolve_channel_names(
+            channel_names, use_reward=self.reward is not None
+        )
+        self.env_channel = Channel.create(resolved_channel_names["env"])
+        self.rollout_channel = Channel.create(resolved_channel_names["rollout"])
+        self.actor_channel = Channel.create(resolved_channel_names["actor"])
         if self.reward is not None:
-            self.reward_channel = Channel.create("Reward")
+            self.reward_channel = Channel.create(resolved_channel_names["reward"])
         else:
             self.reward_channel = None
 

@@ -14,6 +14,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
+
+from rlinf.scheduler.rlix.validation import validate_elastic_vla_config
 
 
 def _load_acceptance_support():
@@ -79,6 +82,52 @@ def _load_acceptance_artifacts():
 
 
 _artifacts = _load_acceptance_artifacts()
+
+
+def _load_two_pipeline_acceptance():
+    module_path = (
+        Path(__file__).resolve().parents[1]
+        / "e2e_tests"
+        / "embodied"
+        / "task8_two_pipeline_acceptance.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "task8_two_pipeline_acceptance", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load Task 8 orchestrator from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_orchestrator = _load_two_pipeline_acceptance()
+
+
+def _load_two_pipeline_driver():
+    module_path = (
+        Path(__file__).resolve().parents[1]
+        / "e2e_tests"
+        / "embodied"
+        / "task8_two_pipeline_driver.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "task8_two_pipeline_driver", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load Task 8 driver from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    sys.path.insert(0, str(module_path.parent))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
+    return module
+
+
+_driver = _load_two_pipeline_driver()
 AcceptanceEvent = _support.AcceptanceEvent
 AcceptanceEventProducer = _support.AcceptanceEventProducer
 AcceptanceEventSink = _support.AcceptanceEventSink
@@ -110,13 +159,21 @@ validate_transfer_timeline = _analysis.validate_transfer_timeline
 extract_scheduler_commits_from_perfetto = (
     _artifacts.extract_scheduler_commits_from_perfetto
 )
+AcceptanceReportMetadata = _artifacts.AcceptanceReportMetadata
 atomic_write_csv = _artifacts.atomic_write_csv
 atomic_write_json = _artifacts.atomic_write_json
 atomic_write_jsonl = _artifacts.atomic_write_jsonl
+emit_acceptance_artifact_set = _artifacts.emit_acceptance_artifact_set
 parse_perfetto_commit_csv = _artifacts.parse_perfetto_commit_csv
 prepare_acceptance_artifacts = _artifacts.prepare_acceptance_artifacts
 verify_completion_marker = _artifacts.verify_completion_marker
 write_completion_marker = _artifacts.write_completion_marker
+run_driver_pair = _orchestrator.run_driver_pair
+validate_driver_ready_pair = _orchestrator.validate_driver_ready_pair
+prepare_preliminary_driver_layout = _orchestrator.prepare_preliminary_driver_layout
+parse_canonical_bundles = _driver.parse_canonical_bundles
+configure_role_owned_surface = _driver.configure_role_owned_surface
+compose_wan_model_driver_config = _driver.compose_wan_model_driver_config
 
 
 def _transition() -> TransitionIdentity:
@@ -223,6 +280,8 @@ def test_grpo_training_loop_requires_reward_update_and_policy_reuse() -> None:
                 ),
             )
         )
+    with pytest.raises(ValueError, match="rewards and advantages must be finite"):
+        validate_grpo_training_loop((replace(first, rewards_finite=False), second))
 
 
 def test_acceptance_artifacts_are_atomic_immutable_and_completion_sealed(
@@ -286,6 +345,236 @@ def test_acceptance_artifact_layout_rejects_run_id_path_traversal(
         prepare_acceptance_artifacts(tmp_path, run_manifest=manifest)
 
 
+def test_two_os_driver_orchestrator_rendezvous_and_isolates_identities(
+    tmp_path: Path,
+) -> None:
+    manifest = RunManifest(
+        run_id="run-processes",
+        environment="wan",
+        mode="disaggregated",
+        scenario="recovery",
+        expected_bundles=((0, 2), (1, 3)),
+        checkpoint_digests={"vla": "abc", "wan": "def"},
+    )
+    layout = prepare_acceptance_artifacts(tmp_path, run_manifest=manifest)
+    script = """
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+role = os.environ["RLINF_TASK8_ROLE"]
+ready = {
+    "scope": "connectivity_only",
+    "role": role,
+    "pid": os.getpid(),
+    "control_plane_actor_id": "shared-control",
+    "scheduler_actor_id": "shared-scheduler",
+    "pipeline_id": f"pipeline-{role}",
+    "pipeline_namespace": f"namespace-{role}",
+    "candidate_mapping": {"actor_infer": [0, 1, 2, 3]},
+    "candidate_dp_mapping": {"actor_infer": {"0": [0, 2], "1": [1, 3]}},
+    "role_names": {"actor": f"actor-{role}", "env": f"env-{role}"},
+}
+Path(os.environ["RLINF_TASK8_READY"]).write_text(json.dumps(ready), encoding="utf-8")
+start = Path(os.environ["RLINF_TASK8_START"])
+while not start.is_file():
+    time.sleep(0.01)
+Path(os.environ["RLINF_TASK8_RESULT"]).write_text(
+    json.dumps({
+        "status": "passed",
+        "role": role,
+        "scope": "connectivity_only",
+        "task8_accepted": False,
+    }),
+    encoding="utf-8",
+)
+print(f"driver {role} completed")
+print(f"driver {role} stderr", file=sys.stderr)
+"""
+    command = (sys.executable, "-c", script)
+
+    results = run_driver_pair(
+        layout=layout,
+        commands={"a": command, "b": command},
+        timeout_s=10.0,
+    )
+
+    assert set(results) == {"a", "b"}
+    assert results["a"].pid != results["b"].pid
+    assert results["a"].ready["scheduler_actor_id"] == "shared-scheduler"
+    assert "driver a completed" in results["a"].stdout_path.read_text()
+    assert "driver b stderr" in results["b"].stderr_path.read_text()
+    assert (layout.root / "control" / "start.json").is_file()
+
+
+def test_preliminary_driver_layout_is_explicitly_non_acceptance(
+    tmp_path: Path,
+) -> None:
+    layout = prepare_preliminary_driver_layout(
+        tmp_path,
+        run_id="model-init-pair",
+        scope="model_init_only",
+    )
+
+    manifest = json.loads((layout.root / "preliminary_manifest.json").read_text())
+    assert manifest == {
+        "run_id": "model-init-pair",
+        "scope": "model_init_only",
+        "task8_accepted": False,
+    }
+    assert (layout.drivers / "a").is_dir()
+    assert (layout.drivers / "b").is_dir()
+    with pytest.raises(FileExistsError, match="not empty"):
+        prepare_preliminary_driver_layout(
+            tmp_path,
+            run_id="model-init-pair",
+            scope="model_init_only",
+        )
+
+
+def test_driver_ready_pair_rejects_different_scheduler() -> None:
+    base = {
+        "scope": "connectivity_only",
+        "role": "a",
+        "pid": 1,
+        "control_plane_actor_id": "control",
+        "scheduler_actor_id": "scheduler-a",
+        "pipeline_id": "pipeline-a",
+        "pipeline_namespace": "namespace-a",
+        "candidate_mapping": {"actor_infer": [0, 1]},
+        "candidate_dp_mapping": {"actor_infer": {"0": [0], "1": [1]}},
+        "role_names": {"actor": "actor-a"},
+    }
+    other = {
+        **base,
+        "role": "b",
+        "pid": 2,
+        "scheduler_actor_id": "scheduler-b",
+        "pipeline_id": "pipeline-b",
+        "pipeline_namespace": "namespace-b",
+        "role_names": {"actor": "actor-b"},
+    }
+
+    with pytest.raises(ValueError, match="different scheduler_actor_id"):
+        validate_driver_ready_pair({"a": base, "b": other})
+
+
+def test_model_init_ready_pair_requires_offloaded_residencies() -> None:
+    residency = {
+        "component": "actor",
+        "rank": 0,
+        "model_resident": False,
+        "optimizer_resident": False,
+        "cuda_graph_captured": False,
+        "policy_version": 0,
+        "safe_to_release": True,
+    }
+
+    def ready(role: str) -> dict:
+        return {
+            "scope": "model_init_only",
+            "role": role,
+            "pid": 1 if role == "a" else 2,
+            "control_plane_actor_id": "control",
+            "scheduler_actor_id": "scheduler",
+            "pipeline_id": f"pipeline-{role}",
+            "pipeline_namespace": f"namespace-{role}",
+            "candidate_mapping": {"actor_infer": [0, 1, 2, 3]},
+            "candidate_dp_mapping": {"actor_infer": {"0": [0, 2], "1": [1, 3]}},
+            "role_names": {"actor": f"actor-{role}"},
+            "runtime_state": "inactive",
+            "actor_infer_bundles": [[0, 2], [1, 3]],
+            "residencies": [dict(residency)],
+        }
+
+    pair = {role: ready(role) for role in ("a", "b")}
+    validate_driver_ready_pair(pair)
+    pair["b"]["residencies"][0]["model_resident"] = True
+    pair["b"]["residencies"][0]["safe_to_release"] = False
+    with pytest.raises(ValueError, match="accelerator-resident"):
+        validate_driver_ready_pair(pair)
+
+
+def test_connectivity_driver_parses_four_gpu_canonical_bundles() -> None:
+    assert parse_canonical_bundles("0,2;1,3", mode="disaggregated") == (
+        (0, 2),
+        (1, 3),
+    )
+    assert parse_canonical_bundles("0;1", mode="collocated") == ((0,), (1,))
+    with pytest.raises(ValueError, match="width-2"):
+        parse_canonical_bundles("0;1", mode="disaggregated")
+    with pytest.raises(ValueError, match="disjoint"):
+        parse_canonical_bundles("0,1;1,2", mode="disaggregated")
+
+
+def test_driver_applies_role_owned_worker_output_and_channel_names(
+    tmp_path: Path,
+) -> None:
+    cfg = OmegaConf.create(
+        {
+            "actor": {"group_name": "ActorGroup"},
+            "rollout": {"group_name": "RolloutGroup"},
+            "env": {"group_name": "EnvGroup"},
+            "runner": {
+                "logger": {"log_path": "old", "experiment_name": "old"},
+                "per_worker_log_path": "old-workers",
+            },
+        }
+    )
+    names = derive_role_names(run_id="run-role", role="b")
+
+    channels = configure_role_owned_surface(
+        cfg,
+        names=names,
+        driver_dir=tmp_path / "driver-b",
+    )
+
+    assert cfg.actor.group_name == names.actor_group
+    assert cfg.rollout.group_name == names.rollout_group
+    assert cfg.env.group_name == names.env_group
+    assert cfg.runner.logger.experiment_name == names.prefix
+    assert cfg.runner.logger.log_path == str((tmp_path / "driver-b" / "logs").resolve())
+    assert cfg.runner.per_worker_log_path == str(
+        (tmp_path / "driver-b" / "worker_logs").resolve()
+    )
+    assert channels == names.runner_channel_names()
+
+
+def test_four_gpu_wan_driver_config_composes_two_rank_topology(tmp_path: Path) -> None:
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "e2e_tests"
+        / "embodied"
+        / "task8_wan_disaggregated.yaml"
+    )
+    names = derive_role_names(run_id="run-config", role="a")
+
+    def pure_validator(cfg):
+        validate_elastic_vla_config(cfg)
+        return cfg
+
+    cfg, channels = compose_wan_model_driver_config(
+        config_path,
+        names=names,
+        driver_dir=tmp_path / "driver-a",
+        validator=pure_validator,
+    )
+
+    assert OmegaConf.to_container(cfg.cluster.component_placement) == {
+        "actor": "0",
+        "rollout": "0,1",
+        "env": "2,3",
+    }
+    assert cfg.env.train.total_num_envs == 4
+    assert cfg.env.train.max_episode_steps == 16
+    assert cfg.algorithm.adv_type == "grpo"
+    assert cfg.algorithm.group_size == 2
+    assert cfg.actor.group_name == names.actor_group
+    assert channels == names.runner_channel_names()
+
+
 def test_role_names_are_deterministic_and_collision_free() -> None:
     names_a = derive_role_names(run_id="run-123", role="a")
     names_b = derive_role_names(run_id="run-123", role="b")
@@ -293,6 +582,11 @@ def test_role_names_are_deterministic_and_collision_free() -> None:
     assert names_a == derive_role_names(run_id="run-123", role="a")
     assert names_a.prefix == "t8_run-123_a"
     assert names_a.actor_group == "t8_run-123_a_ActorGroup"
+    assert names_a.runner_channel_names() == {
+        "env": "t8_run-123_a_env_input",
+        "rollout": "t8_run-123_a_rollout_request",
+        "actor": "t8_run-123_a_actor_batch",
+    }
     assert {
         names_a.actor_group,
         names_a.rollout_group,
@@ -433,6 +727,10 @@ def test_manifest_normalization_is_typed_stable_and_tolerance_aware() -> None:
     )
     assert compare_manifests(first, close, rtol=1e-4, atol=1e-6) == ()
     assert compare_manifests(first, close) == ("$.reward.values[0]",)
+    with pytest.raises(ValueError, match="non-finite scalar"):
+        normalize_manifest({"reward": float("nan")})
+    with pytest.raises(ValueError, match="non-finite tensor"):
+        normalize_manifest(torch.tensor([float("inf")]))
 
 
 def test_manifest_rejects_cuda_state_and_counts_nested_tensor_bytes() -> None:
@@ -1018,6 +1316,154 @@ def test_analysis_summary_is_generated_only_from_complete_raw_evidence() -> None
             gpu_summaries=gpu_summaries,
             utilization=utilization,
             raw_artifacts={"events": "events.jsonl"},
+        )
+
+
+def test_artifact_set_enforces_idle_gate_and_emits_complete_report(
+    tmp_path: Path,
+) -> None:
+    events, allocations, pipeline_a, pipeline_b, committed, resumed = (
+        _transfer_evidence()
+    )
+    timeline = validate_transfer_timeline(
+        events,
+        allocations,
+        pipeline_a=pipeline_a,
+        pipeline_b=pipeline_b,
+        selected_rank=0,
+        sibling_rank=1,
+        bundle=(2, 4),
+        committed_transition=committed,
+        resumed_transition=resumed,
+    )
+    manifest = RunManifest(
+        run_id="run-final",
+        environment="wan",
+        mode="disaggregated",
+        scenario="all",
+        expected_bundles=((2, 4), (3, 5)),
+        checkpoint_digests={"vla": "abc", "wan": "def"},
+    )
+    layout = prepare_acceptance_artifacts(tmp_path, run_manifest=manifest)
+    raw_artifacts = {
+        "events": "events.jsonl",
+        "scheduler": "core/scheduler_timeline.jsonl",
+        "gpu_samples": "gpu/samples.csv",
+        "reference": "reference/manifest.json",
+    }
+    atomic_write_jsonl(layout.root / raw_artifacts["events"], ({"event": "raw"},))
+    atomic_write_jsonl(
+        layout.root / raw_artifacts["scheduler"], ({"operation": "release"},)
+    )
+    atomic_write_csv(
+        layout.root / raw_artifacts["gpu_samples"],
+        fieldnames=("timestamp_ns", "gpu_id"),
+        rows=({"timestamp_ns": 1, "gpu_id": 2},),
+    )
+    atomic_write_json(layout.root / raw_artifacts["reference"], {"sealed": True})
+    write_completion_marker(layout, relative_artifacts=tuple(raw_artifacts.values()))
+    snapshot = analyze_snapshot_size(
+        {"state": torch.ones(4)},
+        encoded_bytes=32,
+        continuation_ceiling_bytes=1024,
+        field_ceiling_bytes=512,
+    )
+    summaries = {
+        gpu_id: GpuUtilizationSummary(gpu_id, 100, 50.0, 20) for gpu_id in (2, 3, 4, 5)
+    }
+    trials = tuple(
+        trial
+        for repetition in range(5)
+        for trial in (
+            UtilizationTrial(repetition, "static", 100, 4, 10, idle_fraction=0.5),
+            UtilizationTrial(repetition, "dynamic", 110, 4, 10, idle_fraction=0.4),
+        )
+    )
+    metadata = AcceptanceReportMetadata(
+        root_commit="root-sha",
+        rlinf_commit="rlinf-sha",
+        dirty_worktree=False,
+        hardware=("4 x NVIDIA test GPU",),
+        commands=("run-task8",),
+        limitations=("Test fixture only.",),
+    )
+    training = {
+        pipeline_id: (
+            GrpoIterationEvidence(0, 3, 3, 8, 8, 8, "grpo", True, 4),
+            GrpoIterationEvidence(1, 4, 4, 8, 8, 8, "grpo", True, 5),
+        )
+        for pipeline_id in (pipeline_a, pipeline_b)
+    }
+
+    finalizer_kwargs = {
+        "layout": layout,
+        "reference_differences": (),
+        "transfer_timeline": timeline,
+        "snapshot_report": snapshot,
+        "gpu_summaries": summaries,
+        "utilization_trials": trials,
+        "training_iterations": training,
+        "latencies_ms": {"safe_point": (1.0, 2.0, 3.0)},
+        "raw_artifacts": raw_artifacts,
+        "metadata": metadata,
+    }
+    with pytest.raises(ValueError, match="does not match the stored manifest"):
+        emit_acceptance_artifact_set(
+            run_manifest=replace(manifest, minimum_throughput_improvement=0.06),
+            **finalizer_kwargs,
+        )
+    with pytest.raises(ValueError, match="exactly one static and dynamic pair"):
+        emit_acceptance_artifact_set(
+            run_manifest=manifest,
+            **{**finalizer_kwargs, "utilization_trials": (*trials, *trials[-2:])},
+        )
+    summary, report = emit_acceptance_artifact_set(
+        run_manifest=manifest,
+        **finalizer_kwargs,
+    )
+
+    assert summary["status"] == "passed"
+    assert "Median direct-GPU idle reduction: 20.00%" in report
+    assert "## Provenance" in report
+    assert "## Batch and policy versions" in report
+    assert summary["training_iterations"][pipeline_a][1]["produced_policy_version"] == 5
+    assert {path.name for path in layout.analysis.iterdir()} == {
+        "REPORT.md",
+        "correctness.json",
+        "latency_summary.csv",
+        "ownership.json",
+        "utilization_repetitions.csv",
+        "utilization_summary.json",
+    }
+
+
+def test_idle_reduction_is_a_fail_closed_utilization_gate() -> None:
+    trials = [
+        trial
+        for repetition in range(5)
+        for trial in (
+            UtilizationTrial(repetition, "static", 100, 4, 10, idle_fraction=0.5),
+            UtilizationTrial(repetition, "dynamic", 110, 4, 10, idle_fraction=0.49),
+        )
+    ]
+
+    result = evaluate_utilization_trials(
+        trials,
+        minimum_median_idle_reduction=0.05,
+    )
+
+    assert result.median_improvement == pytest.approx(0.1)
+    assert result.median_idle_reduction == pytest.approx(0.02)
+    assert result.passed is False
+    with pytest.raises(ValueError, match="idle_fraction is required"):
+        evaluate_utilization_trials(
+            [replace(trial, idle_fraction=None) for trial in trials],
+            minimum_median_idle_reduction=0.05,
+        )
+    with pytest.raises(ValueError, match="idle_fraction must be within"):
+        evaluate_utilization_trials(
+            [replace(trial, idle_fraction=float("nan")) for trial in trials],
+            minimum_median_idle_reduction=0.05,
         )
 
 

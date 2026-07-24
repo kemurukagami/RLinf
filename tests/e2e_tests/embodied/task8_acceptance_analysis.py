@@ -135,6 +135,8 @@ class GrpoIterationEvidence:
     advantage_type: str
     actor_update_completed: bool
     produced_policy_version: int
+    rewards_finite: bool = True
+    advantages_finite: bool = True
 
     def validate(self) -> None:
         """Reject partial rewards, mixed versions, or non-GRPO updates."""
@@ -164,6 +166,8 @@ class GrpoIterationEvidence:
             raise ValueError("sealed batch policy version does not match collection")
         if self.advantage_type != "grpo":
             raise ValueError("Task 8 training evidence must use GRPO advantages")
+        if not self.rewards_finite or not self.advantages_finite:
+            raise ValueError("Task 8 GRPO rewards and advantages must be finite")
         if not self.actor_update_completed:
             raise ValueError("GRPO actor update did not complete")
         if self.produced_policy_version != self.collection_policy_version + 1:
@@ -750,6 +754,13 @@ def build_analysis_summary(
             f"- Reference equivalence: {'PASS' if correctness_passed else 'FAIL'}",
             "- A-to-B-to-A ownership transfer: PASS",
             f"- Utilization threshold: {'PASS' if utilization.passed else 'FAIL'}",
+            f"- Median throughput improvement: {utilization.median_improvement:.2%}",
+            "- Median direct-GPU idle reduction: "
+            + (
+                f"{utilization.median_idle_reduction:.2%}"
+                if utilization.median_idle_reduction is not None
+                else "NOT MEASURED"
+            ),
             "",
             "## Raw evidence",
             "",

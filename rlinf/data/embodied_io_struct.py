@@ -489,8 +489,13 @@ def split_elastic_rollout_request(
 
     if not split_sizes or any(size <= 0 for size in split_sizes):
         raise ValueError("split_sizes must contain positive values")
-    if sum(split_sizes) != request.logical_batch_size:
-        raise ValueError("split sizes must sum to the request logical batch size")
+    split_total = sum(split_sizes)
+    if split_total != request.logical_batch_size:
+        raise ValueError(
+            f"{request.kind.value} request split sizes {split_sizes} sum to "
+            f"{split_total}, but its logical batch size is "
+            f"{request.logical_batch_size}"
+        )
     if request.kind is ElasticRolloutRequestKind.DRAIN_BARRIER:
         if len(split_sizes) != 1:
             raise ValueError("Drain barriers require one-to-one elastic routing")

@@ -75,6 +75,14 @@ Implementation progress (2026-07-24):
   manifests, enforces exact scope-specific readiness schemas, rejects any
   accelerator-resident model state, and writes either `pair_result.json` or
   `pair_failure.json` without allowing a preliminary run to claim acceptance.
+- The orchestrator now also has an acceptance-matrix preflight that validates
+  the requested environment/mode against the configured rank-to-GPU bundles,
+  requires GRPO with at least two linked training iterations, freezes the hard
+  utilization thresholds and operator-supplied checkpoint digests into the
+  immutable run manifest, and still labels the result as non-acceptance. The
+  checked-in launcher exposes this only through explicit `--preflight-only`
+  until real two-driver generation is implemented. Wan and OpenSora now each
+  have disaggregated and collocated matrix configs covered by CPU tests.
 - A single four-A800 model-bearing Wan driver passed cold initialization in
   `287.14s`. Its immutable readiness evidence covers actor rank 0, rollout
   ranks 0-1, and environment ranks 0-1; all five records report model,
@@ -89,6 +97,42 @@ Implementation progress (2026-07-24):
   was fully released. This is retained as failed preliminary evidence and is
   not a Task 8 acceptance result; the two-driver model stage requires a higher
   container memory limit or a separately validated memory reduction.
+- After the container CPU-memory limit was raised, the two-driver Wan
+  `model-init-only` run passed on 2026-07-27. Command:
+
+  ```bash
+  PYTHONPATH=/root/_VLAMP/rlix-core/src:/root/_VLAMP/RLinf:/root/_VLAMP/RLinf/tests/e2e_tests/embodied \
+  /root/.venv/bin/python /root/_VLAMP/RLinf/tests/e2e_tests/embodied/task8_two_pipeline_acceptance.py \
+    --scope model-init-only \
+    --address 127.0.0.1:6379 \
+    --run-id model-init-manual-2 \
+    --output-dir /tmp/task8-model-init \
+    --mode disaggregated \
+    --bundles '0,2;1,3' \
+    --config /root/_VLAMP/RLinf/tests/e2e_tests/embodied/task8_wan_disaggregated.yaml \
+    --timeout-s 1800
+  ```
+
+  The run produced `/tmp/task8-model-init/model-init-manual-2/pair_result.json`
+  with `status: passed`, `scope: model_init_only`, and
+  `task8_accepted: false`. Driver A PID `84530` registered pipeline
+  `rlinf_3b7af3522990`; driver B PID `84531` registered pipeline
+  `rlinf_ce0ac00734e8`. Both drivers resolved the same detached control plane
+  `9f30878de46e5fb18af6f0fc02000000` and scheduler
+  `5f6ada4046615dbf15b7f7b502000000`, while retaining distinct pipeline
+  namespaces and role-scoped RLinf worker/channel names. Both registered the
+  four-GPU disaggregated actor-infer bundles `rank 0 -> (0, 2)` and
+  `rank 1 -> (1, 3)`. Each driver reported five post-initialization residency
+  records: actor rank 0, rollout ranks 0-1, and environment ranks 0-1. Every
+  record had `model_resident: false`, `optimizer_resident: false`,
+  `cuda_graph_captured: false`, and `safe_to_release: true`; both runtimes
+  returned `inactive`. The repository helper `validate_driver_ready_pair()`
+  accepted the two readiness files, and both driver stderr logs were scanned
+  for traceback/exception/module/runtime/segmentation failure markers with no
+  matches in the successful run. This proves two independent model-bearing
+  Wan drivers can cold-initialize, verify physical offload, share one RLix
+  core, and close cleanly on the four-GPU host. It does not prove generation,
+  preemption, resume, GRPO, or utilization, so it remains preliminary evidence.
 - After this slice, the focused Task 8 suite passes `51 passed, 1 skipped`, the
   complete focused Tasks 1-8 regression passes `294 passed, 2 skipped`, and
   the complete `rlix-core` suite passes `114 passed, 1 skipped`. Ruff lint
@@ -227,14 +271,22 @@ Implementation checklist:
   scheduler, runtime, and coordinator transaction boundaries.
 - [x] Add explicit original-RLix parity regressions for every preserved
   behavior named in the architecture.
-- [ ] Build an acceptance orchestrator that starts two independent OS driver
-  processes against one existing Ray cluster.
+- [x] Build a preliminary acceptance orchestrator that starts two independent
+  OS driver processes against one existing Ray cluster for connectivity,
+  shared-control, and model-initialization scopes.
+- [ ] Extend that orchestrator into the full generation acceptance path with
+  preemption gates, reference capture, GRPO evidence, utilization sampling,
+  and final report emission.
 - [x] Derive and CPU-test collision-free role-specific RLinf worker, channel,
   and event identities while retaining the one shared core namespace.
-- [ ] Apply those identities to the full driver, output, and acceptance-control
+- [x] Apply those identities to the full driver, output, and acceptance-control
   surface.
 - [x] Prove two subprocess clients resolve the same detached control-plane and
   scheduler actor IDs and receive distinct pipeline IDs/namespaces.
+- [x] Prove two independent model-bearing Wan drivers cold-initialize through
+  production placement/launch/runner initialization, verify all actor,
+  rollout, and environment ranks are offloaded, and close without claiming
+  acceptance.
 - [x] Add transparent acceptance-only environment/rollout subclasses and prove
   fake-worker output, call-order, and RNG equivalence.
 - [x] Complete acceptance-only worker/actor wiring around drain observation,
@@ -678,31 +730,49 @@ execution.
 Both drivers register the same candidate actor-infer topology so exact physical
 reuse is possible.
 
-Recommended disaggregated six-GPU mapping:
+Required four-GPU disaggregated mapping on the supported host:
 
 ```text
-actor ranks:   [0, 1]
-rollout ranks: [2, 3]
-env ranks:     [4, 5]
+fixed actor rank: [0]
+rollout ranks:    [0, 1]
+env ranks:        [2, 3]
 
-actor_infer rank 0 = [2, 4]
-actor_infer rank 1 = [3, 5]
+actor_infer rank 0 = [0, 2]
+actor_infer rank 1 = [1, 3]
 ```
 
-Recommended collocated four-GPU mapping:
+The actor mapping intentionally overlaps generation GPU 0. This is safe only
+because `actor_train` and `actor_infer` are different scheduler-owned stages:
+the runner must release and verify physical offload of all generation bundles
+before fixed actor training acquires GPU 0, and it must release actor training
+before the next collection. The acceptance controller gates both pipelines so
+pipeline B cannot enter a fixed actor stage while pipeline A is executing the
+forced generation transfer. Any simultaneous fixed/elastic ownership of GPU 0
+is an acceptance failure, not an allowed oversubscription.
+
+Required four-GPU collocated mapping:
 
 ```text
-actor ranks:   [0, 1]
-rollout ranks: [2, 3]
-env ranks:     [2, 3]
+actor ranks:   [2, 3]
+rollout ranks: [0, 1]
+env ranks:     [0, 1]
 
-actor_infer rank 0 = [2]
-actor_infer rank 1 = [3]
+actor_infer rank 0 = [0]
+actor_infer rank 1 = [1]
 ```
 
 GPU IDs are configurable, but every recorded run stores the resolved mapping.
 Do not assume `CUDA_VISIBLE_DEVICES` text is the core GPU identity; T6 resolved
 placement remains authoritative.
+
+Both independent pipelines register the same mapping. They initialize one at
+a time, return fully CPU-offloaded/inactive, and only then enter the shared
+generation experiment. Four GPUs are sufficient for the scheduling topology;
+they do not remove the separately measured 128-GiB container-memory blocker.
+The real two-driver run still requires either a higher cgroup memory limit or
+a validated reduction in per-pipeline CPU-resident checkpoint state. The test
+must fail preflight rather than substitute fake workers, fewer ranks, or one
+driver when that host-memory prerequisite is not met.
 
 ### 7.2 Process roles
 
@@ -769,7 +839,7 @@ Required gates:
 2. B policy sync and then A policy sync completed sequentially while neither
    collection owns generation GPUs;
 3. A owns both generation bundles;
-4. selected A rank emitted `chunk_started`;
+4. selected A rank completed an acknowledged initial bootstrap dispatch;
 5. B may start its already-synchronized elastic collection demand;
 6. at least one exact A bundle transferred to B;
 7. B performed useful real model work on the transferred bundle;
@@ -779,6 +849,390 @@ Required gates:
 Every wait has a positive configured deadline. Timeout never force-cancels
 diffusion. On timeout, preserve logs, query statuses, stop new work, and perform
 only cleanup whose residency preconditions are known.
+
+### 7.6 Generation proof harness design
+
+The next implementation step is a `generation-proof-only` scope that builds on
+the passing `model-init-only` path. It remains `task8_accepted: false` until it
+also emits reference equivalence, linked GRPO, utilization, and final report
+artifacts. Its purpose is narrower: prove that two already-initialized
+model-bearing drivers can interact through the real runner collection path and
+perform one event-gated A-to-B-to-A actor-infer bundle transfer.
+
+The harness uses the same four-GPU disaggregated topology already proven by
+`model-init-manual-2`:
+
+```text
+pipeline A candidate actor_infer:
+  rank 0 -> (0, 2)
+  rank 1 -> (1, 3)
+
+pipeline B candidate actor_infer:
+  rank 0 -> (0, 2)
+  rank 1 -> (1, 3)
+
+fixed actor_train:
+  GPU 0, mutually exclusive with actor_infer ownership
+```
+
+The two pipelines intentionally register identical candidate mappings. The
+scheduler decides active ownership. The harness must prove that identical
+candidate registration never becomes simultaneous active ownership of any
+physical GPU. GPU 0 is reused across fixed actor and elastic generation stages
+only by time sharing: no generation bundle may remain active or resident when
+either pipeline acquires `actor_train`.
+
+The generation-proof driver configuration is:
+
+- use the same role-owned worker groups, channels, log directories, and runner
+  channel names as `model-init-only`;
+- launch `RecordingEnvWorker`, `RecordingMultiStepRolloutWorker`,
+  `RecordingEmbodiedFSDPActor`, and `RecordingEmbodiedRunner`;
+- configure every recording worker with an `AcceptanceControlObserverProxy`
+  that submits to the named shared acceptance-control actor;
+- install those proxies on the remote actor, rollout, and environment worker
+  actors before `runner.init_workers()`; missing worker observers are a
+  fail-closed harness error because generation hooks execute inside those Ray
+  actors, not inside the local runner process;
+- enrich worker-originated transition events from each worker's elastic cursor
+  before submission so lifecycle generation, policy version, and transition
+  identity are present even when the production method payload encodes them
+  indirectly; the acceptance-control actor reports rejected event name, role,
+  component, rank, lifecycle, policy, transition, GPU bundle, sequence, detail
+  keys, and validation reason;
+- initialize driver A and driver B sequentially, then verify both are
+  `inactive` and all residencies are `safe_to_release`;
+- run policy synchronization as a fixed stage before any elastic generation
+  demand, with B synchronized first and A synchronized second; and
+- after sync, require both pipelines to return to inactive/offloaded state
+  before the forced generation interaction begins.
+
+The frozen four-GPU Wan workload is:
+
+| Setting | Value | Effective generation-proof behavior |
+| --- | ---: | --- |
+| physical GPUs | 4 | one single-node Ray cluster |
+| actor training placement | GPU 0 | fixed stage, time-shared with generation |
+| rollout placement | GPUs 0, 1 | one rollout worker per DP rank |
+| environment placement | GPUs 2, 3 | one Wan worker per DP rank |
+| canonical bundles | `(0, 2)`, `(1, 3)` | rollout/environment peers move together |
+| `total_num_envs` | 16 | eight environments per DP rank |
+| `group_size` | 8 | one complete GRPO group per rank, two groups per collection |
+| `rollout_epoch` | 1 | one trajectory per environment |
+| trajectories per rank | 8 | eight environments times one epoch |
+| trajectories per collection | 16 | the scheduler's step target |
+| `max_episode_steps` | 256 | production primitive-step truncation ceiling; success may end an episode earlier |
+| `max_steps_per_rollout_epoch` | 256 | one complete production-length trajectory per environment |
+| OpenVLA-OFT action chunk | 8 | eight primitive actions per policy result |
+| policy/environment chunks | 32 | at most `256 / 8` interaction commits, unless sparse success terminates earlier |
+| Wan `num_inference_steps` | 5 | production Wan generation quality for meaningful sparse reward classification |
+| reward type | action-level | binary per-frame success predictions are retained through trajectory sealing |
+| reward filtering | enabled, inclusive `[0.0, 5.0]` group-mean bounds | admit the complete binary-reward range, including uniform all-failure and all-success groups |
+| RLix monitor interval | 0.1 seconds | bounded Ray status-query pressure |
+| configured `max_train_steps` | 10 | ten linked collections and actor updates per pipeline |
+| measured repetitions | 5 | full acceptance matrix only |
+| warmup repetitions | 1 | full acceptance matrix only |
+
+For this two-rank configuration, RLinf requires
+`total_num_envs / env_world_size / pipeline_stage_num` to be divisible by
+`group_size`. Here that is `16 / 2 / 1 = 8`, so each rank owns one complete
+eight-trajectory GRPO group and no group crosses a rank boundary. The collection
+still contains two independent groups, as the preceding 8-environment/group-4
+diagnostic did, but each group now compares twice as many stochastic alternatives.
+For an illustrative independent binary outcome with success probability 0.5,
+the probability that a group has no reward variation falls from 12.5% at group
+size 4 to about 0.78% at group size 8. Real Wan outcomes are correlated, so this
+is a sizing intuition rather than an acceptance threshold. The cost is twice the
+logical trajectories, environment state, video work, and maximum model/environment
+interaction volume per collection.
+
+`generation-proof-only` executes ten linked collections and GRPO actor updates
+per pipeline. The first iteration retains the deterministic A-to-B-to-A
+preemption gates; after both first updates complete, iterations 2 through 10
+use normal shared scheduler arbitration. Each later collection synchronizes the
+policy produced by the preceding update before requesting generation. It does
+not execute the one warmup plus five measured utilization repetitions, which
+belong to the later full Task 8 acceptance matrix. With two pipelines, the proof
+run therefore collects 320 trajectories in total. Each trajectory may terminate
+early when the Wan reward model recognizes
+success; otherwise it is truncated after 256 primitive environment steps. Wan
+still computes sparse action-level reward predictions for every generated
+eight-frame chunk, but GRPO does not resolve group rewards, apply the production
+reward filter, or compute advantages until all sixteen trajectories in that
+pipeline have reached a terminal boundary and the aggregate actor batch is
+sealed. A collection with no reward-model success is valid generation/lifecycle
+evidence: its all-zero group remains in the loss mask, produces finite zero
+GRPO advantages and a zero-gradient actor update, and completes the iteration.
+The proof still rejects incomplete batches, mixed policy versions, non-finite
+values, and missing actor-update boundaries. Thus allowing a zero-success
+iteration does not claim policy improvement or weaken lifecycle validation.
+
+The `run_id` is shared by artifact paths, named Ray actors, worker groups, and
+channels. It must be one safe component: letters, digits, `_`, `.`, `-`, or `=`,
+starting with a letter or digit. It must not contain `/`, whitespace, or `:`.
+For manual reruns, use compact UTC identifiers such as
+`generation-proof-20260728T120000Z`, not path-shaped values or colon-separated
+ISO timestamps.
+
+The 100 ms collection monitor interval is intentional for the real-model proof.
+The runtime still reacts much faster than a Wan/OpenVLA inference unit, while
+avoiding the unbounded Ray task-event pressure seen with the former implicit
+10 ms interval during multi-minute cold generation. This polling cadence does
+not change transition, safe-point, or completion semantics.
+
+The acceptance-control actor owns the following deterministic gates:
+
+```text
+both_drivers_initialized
+allow_b_policy_sync
+b_policy_sync_completed
+allow_a_policy_sync
+a_policy_sync_completed
+allow_a_collection
+a_generation_granted
+a_target_bootstrap_dispatched
+a_target_chunk_started
+allow_b_collection
+b_generation_requested
+a_target_drain_requested
+a_target_chunk_committed
+a_target_snapshot_offloaded
+transfer_to_b_observed
+b_useful_work_observed
+allow_b_release
+b_release_observed
+a_resume_observed
+allow_training
+both_batches_sealed
+both_training_completed
+```
+
+The expected pipeline interaction is:
+
+```text
+1.  Orchestrator creates the run-owned acceptance-control actor and starts
+    drivers A and B as separate OS processes.
+2.  Driver A initializes real actor, rollout, and Wan environment workers,
+    verifies offload, writes readiness, and waits.
+3.  Driver B does the same independently with distinct pipeline ID, namespace,
+    groups, channels, output directory, and PID.
+4.  Driver B performs production fixed policy sync, then releases all fixed
+    ownership and reports `policy_synchronized`.
+5.  Driver A performs production fixed policy sync, then releases all fixed
+    ownership and reports `policy_synchronized`.
+6.  Driver A enters production collection. The scheduler grants A both
+    actor-infer bundles. A rank 0 owns `(0, 2)`; A rank 1 owns `(1, 3)`.
+7.  A rank 0 runs real Wan bootstrap, assigns the initial transition identity,
+    and awaits `_send_elastic_observation()`. Only after the production channel
+    send completes does its recording worker emit `bootstrap_dispatched` for
+    bundle `(0, 2)`. Recording before the awaited send is forbidden because it
+    could release the gate while bootstrap is blocked or has failed.
+8.  The orchestrator releases B collection demand after the acknowledged A
+    rank 0 bootstrap dispatch. A rank 1 remains eligible/productive and B does
+    not rerun fixed policy sync at this point. Later `policy_request_completed`,
+    `chunk_started`, and `chunk_committed` evidence remains required to prove
+    real policy inference and environment advancement; bootstrap dispatch alone
+    is a scheduling milestone, not final generation success.
+9.  RLix requests shrink of A rank 0. A rank 0 must emit `drain_requested`
+    before the current chunk finishes, then `chunk_committed` exactly once.
+10. A retains the next bootstrap, snapshots rank 0 continuation state to CPU,
+    offloads rollout and environment residency for bundle `(0, 2)`, and only
+    then allows the scheduler callback to return.
+11. The scheduler emits `release_committed` for A rank 0 bundle `(0, 2)`.
+12. The scheduler emits `allocation_committed` for B on the exact same bundle
+    `(0, 2)`. B emits at least one real useful model-work event on that bundle.
+13. B safely releases enough generation ownership for A to resume.
+14. A reacquires rank 0 on `(0, 2)`, validates the same-rank pause token,
+    onloads rollout and environment state, restores the CPU snapshot, and
+    emits one `resumed_bootstrap_dispatched` for the retained transition.
+15. A and B each complete a bounded collection, seal complete single-version
+    batches, and only then enter production fixed actor training.
+16. After training, both runtimes release fixed ownership, verify final
+    offload, unregister, close workers, and persist events/results.
+```
+
+Shrink completion-race semantics:
+
+- A scheduler-driven shrink samples environment and rollout peers with separate
+  Ray RPCs. The pair is not an atomic status object.
+- A rank may be observed at the natural-completion boundary with one peer already
+  reporting `COMPLETED` while the other still reports `ACTIVE` or
+  `DRAIN_REQUESTED`. This is legal transient skew when the rank has just
+  finished its assigned trajectories.
+- The coordinator must not fail closed on that transient
+  `COMPLETED`/`ACTIVE` or `COMPLETED`/`DRAIN_REQUESTED` sample. It waits for the
+  stored environment and rollout run calls, then validates the real outcomes:
+  both `COMPLETED` enters completed offload, both `PAUSE_READY` enters pause
+  offload, and any true outcome mismatch remains fail-closed.
+- Other peer-state mismatches are still invalid. Final post-shrink peer states
+  must match and must be either `PAUSED` or `COMPLETED`, with both peers
+  verified non-resident before the scheduler callback can release GPUs.
+- `FAILED_RESIDENT` is not tolerated as transient skew. It means one peer
+  recorded an exception while it still had model/GPU residency, so the
+  coordinator must fail closed and preserve the existing scheduler allocation.
+  Peer mismatch diagnostics must include both persisted worker failure strings
+  and stored run-task states so a failing GPU run identifies the original
+  worker-side exception without requiring a separate log search.
+
+Generation-proof rerun `generation-proof-20260728T031142Z` demonstrated that
+this diagnostic path works as intended. Both A rollout ranks received real Wan
+observations and emitted `policy_request_started`; rank 0 then entered
+`FAILED_RESIDENT` with `TypeError: Got unsupported ScalarType BFloat16`. The
+failure was not a lifecycle race: the acceptance-only
+`policy_request_completed` hook attempted to normalize the successful policy
+result with `Tensor.numpy()`, but NumPy has no native bfloat16 scalar type. The
+evidence encoder now handles CPU bfloat16 tensors explicitly: it preserves the
+`bfloat16` dtype and two-byte logical size, hashes the original uint16 storage
+bits, and widens only optional inline JSON values to float32. The production
+policy result is not cast or mutated. A focused regression covers stable BF16
+encoding, byte accounting, and non-finite rejection. This run remains failed
+preliminary evidence and does not satisfy the generation-proof assertions.
+
+Generation-proof rerun `generation-proof-20260728T033439Z` progressed through
+both real policy calls and proved the BF16 evidence fix. Rank 1 entered
+`env_interact_step()` at `03:44:30.163 UTC`; rank 0 accepted its paired drain
+request and entered `env_interact_step()` at `03:44:30.742 UTC`. Neither rank
+then emitted `chunk_committed` before the operator interrupted the run about
+322 seconds later. There was no CUDA, NCCL, Ray object-store, OOM, or worker
+exception; `pair_failure.json` records the operator `KeyboardInterrupt`. This
+localizes the stall to the common synchronous Wan `chunk_step()` path, but the
+old chunk-level hooks cannot distinguish model onload, diffusion/VAE work, and
+reward inference.
+
+The generation-proof recording environment now installs acceptance-only,
+per-chunk diagnostic wrappers around those three production operations. It
+emits `world_model_onload_{started,completed,failed}`,
+`world_model_diffusion_{started,completed,failed}`, and
+`world_model_reward_{started,completed,failed}`. A started marker is committed
+to the central event log before entering the operation; completed and failed
+markers include elapsed seconds, and failed markers also preserve exception
+type and text. The wrappers delegate to the original bound methods, preserve
+the exact return value, and restore the original environment surface in a
+`finally` block. Therefore a killed rerun identifies the active Wan phase
+without replacing or weakening production computation.
+
+Generation-proof rerun `generation-proof-20260728T065253Z` advanced both Wan
+environment ranks through the reward-call return marker but emitted no
+`chunk_committed` marker. System-wide GPU utilization from an unrelated
+operator workload is not acceptance evidence and must not be used to infer the
+blocked project phase. The remaining boundary is post-reward processing inside
+`WanEnv.chunk_step()` or immediate `EnvOutput` assembly.
+
+The acceptance harness therefore supports switchable fine-grained phase
+diagnostics. `--phase-diagnostics` is enabled by default for the current debug
+runs; `--no-phase-diagnostics` disables every detailed world-model marker while
+retaining the required acceptance events such as `chunk_started` and
+`chunk_committed`. Worker instances default to detailed diagnostics disabled
+and must be explicitly configured by the harness. When enabled, a temporary
+Wan observer records reward return, reward-difference calculation, success
+estimation, the natural truncation and done synchronization checks, optional
+automatic reset, metric construction, render tensor conversion, chunk return,
+and completed `EnvOutput` assembly. The observer is removed in a `finally`
+block after each chunk. The checks record only compact booleans such as
+`has_truncations` and `has_past_dones`; they do not serialize intermediate
+model tensors or insert a synchronization ahead of the corresponding
+production check.
+
+Rerun `generation-proof-postreward-debug-1` reached
+`world_model_chunk_step_returning` and `env_output_constructed` on both A
+environment ranks. Both ranks reported `has_truncations: false` and
+`has_past_dones: false`, and both completed metrics and render conversion. The
+next acceptance hook attempted to attach the complete live `EnvOutput` tuple to
+`chunk_committed`. Manifest normalization expands dataclasses with
+`dataclasses.asdict()`, which recursively deep-copies their fields before the
+CPU-tensor validator runs. The result contains nested accelerator tensors, so
+observability introduced an unsafe copy/synchronization on the commit path.
+`chunk_committed` is now a bounded identity/order marker containing stage,
+transition, lifecycle, policy, rank, bundle, sequence, and timestamp context,
+but no live result payload. Detailed numerical evidence remains the
+responsibility of later CPU-sealed snapshots and batches. This changes only
+acceptance evidence encoding; the production result returned to the rollout
+path is unchanged.
+
+Rerun `generation-proof-postreward-debug-2` proved that both environment ranks
+now reach `chunk_committed`, but exposed a production drain-barrier routing bug.
+The live coordinator observation showed A environment rank 0 in
+`FAILED_RESIDENT` with `ValueError: split sizes must sum to the request logical
+batch size`, its rollout peer still in `DRAIN_REQUESTED`, and A rank 1 naturally
+`COMPLETED`. With four global environments and two one-to-one environment and
+rollout ranks, the route planner assigns a local shard of two environments to
+rank 0. Observation envelopes already describe that local shard. The drain
+barrier incorrectly described the global training batch of four, so its
+`[2]` route split could not satisfy a logical size of four and the barrier never
+reached rollout rank 0.
+
+Drain barriers now use the local per-rank, per-stage environment count for
+their envelope logical batch size while retaining the global batch size as the
+input to route planning. Regression coverage composes the real two-source,
+two-destination route calculation with a four-environment global batch and
+requires a single local barrier shard of size two. Split validation failures
+report the request kind, calculated split sizes and sum, and declared logical
+batch size.
+
+Paired coordinator waits now retain legal asynchronous completion skew but
+return on the first genuine task exception. Normal completion of only one peer
+still waits for the other; an exception is surfaced immediately because the
+other peer may be blocked on a message that the failed peer was responsible for
+sending. This prevents a worker exception from appearing as a hang until the
+900-second operation timeout. The coordinator remains fail-closed and preserves
+resident allocation state on error.
+
+When `--phase-diagnostics` is enabled, the acceptance environment also emits
+`barrier_send_started`, `barrier_send_completed`, or `barrier_send_failed` with
+compact exception type and text, followed by the required `drain_observed` only
+after a successful send. These additional markers are disabled by
+`--no-phase-diagnostics`; the production barrier protocol and required
+acceptance events are unchanged.
+
+The first rerun with these markers reached both real Wan `chunk_committed`
+events, then failed before entering the production barrier send because the
+strict acceptance vocabulary had not yet registered `barrier_send_started`.
+All three barrier phase events are now members of the known-event and
+transition-event contracts, so the sink both accepts them and requires their
+rank, lifecycle, policy, and transition identity. Schema-level regressions pass
+each marker through `AcceptanceEvent.validate()` and `AcceptanceEventSink`;
+worker-only list-observer coverage is not considered sufficient for new event
+types.
+
+The first generation-proof implementation should stop after one bounded
+collection and one actor update per pipeline if that is the smallest reliable
+production path. It must not claim Task 8 acceptance until a follow-up scope
+runs two linked GRPO iterations and proves that policy version `N+1` produced
+by the first update is synchronized into the next collection.
+
+Hard assertions for this scope:
+
+- A and B readiness schemas remain identical to `model-init-only` plus
+  acceptance-control actor identity and event-log path.
+- A and B share the same detached control plane and scheduler actor IDs.
+- A and B pipeline IDs, namespaces, worker groups, channel names, and output
+  directories are distinct.
+- A rank 0 acknowledged `bootstrap_dispatched` precedes B generation demand.
+- A later `policy_request_completed` and `chunk_committed` prove that the
+  scheduling milestone progressed through real policy and environment work.
+- A rank 0 `drain_requested` occurs before A rank 0 `chunk_committed`.
+- A rank 0 `chunk_committed` occurs exactly once for the selected transition.
+- A rank 1 emits useful progress after A rank 0 is selected for drain.
+- A snapshot and rollout/environment offload receipts precede the scheduler
+  `release_committed` for `(0, 2)`.
+- B `allocation_committed` for `(0, 2)` follows A release and precedes B useful
+  work.
+- A and B never overlap active scheduler ownership or reported physical
+  residency on any GPU in `(0, 2)`.
+- B release precedes A reallocation/resume.
+- A emits exactly one retained-transition resume dispatch.
+- Both batches are sealed before training starts.
+- No fixed `actor_train` stage starts while any generation bundle using GPU 0
+  is active or resident.
+- Final residency for every actor, rollout, and environment rank is
+  `safe_to_release`.
+
+Failure handling is also part of the design. If a driver exits, a worker
+observer rejects an event, a timeout fires, or a callback fails, the
+acceptance-control actor publishes the failure to every waiter. The
+orchestrator must then preserve partial logs and write `pair_failure.json`
+without attempting to convert the run into a weaker single-driver or fake-model
+case.
 
 ## 8. Evidence schema and acceptance observability
 
@@ -1131,7 +1585,7 @@ remain authoritative.
 
 ### 12.1 Disaggregated Wan recovery — required
 
-Run the six-GPU topology with two width-two bundles and the real OpenVLA-OFT
+Run the four-GPU topology with two width-two bundles and the real OpenVLA-OFT
 and Wan checkpoints. This is the primary safe reuse proof because rollout and
 environment residency must both clear different physical GPUs before transfer.
 
@@ -1456,7 +1910,8 @@ Ray/worker instrumentation. Do not place test-only event orchestration in
 
 `tests/e2e_tests/embodied/task8_wan_disaggregated.yaml`
 
-- two-rank six-GPU recommended mapping and bounded workloads.
+- two-rank four-GPU mapping with stage-isolated fixed actor overlap and bounded
+  workloads.
 
 `tests/e2e_tests/embodied/task8_wan_collocated.yaml`
 
@@ -1552,23 +2007,37 @@ disabled/no-observer behavior is unchanged.
    driver; fix production only if config-level isolation is insufficient.
 7. Build transparent acceptance worker subclasses and prove fake-worker output
    equivalence.
-8. Add the run-owned event sink, barriers, trace preparation, and NVML sampler.
-9. Refactor the T7 real smoke construction into reusable test helpers only
+8. Add the run-owned event sink and shared acceptance-control barriers.
+9. Prove the two-driver control-only and model-initialization-only scopes on
+   the four-GPU Wan host, retaining `task8_accepted: false`.
+10. Wire the recording worker subclasses into a `generation-proof-only` driver
+   scope and configure every worker with a shared actor observer proxy.
+11. Add event-gated policy-sync and collection gates so B's generation demand
+   is released only after A rank 0 completes an acknowledged production
+   bootstrap dispatch; retain later policy/chunk events as generation proof.
+12. Prove one real disaggregated Wan A-to-B-to-A generation transfer with
+   complete offload, useful B work, A resume dispatch, sealed batches, and
+   final residency.
+13. Add trace preparation and NVML sampler correlation to that generation run.
+14. Refactor the T7 real smoke construction into reusable test helpers only
    where this avoids copying production configuration logic; keep the T7
    command working unchanged.
-10. Implement uninterrupted reference capture and analyzer validation for Wan.
-11. Implement the disaggregated two-driver Wan forced preemption run.
-12. Prove exact A-to-B-to-A transfer, reference equivalence, complete batches,
+15. Implement uninterrupted reference capture and analyzer validation for Wan.
+16. Extend the generation-proof run into the full disaggregated Wan forced
+    preemption acceptance run.
+17. Prove exact A-to-B-to-A transfer, reference equivalence, complete batches,
     and final residency before adding performance claims.
-13. Add static/dynamic utilization repetitions and enforce thresholds.
-14. Add collocated Wan recovery and report swap overhead separately.
-15. Add OpenSora config/preflight and run disaggregated recovery/reference.
-16. Run OpenSora utilization repetitions and collocated recovery where the
+18. Add two linked GRPO iterations per pipeline and prove the produced policy
+    version is collected by the next iteration.
+19. Add static/dynamic utilization repetitions and enforce thresholds.
+20. Add collocated Wan recovery and report swap overhead separately.
+21. Add OpenSora config/preflight and run disaggregated recovery/reference.
+22. Run OpenSora utilization repetitions and collocated recovery where the
     hardware envelope supports it.
-17. Run the full T1-T8/core/style suite and all shell/config preflight checks.
-18. Generate reports solely from raw artifacts and inspect every failed or
+23. Run the full T1-T8/core/style suite and all shell/config preflight checks.
+24. Generate reports solely from raw artifacts and inspect every failed or
     invalid repetition.
-19. Update canonical design/status documents only after the required Wan and
+25. Update canonical design/status documents only after the required Wan and
     OpenSora rows pass.
 
 Keep commits/reviews aligned with schema/analyzer, CPU composition, process
@@ -1707,6 +2176,258 @@ bash tests/e2e_tests/embodied/run_task8_two_pipeline_acceptance.sh \
 Run the collocated config separately when its preflighted memory envelope is
 supported. Record exact commands, output directories, hardware, repetitions,
 and results in the canonical completion update.
+
+### 19.7 Mid-rollout continuation hardening result (2026-07-28)
+
+The disaggregated Wan generation-proof run
+`generation-proof-barrier-contract-fix-1` progressed through real chunk commit,
+barrier consumption, drain observation, and snapshot construction. Pause
+offload then failed validation because `last_observations` and
+`last_intervened_info` were empty. This was downstream of the earlier barrier
+and acceptance-instrumentation failures and occurred before release, ownership
+transfer, onload, or actual resume.
+
+The root cause was a resume-schema dependency on end-of-rollout caches:
+`auto_reset=False` leaves those caches empty until rollout finalization, while
+Task 8 pauses after a committed chunk. Worker resume schema version 3 now uses
+the committed `current_env_outputs` and retained `resume_bootstraps` pair as
+the canonical stage continuation. It normalizes observation/intervention
+fields from the committed output, validates the complete snapshot before
+reporting `snapshot_completed`, and repeats validation during offload and
+restore. A divergent retained bootstrap fails closed. This behavior is
+reset-mode independent and is covered by focused empty-cache, stale-cache,
+divergence, ownership, and restore tests.
+
+The next rerun reached this new construction-time validation and exposed a
+second pre-existing assumption: the validator required one continuous
+`EmbodiedRolloutResult.actions` entry per committed chunk. Real OpenVLA-OFT
+instead retains its training target as `forward_inputs["action_tokens"]`; the
+decoded `[environment, chunk, action]` tensor was valid and had already driven
+the committed Wan chunk. Validation now accepts either a complete continuous
+action sequence or complete model forward inputs, requires elastic transition
+identity coverage, rejects partial/missing representations, and emits all
+counts and forward-input keys on failure. The run still stopped before
+`snapshot_completed`, offload, transfer, onload, or resume, so it is diagnostic
+progress rather than Task 8 acceptance evidence.
+
+The following `generation-proof-action-alignment-1` rerun accepted the real
+OpenVLA-OFT token-action representation and advanced to reward alignment. It
+showed the expected first-chunk safe-point ledger: one policy input, log-prob,
+value, version, transition identity, and done boundary; zero materialized
+rewards; and one reward retained in the pending `EnvOutput`. The validator had
+incorrectly required that retained reward to be materialized already. The
+phase-aware contract now requires `committed_chunks - 1` trajectory rewards,
+one pending-bootstrap reward, and result-boundary counts that include prior
+epoch finalization. Missing and duplicate pending rewards fail closed, snapshot
+does not mutate the ledger, and pause/restore tests prove one-time later
+materialization. This run also stopped before `snapshot_completed` and remains
+diagnostic rather than acceptance evidence.
+
+### 19.8 Aggregate batch-seal evidence contract (2026-07-29)
+
+The `generation-proof-reward-ledger-1` rerun advanced beyond the earlier
+continuation failures: A snapshotted and offloaded, B performed real generation
+after ownership transfer, A restored and performed post-resume Wan work, and
+the active rollout ranks completed. Production actor batch sealing then
+validated its CPU batch, but the acceptance producer rejected the following
+evidence event. It had recursively selected one rank-1 environment transition
+from the aggregate batch details and attached it to actor producer rank 0.
+Those ranks are different coordinate spaces: the actor rank identifies the
+batch consumer, while every transition identity identifies its contributing
+environment rank. A singleton actor is expected to consume transitions from
+both environment ranks 0 and 1.
+
+The acceptance contract therefore treats `batch_sealed` as aggregate evidence,
+as its existing exclusion from the rank-local and transition-local event sets
+already specified. It forbids a singular top-level `transition_identity`,
+retains the complete transition list in the sealed details, and validates that
+list independently for uniqueness, lifecycle, policy version, transition
+count, and exact coverage of the receipt's `contributing_dp_ranks`. Rank-local
+events retain the existing producer-rank/transition-rank equality check. Tests
+exercise both transition arrival orders so acceptance cannot depend on which
+environment trajectory reaches the actor first, and malformed contributor
+coverage continues to fail closed. The rerun is generation/resume evidence but
+is not full generation-proof acceptance because GRPO training did not start.
+
+### 19.9 Completion-aware selected-rank release (2026-07-29)
+
+The `generation-proof-aggregate-seal-fix-1` rerun passed real snapshot,
+offload, ownership transfer, restore, and post-resume Wan generation. Pipeline
+A's resumed rank 0 then completed its final assigned trajectory. The runtime's
+rank observation still described the completed worker as callback-active, so
+it published `completed=4`, `active_dp_ranks=[0]`, and
+`completed_dp_ranks=[0, 1]`. The central scheduler reacted to zero remaining A
+demand and independently released A's last rank for the still-incomplete B
+pipeline. The runtime then submitted its exact-rank release from the earlier
+observation; scheduler ownership was already empty, and the strict API raised
+`No requested ranks are active`. This occurred immediately after A's final
+`rank_completed` event and before reward aggregation, `batch_sealed`,
+advantage calculation, or training. Later actor-death and expansion errors
+were teardown consequences.
+
+Selected-rank release is now an atomic completion-aware compare-and-release
+operation under the scheduler lock. Every requested rank must belong to the
+canonical registered mapping. Active ranks retain ownership validation and go
+through the existing verified shrink callback before commit. Already-inactive
+ranks are accepted only when the current progress snapshot includes them in
+`completed_dp_ranks`; mixed requests shrink only the active subset. The same
+partition is recomputed during planning so a background shrink committed in
+the API-to-plan lock gap is also safe. Unknown ranks and inactive ranks without
+current completion evidence still fail closed. Repeated completed release is
+therefore idempotent without catching exception strings or weakening physical
+ownership validation. New collection progress replaces the old snapshot and
+sealing clears it, bounding the evidence to the current collection lifecycle.
+
+### 19.10 Single-pipeline Wan control experiment (2026-07-29)
+
+`tests/e2e_tests/embodied/task8_single_pipeline_diagnostic.py` is the control
+experiment for separating generation/reward behavior from cross-pipeline
+preemption behavior. It composes the same production
+`wan_libero_spatial_grpo_openvlaoft_rlix` base and the same Task 8 overrides as
+the two-driver run. The resulting pipeline has actor rank 0 on GPU 0, rollout
+ranks on GPUs 0 and 1, environment ranks on GPUs 2 and 3, and canonical
+actor-infer bundles `rank 0 -> (0, 2)` and `rank 1 -> (1, 3)`. It uses sixteen
+training environments, GRPO group size 8, rollout epoch 1, 256 environment
+steps per trajectory, five Wan diffusion steps per chunk, production reward
+filter bounds, and ten configured training iterations. Each DP rank owns eight
+environments and therefore contributes one complete GRPO group per collection;
+the sealed actor batch contains two groups and sixteen trajectories.
+
+Only one RLix pipeline is registered. There is no acceptance control actor,
+second driver, generation gate, or competing scheduler demand, so no
+cross-pipeline shrink, transfer, restore, or resume is expected. RLix remains
+enabled deliberately: initialization, fixed stages, elastic collection, batch
+sealing, and completed-rank release still use the same production paths as the
+two-pipeline test. This makes the run a controlled comparison rather than a
+legacy-runner or non-Ray smoke test. It is diagnostic evidence and cannot
+satisfy Task 8's two-pipeline acceptance requirements.
+
+The run refuses to reuse a non-empty output directory and writes a fully
+resolved config before model launch. Training video capture is enabled at
+`<run>/trajectories/videos/seed_*/<n>.mp4`; the normal environment
+`finish_rollout()` path synchronously finalizes each MP4. For Wan, the current
+chunk API exposes one returned observation per eight-action chunk, so these
+videos are suitable for visual trajectory review but do not contain every
+intermediate diffusion frame.
+
+At each actor batch seal, before advantage calculation or training, the
+diagnostic actor atomically writes
+`<run>/trajectories/iteration_<policy>/sealed_batch.pt` and
+`reward_summary.json`. The tensor artifact retains the complete CPU-owned
+batch for offline inspection. The summary records reward shape/range/nonzero
+count, per-trajectory sums, GRPO group sums and means, configured filter
+bounds, accepted groups, post-filter active trajectories, terminal/truncation
+counts, policy versions, and the elastic batch receipt. Therefore the first
+generated batch remains available if a later production stage fails. Filtering
+remains enabled but admits the complete binary group-mean range `[0.0, 5.0]`,
+so a uniform group yields a finite zero-advantage update rather than an empty
+mask. The harness records a nonzero exit in `result.json` plus `failure.txt`
+when production execution fails.
+
+The intended clean control run is:
+
+```bash
+cd /root/_VLAMP
+/root/.venv/bin/ray stop --force
+rm -rf /tmp/task8-single-pipeline/single-realistic-wan-16x8-1
+rm -f /tmp/task8-single-pipeline/single-realistic-wan-16x8-1.console.log
+mkdir -p /tmp/task8-single-pipeline
+
+RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
+/root/.venv/bin/ray start \
+  --head --port=6379 --num-gpus=4 \
+  --include-dashboard=true --dashboard-host=0.0.0.0 --disable-usage-stats
+
+set -o pipefail
+PYTHONPATH=/root/_VLAMP/rlix-core/src:/root/_VLAMP/RLinf:/root/_VLAMP/RLinf/tests/e2e_tests/embodied \
+RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
+/root/.venv/bin/python \
+  /root/_VLAMP/RLinf/tests/e2e_tests/embodied/task8_single_pipeline_diagnostic.py \
+    --address 127.0.0.1:6379 \
+    --run-id single-realistic-wan-16x8-1 \
+    --output-dir /tmp/task8-single-pipeline \
+    --config /root/_VLAMP/RLinf/tests/e2e_tests/embodied/task8_wan_disaggregated.yaml \
+    --bundles '0,2;1,3' \
+  2>&1 | tee /tmp/task8-single-pipeline/single-realistic-wan-16x8-1.console.log
+```
+
+`tee` leaves all driver and worker-forwarded output visible in the terminal
+while retaining the same stream in the adjacent `.console.log`. Structured
+runner metrics remain under `<run>/logs/metrics.log`, and training videos remain
+enabled under `<run>/trajectories/videos/seed_*/<n>.mp4`.
+
+### 19.11 Zero-success-compatible two-pipeline proof and live artifacts (2026-07-29)
+
+The two-driver generation proof now composes the same Wan workload used by the
+single-pipeline control: 16 total environments, two environment DP ranks,
+eight environments and one group per rank, GRPO group size 8, rollout epoch 1,
+256 primitive steps per trajectory, five Wan diffusion steps, and ten linked
+training iterations per driver. The first iteration remains explicitly gated
+to prove the required transfer and resume. After both first actor updates,
+iterations 2 through 10 synchronize the preceding policy and run through normal
+shared scheduler arbitration.
+
+Acceptance producers derive policy version from each current cursor or batch
+receipt instead of freezing worker context at policy 0. Aggregate terminal-event
+uniqueness includes policy version, so `batch_sealed` and `training_completed`
+may occur once for each of policies 0 through 9 while duplicates within one
+policy still fail closed. The result requires both configured and completed
+iteration counts to equal 10.
+
+Reward filtering remains enabled, but its inclusive group-mean interval is
+`[0.0, 5.0]`. These are the complete possible terminal-masked group means for
+the current binary reward model with reward coefficient 5. An all-failure
+group is therefore retained with zero rewards and finite zero advantages; an
+all-success group is retained with uniform rewards and the same zero relative
+advantages. Mixed groups remain the only groups capable of producing a useful
+GRPO gradient. The generation proof accepts zero-success iterations as valid
+lifecycle and execution evidence, not as learning-quality evidence. Batch
+cardinality, rank contribution, policy version, transition identity, finite
+reward/advantage values, and actor-update completion remain fail-closed.
+
+Each driver enables the production `RecordVideo` wrapper at
+`<run>/drivers/<role>/trajectories/videos/seed_*/<n>.mp4`. Videos are flushed
+synchronously at rollout completion. They are tiled per environment worker and
+retain the Wan limitation that only the observation returned for each
+eight-frame chunk is recorded. The driver result includes its trajectory root.
+
+The orchestrator's `--stream-driver-logs` option is enabled by default. It
+mirrors both child stdout/stderr streams to the parent terminal with driver and
+stream prefixes while preserving the unmodified streams in
+`drivers/<role>/stdout.log` and `stderr.log`. `--no-stream-driver-logs` disables
+only terminal mirroring and does not disable artifact logs.
+
+The intended clean two-pipeline rerun is:
+
+```bash
+cd /root/_VLAMP
+/root/.venv/bin/ray stop --force
+rm -rf /tmp/task8-generation-proof/generation-proof-zero-reward-videos-1
+rm -f /tmp/task8-generation-proof/generation-proof-zero-reward-videos-1.console.log
+mkdir -p /tmp/task8-generation-proof
+
+RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
+/root/.venv/bin/ray start \
+  --head --port=6379 --num-gpus=4 \
+  --include-dashboard=true --dashboard-host=0.0.0.0 --disable-usage-stats
+
+set -o pipefail
+PYTHONPATH=/root/_VLAMP/rlix-core/src:/root/_VLAMP/RLinf:/root/_VLAMP/RLinf/tests/e2e_tests/embodied \
+RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
+/root/.venv/bin/python \
+  /root/_VLAMP/RLinf/tests/e2e_tests/embodied/task8_two_pipeline_acceptance.py \
+    --scope generation-proof-only \
+    --address 127.0.0.1:6379 \
+    --run-id generation-proof-zero-reward-videos-1 \
+    --output-dir /tmp/task8-generation-proof \
+    --mode disaggregated \
+    --bundles '0,2;1,3' \
+    --config /root/_VLAMP/RLinf/tests/e2e_tests/embodied/task8_wan_disaggregated.yaml \
+    --phase-diagnostics \
+    --stream-driver-logs \
+    --timeout-s 21600 \
+  2>&1 | tee /tmp/task8-generation-proof/generation-proof-zero-reward-videos-1.console.log
+```
 
 ## 20. Definition of done
 

@@ -1,0 +1,36 @@
+# Four-GPU Task 8 OpenSora matrix. Execution is conditional on the checkpoint
+# fitting the supported host; preflight never counts that condition as passed.
+acceptance:
+  environment: opensora
+  mode: collocated
+  expected_bundles: [[0], [1]]
+  repetitions: 5
+  warmup_repetitions: 1
+  minimum_throughput_improvement: 0.05
+  minimum_idle_reduction: 0.05
+  sample_interval_ms: 100
+
+models:
+  vla:
+    checkpoint: ${oc.env:RLINF_VLA_CHECKPOINT,/workspace/VLA/Openvla-oft-SFT-libero-spatial-traj1}
+    precision: bf16
+    unnorm_key: libero_spatial_no_noops
+  world_model:
+    checkpoint: ${oc.env:RLINF_OPENSORA_CHECKPOINT,/workspace/WM/RLinf-OpenSora-LIBERO-Spatial}
+
+smoke:
+  base_config: opensora_libero_spatial_grpo_openvlaoft
+  actor_gpus: [2, 3]
+  rollout_gpu: [0, 1]
+  env_gpu: [0, 1]
+  operation_timeout_s: 900.0
+  output_dir: ${oc.env:RLINF_TASK8_OUTPUT,/tmp/rlinf_task8_opensora_collocated}
+  total_num_envs: 4
+  adv_type: grpo
+  group_size: 2
+  rollout_epoch: 1
+  max_episode_steps: 8
+  max_steps_per_rollout_epoch: 8
+  max_train_steps: 2
+  run_evaluation: false
+  save_checkpoint: false

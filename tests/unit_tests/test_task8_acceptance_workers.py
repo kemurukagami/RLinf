@@ -81,6 +81,16 @@ class _RecordingFakeEnv(RecordingEnvWorkerMixin, _FakeEnvWorker):
     pass
 
 
+class _FailingBarrierEnvWorker(_FakeEnvWorker):
+    async def _send_elastic_barrier(self, rollout_channel, token):
+        self.calls.append(("barrier", rollout_channel, token))
+        raise ValueError("injected barrier routing failure")
+
+
+class _RecordingFailingBarrierEnv(RecordingEnvWorkerMixin, _FailingBarrierEnvWorker):
+    pass
+
+
 class _FakeRolloutWorker:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
@@ -152,6 +162,7 @@ class _FakeRunner:
         self.calls: list[tuple] = []
         self.global_step = 3
         self.cfg = SimpleNamespace(algorithm=SimpleNamespace(adv_type="grpo"))
+        self.rlix_runtime = None
 
     def update_rollout_weights(self):
         self.calls.append(("sync", self.global_step))
@@ -203,7 +214,7 @@ def test_recording_env_worker_preserves_outputs_calls_and_rng() -> None:
     _assert_nested_equal(plain.calls, recorded.calls)
     assert torch.equal(expected_next_rng, actual_next_rng)
     assert [event.event for event in events] == ["chunk_started", "chunk_committed"]
-    assert events[-1].details["result"]["obs"]["kind"] == "tensor"
+    assert events[-1].details == {"stage_id": 2}
 
     _assert_nested_equal(
         recorded.snapshot_rollout_stage(), plain.snapshot_rollout_stage()
@@ -230,9 +241,10 @@ def test_recording_env_worker_preserves_outputs_calls_and_rng() -> None:
     asyncio.run(recorded.request_elastic_drain("request"))
     asyncio.run(recorded._send_elastic_barrier("channel", "token"))
     asyncio.run(recorded._send_elastic_observation("channel", {"transition_id": "t1"}))
-    assert [event.event for event in events[-3:]] == [
+    assert [event.event for event in events[-4:]] == [
         "drain_requested",
         "drain_observed",
+        "bootstrap_dispatched",
         "resumed_bootstrap_dispatched",
     ]
 
@@ -270,6 +282,36 @@ def test_recording_rollout_worker_preserves_outputs_and_call_order() -> None:
         "drain_requested",
         "barrier_consumed",
     ]
+
+
+def test_barrier_phase_diagnostics_record_success_and_failure() -> None:
+    successful = _RecordingFakeEnv()
+    success_events = []
+    successful.configure_acceptance_observer(success_events.append)
+    successful.configure_task8_phase_diagnostics(True)
+
+    asyncio.run(successful._send_elastic_barrier("channel", "token"))
+
+    assert [event.event for event in success_events] == [
+        "barrier_send_started",
+        "barrier_send_completed",
+        "drain_observed",
+    ]
+
+    failing = _RecordingFailingBarrierEnv()
+    failure_events = []
+    failing.configure_acceptance_observer(failure_events.append)
+    failing.configure_task8_phase_diagnostics(True)
+
+    with pytest.raises(ValueError, match="injected barrier routing failure"):
+        asyncio.run(failing._send_elastic_barrier("channel", "token"))
+
+    assert [event.event for event in failure_events] == [
+        "barrier_send_started",
+        "barrier_send_failed",
+    ]
+    assert failure_events[-1].details["error_type"] == "ValueError"
+    assert failure_events[-1].details["error"] == "injected barrier routing failure"
 
 
 def test_observer_failure_propagates_before_worker_call() -> None:

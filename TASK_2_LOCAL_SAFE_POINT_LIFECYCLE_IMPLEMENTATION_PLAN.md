@@ -616,6 +616,13 @@ Because an elastic T1 snapshot now includes a channel-visible identity, bump
 environment schema does not change. T2 does not silently load version-1 worker
 snapshots into an elastic lifecycle.
 
+Subsequent Task 8 hardening bumps the worker schema from 2 to 3. Version 3
+normalizes observation and intervention continuation fields from the committed
+`current_env_outputs`/`resume_bootstraps` pair and validates that pair before a
+snapshot can be reported or offloaded. This removes the reset-mode-dependent
+assumption that end-of-rollout caches are populated at a mid-rollout safe
+point. The world-environment schema remains unchanged.
+
 ### 7.2 `RolloutResult`
 
 Add the same optional field:

@@ -15,7 +15,8 @@
 import asyncio
 import gc
 from collections import defaultdict
-from dataclasses import dataclass, fields
+from collections.abc import Mapping
+from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 from typing import Any
 
@@ -79,7 +80,7 @@ from rlinf.workers.elastic_rollout_lifecycle import (
 )
 from rlinf.workers.env.history_manager import HistoryManager
 
-ENV_ROLLOUT_RESUME_SCHEMA_VERSION = 2
+ENV_ROLLOUT_RESUME_SCHEMA_VERSION = 3
 
 
 class RolloutCursorPhase(str, Enum):
@@ -1322,7 +1323,10 @@ class EnvWorker(Worker):
             ElasticRolloutRequest(
                 kind=ElasticRolloutRequestKind.DRAIN_BARRIER,
                 transition_id=token.next_transition_id,
-                logical_batch_size=self.train_batch_size,
+                # ``send_to`` receives the global batch size so its route plan
+                # can map every source rank, but this envelope represents only
+                # the shard owned by the current rank and stage.
+                logical_batch_size=self.train_num_envs_per_stage,
                 env_output=None,
                 drain_request_id=token.request_id,
             ),
@@ -1500,6 +1504,169 @@ class EnvWorker(Worker):
         if len(self._resume_bootstraps) != 1 or self._resume_bootstraps[0] is None:
             raise RuntimeError("snapshot requires one unsent bootstrap")
 
+    @classmethod
+    def _continuation_values_equal(cls, left: Any, right: Any) -> bool:
+        """Compare nested continuation values without ambiguous tensor truthiness."""
+
+        if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+            return (
+                isinstance(left, torch.Tensor)
+                and isinstance(right, torch.Tensor)
+                and left.dtype == right.dtype
+                and tuple(left.shape) == tuple(right.shape)
+                and torch.equal(left, right)
+            )
+        if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+            if (
+                not isinstance(left, np.ndarray)
+                or not isinstance(right, np.ndarray)
+                or left.dtype != right.dtype
+                or left.shape != right.shape
+            ):
+                return False
+            if np.issubdtype(left.dtype, np.inexact):
+                return np.array_equal(left, right, equal_nan=True)
+            return np.array_equal(left, right)
+        if is_dataclass(left) or is_dataclass(right):
+            return (
+                type(left) is type(right)
+                and is_dataclass(left)
+                and all(
+                    cls._continuation_values_equal(
+                        getattr(left, field.name), getattr(right, field.name)
+                    )
+                    for field in fields(left)
+                )
+            )
+        if isinstance(left, Mapping) or isinstance(right, Mapping):
+            return (
+                isinstance(left, Mapping)
+                and isinstance(right, Mapping)
+                and left.keys() == right.keys()
+                and all(
+                    cls._continuation_values_equal(left[key], right[key])
+                    for key in left
+                )
+            )
+        if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+            return (
+                type(left) is type(right)
+                and len(left) == len(right)
+                and all(
+                    cls._continuation_values_equal(left_item, right_item)
+                    for left_item, right_item in zip(left, right, strict=True)
+                )
+            )
+        return type(left) is type(right) and left == right
+
+    @classmethod
+    def _validate_stage_continuation(
+        cls,
+        current_output: EnvOutput,
+        resume_bootstrap: EnvOutput,
+        last_observation: Any,
+        last_intervened_info: Any,
+    ) -> None:
+        """Validate one atomic committed-boundary continuation record."""
+
+        if not cls._continuation_values_equal(current_output, resume_bootstrap):
+            raise ValueError(
+                "pending bootstrap does not match the committed environment output"
+            )
+        if not cls._continuation_values_equal(last_observation, current_output.obs):
+            raise ValueError(
+                "snapshot last observation does not match the committed environment output"
+            )
+        expected_intervened_info = (
+            current_output.intervene_actions,
+            current_output.intervene_flags,
+        )
+        if not cls._continuation_values_equal(
+            last_intervened_info, expected_intervened_info
+        ):
+            raise ValueError(
+                "snapshot intervention state does not match the committed environment output"
+            )
+
+    @staticmethod
+    def _validate_partial_rollout_alignment(
+        rollout_result: EmbodiedRolloutResult,
+        pending_output: EnvOutput,
+        cursor: EnvRolloutCursor,
+        *,
+        require_transition_ids: bool,
+    ) -> None:
+        """Validate committed chunks without assuming one action representation."""
+
+        committed_chunks = cursor.chunk_index
+        counts = {
+            name: len(getattr(rollout_result, name))
+            for name in (
+                "actions",
+                "intervene_flags",
+                "rewards",
+                "terminations",
+                "truncations",
+                "dones",
+                "prev_logprobs",
+                "prev_values",
+                "versions",
+                "transition_ids",
+                "forward_inputs",
+            )
+        }
+        forward_input_keys = sorted(
+            {
+                key
+                for inputs in rollout_result.forward_inputs
+                if isinstance(inputs, Mapping)
+                for key in inputs
+            }
+        )
+
+        def fail(reason: str) -> None:
+            rendered_counts = " ".join(
+                f"{name}={count}" for name, count in counts.items()
+            )
+            raise ValueError(
+                "partial rollout alignment failed: "
+                f"{reason}; committed_chunks={committed_chunks} "
+                f"epoch_index={cursor.epoch_index} {rendered_counts} "
+                f"pending_reward_present={pending_output.rewards is not None} "
+                f"forward_input_keys={forward_input_keys}"
+            )
+
+        result_boundaries = committed_chunks + cursor.epoch_index
+        materialized_rewards = committed_chunks - 1
+        if counts["rewards"] != materialized_rewards:
+            fail("rewards must exclude exactly the retained pending-bootstrap reward")
+        if pending_output.rewards is None:
+            fail("retained pending bootstrap must contain the deferred reward")
+        for name in ("terminations", "truncations", "dones"):
+            if counts[name] != result_boundaries:
+                fail(f"{name} must contain every materialized result boundary")
+        for name in ("actions", "prev_logprobs", "versions", "forward_inputs"):
+            if counts[name] not in (0, committed_chunks):
+                fail(f"{name} must be absent or contain every committed chunk")
+        if counts["prev_values"] not in (0, result_boundaries):
+            fail("prev_values must be absent or contain every result boundary")
+        if counts["intervene_flags"] != counts["actions"]:
+            fail("intervene_flags must align with continuous actions")
+        if counts["actions"] != committed_chunks and (
+            counts["forward_inputs"] != committed_chunks
+        ):
+            fail("no complete continuous or model-input action representation")
+        if any(
+            not isinstance(inputs, Mapping) or not inputs
+            for inputs in rollout_result.forward_inputs
+        ):
+            fail("forward_inputs entries must be non-empty mappings")
+        expected_transition_counts = (
+            (result_boundaries,) if require_transition_ids else (0, result_boundaries)
+        )
+        if counts["transition_ids"] not in expected_transition_counts:
+            fail("transition_ids do not cover the materialized result boundaries")
+
     def _world_snapshot_context(
         self, cursor: EnvRolloutCursor, world_state: WorldEnvResumeState | None = None
     ) -> WorldEnvSnapshotContext:
@@ -1531,6 +1698,14 @@ class EnvWorker(Worker):
         cursor = self._clone_cursor(self._rollout_cursor)
         snapshot_world = get_env_attr(self.env_list[0], "snapshot_resume_state")
         world_state = snapshot_world(self._world_snapshot_context(cursor))
+        current_env_outputs = tuple(
+            self._clone_env_output(output) for output in self._current_env_outputs
+        )
+        resume_bootstraps = tuple(
+            self._clone_env_output(output) if output is not None else None
+            for output in self._resume_bootstraps
+        )
+        current_output = current_env_outputs[0]
         state = EnvRolloutResumeState(
             schema_version=ENV_ROLLOUT_RESUME_SCHEMA_VERSION,
             worker_rank=self._rank,
@@ -1541,16 +1716,19 @@ class EnvWorker(Worker):
             rollout_results=tuple(
                 self._clone_rollout_result(result) for result in self.rollout_results
             ),
-            current_env_outputs=tuple(
-                self._clone_env_output(output) for output in self._current_env_outputs
-            ),
-            resume_bootstraps=tuple(
-                self._clone_env_output(output) if output is not None else None
-                for output in self._resume_bootstraps
-            ),
-            last_observations=tuple(clone_nested_to_cpu(self.last_obs_list)),
-            last_intervened_info=tuple(
-                clone_nested_to_cpu(self.last_intervened_info_list)
+            current_env_outputs=current_env_outputs,
+            resume_bootstraps=resume_bootstraps,
+            # These fields are the normalized continuation for the committed
+            # boundary, not copies of the end-of-rollout bootstrap caches. The
+            # caches may be empty (auto_reset=False) or stale until finalization.
+            last_observations=(clone_nested_to_cpu(current_output.obs),),
+            last_intervened_info=(
+                clone_nested_to_cpu(
+                    (
+                        current_output.intervene_actions,
+                        current_output.intervene_flags,
+                    )
+                ),
             ),
             train_prev_done=tuple(clone_nested_to_cpu(self.train_prev_done)),
             env_metrics={
@@ -1568,6 +1746,11 @@ class EnvWorker(Worker):
             history_state=None,
         )
         BaseWorldEnv.assert_cpu_only(state, "env_rollout_resume_state")
+        self.validate_rollout_resume_state(
+            state,
+            expected_lifecycle_generation=cursor.lifecycle_generation,
+            expected_policy_version=cursor.policy_version,
+        )
         return state
 
     def validate_rollout_resume_state(
@@ -1624,6 +1807,12 @@ class EnvWorker(Worker):
             raise ValueError("resume state must contain one last observation")
         if len(state.last_intervened_info) != 1:
             raise ValueError("resume state must contain one intervention state")
+        self._validate_stage_continuation(
+            state.current_env_outputs[0],
+            state.resume_bootstraps[0],
+            state.last_observations[0],
+            state.last_intervened_info[0],
+        )
         if state.history_state is not None:
             raise ValueError("history_state must be None for Task 1")
         if state.prefetched_train_bootstrap is not None:
@@ -1631,17 +1820,14 @@ class EnvWorker(Worker):
         rollout_result = state.rollout_results[0]
         if type(rollout_result) is not EmbodiedRolloutResult:
             raise TypeError("resume rollout must be EmbodiedRolloutResult")
-        if len(rollout_result.actions) != cursor.chunk_index:
-            raise ValueError("rollout actions length does not match chunk_index")
-        result_steps = cursor.chunk_index + cursor.epoch_index
-        for name in ("rewards", "terminations", "truncations", "dones"):
-            if len(getattr(rollout_result, name)) != result_steps:
-                raise ValueError(f"rollout {name} length does not match chunk_index")
-        for name in ("prev_logprobs", "versions", "forward_inputs"):
-            if len(getattr(rollout_result, name)) not in (0, cursor.chunk_index):
-                raise ValueError(f"rollout {name} length is inconsistent")
-        if len(rollout_result.prev_values) not in (0, result_steps):
-            raise ValueError("rollout prev_values length is inconsistent")
+        self._validate_partial_rollout_alignment(
+            rollout_result,
+            state.current_env_outputs[0],
+            cursor,
+            require_transition_ids=(
+                state.current_env_outputs[0].transition_id is not None
+            ),
+        )
         prev_done = state.train_prev_done[0]
         if prev_done.dtype != torch.bool or tuple(prev_done.shape) != (
             self.train_num_envs_per_stage,

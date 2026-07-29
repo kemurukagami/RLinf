@@ -18,6 +18,7 @@ from rlinf.data.embodied_io_struct import (
 )
 from rlinf.scheduler.rlix.coordinator import RLixResizeCoordinator
 from rlinf.scheduler.rlix.protocol import ElasticCollectionContext
+from rlinf.scheduler.worker.routing import build_send_plan
 from rlinf.workers.elastic_rollout_lifecycle import (
     CompletedResidencyReceipt,
     DrainRequest,
@@ -420,6 +421,48 @@ def test_drain_barrier_rejects_non_one_to_one_routing():
         split_elastic_rollout_request(request, [1, 1])
 
 
+def test_drain_barrier_local_batch_matches_two_rank_route_plan():
+    request = ElasticRolloutRequest(
+        kind=ElasticRolloutRequestKind.DRAIN_BARRIER,
+        transition_id=_identity(sequence=1),
+        logical_batch_size=2,
+        env_output=None,
+        drain_request_id="drain-1",
+    )
+    plan = build_send_plan(
+        src_group_name="env",
+        dst_group_name="rollout",
+        src_rank=0,
+        src_world_size=2,
+        dst_world_size=2,
+        tag="train_rollout_results",
+        route_key=0,
+        batch_size=4,
+    )
+    split_sizes = [entry.batch_size for entry in plan.entries]
+
+    shards = split_elastic_rollout_request(request, split_sizes)
+
+    assert split_sizes == [2]
+    assert shards == [request]
+
+
+def test_request_split_error_reports_kind_sizes_and_logical_batch():
+    request = ElasticRolloutRequest(
+        kind=ElasticRolloutRequestKind.DRAIN_BARRIER,
+        transition_id=_identity(sequence=1),
+        logical_batch_size=4,
+        env_output=None,
+        drain_request_id="drain-1",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"drain_barrier request split sizes \[2\] sum to 2.*logical batch size is 4",
+    ):
+        split_elastic_rollout_request(request, [2])
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
@@ -715,6 +758,21 @@ def test_environment_sends_identified_observation_with_awaited_route_work():
     assert request.kind is ElasticRolloutRequestKind.OBSERVATION
     assert request.transition_id == _identity()
     assert request.logical_batch_size == 1
+    assert all(work.awaited for work in worker.send_works)
+
+
+def test_environment_sends_barrier_with_local_not_global_batch_size():
+    worker = _elastic_env_worker(world_size=2)
+    worker.train_batch_size = 4
+    worker.train_num_envs_per_stage = 2
+    token = SafePointToken("drain-1", 0, 1, 3, _identity(sequence=1))
+
+    asyncio.run(worker._send_elastic_barrier(None, token))
+
+    assert len(worker.sent_requests) == 1
+    request = worker.sent_requests[0]
+    assert request.kind is ElasticRolloutRequestKind.DRAIN_BARRIER
+    assert request.logical_batch_size == 2
     assert all(work.awaited for work in worker.send_works)
 
 

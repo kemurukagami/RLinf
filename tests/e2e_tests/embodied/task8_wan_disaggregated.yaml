@@ -1,5 +1,15 @@
 # Four-A800 Task 8 Wan configuration. Both independent drivers resolve this
 # same candidate topology; RLix owns active exclusivity between pipelines.
+acceptance:
+  environment: wan
+  mode: disaggregated
+  expected_bundles: [[0, 2], [1, 3]]
+  repetitions: 5
+  warmup_repetitions: 1
+  minimum_throughput_improvement: 0.05
+  minimum_idle_reduction: 0.05
+  sample_interval_ms: 100
+
 models:
   vla:
     checkpoint: ${oc.env:RLINF_VLA_CHECKPOINT,/workspace/VLA/Openvla-oft-SFT-libero-spatial-traj1}
@@ -7,7 +17,10 @@ models:
     unnorm_key: libero_spatial_no_noops
   world_model:
     checkpoint: ${oc.env:RLINF_WM_CHECKPOINT,/workspace/WM/RLinf-Wan-LIBERO-Spatial}
-    num_inference_steps: 1
+    # Match the production Wan GRPO workload. A single diffusion step is useful
+    # for lifecycle smoke tests, but its lower-quality frames are not suitable
+    # evidence for the sparse binary reward model.
+    num_inference_steps: 5
 
 smoke:
   base_config: wan_libero_spatial_grpo_openvlaoft_rlix
@@ -15,13 +28,23 @@ smoke:
   rollout_gpu: [0, 1]
   env_gpu: [2, 3]
   operation_timeout_s: 900.0
+  monitor_poll_interval_s: 0.1
   output_dir: ${oc.env:RLINF_TASK8_OUTPUT,/tmp/rlinf_task8_wan_disaggregated}
-  total_num_envs: 4
+  total_num_envs: 16
   adv_type: grpo
-  group_size: 2
+  group_size: 8
+  # The generation proof validates lifecycle and training-path completion, not
+  # reward-model quality. Keep filtering enabled, but admit the full binary
+  # group-mean range so all-failure and all-success iterations remain finite
+  # zero-advantage GRPO updates instead of becoming empty masked batches.
+  filter_rewards: true
+  rewards_lower_bound: 0.0
+  rewards_upper_bound: 5.0
   rollout_epoch: 1
-  max_episode_steps: 16
-  max_steps_per_rollout_epoch: 16
-  max_train_steps: 2
+  # Preserve a complete production-length episode so sparse success rewards can
+  # be resolved before GRPO seals and filters the sixteen-trajectory batch.
+  max_episode_steps: 256
+  max_steps_per_rollout_epoch: 256
+  max_train_steps: 10
   run_evaluation: false
   save_checkpoint: false

@@ -128,7 +128,25 @@ class RLixResizeCoordinator:
         timeout_s: float | None = None,
     ) -> tuple[Any, ...]:
         timeout = self._operation_timeout_s if timeout_s is None else timeout_s
-        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=timeout,
+            return_when=asyncio.FIRST_EXCEPTION,
+        )
+        # A paired lifecycle may legitimately finish one peer before the other,
+        # so normal completion still waits for both. A real exception cannot be
+        # repaired by waiting for its peer, which may be blocked on a message the
+        # failed task was responsible for sending.
+        for task in tasks:
+            if not task.done():
+                continue
+            if task.cancelled():
+                raise asyncio.CancelledError(
+                    f"Task was cancelled while waiting for {operation}"
+                )
+            exception = task.exception()
+            if exception is not None:
+                raise exception
         if pending:
             raise TimeoutError(f"Timed out waiting for {operation}")
         return tuple(task.result() for task in tasks)
@@ -181,6 +199,63 @@ class RLixResizeCoordinator:
         ):
             raise ResizeCoordinatorError(f"rank {rank} returned an invalid status")
         return env_status, rollout_status
+
+    @staticmethod
+    def _format_peer_state_mismatch(
+        rank: int,
+        *,
+        env_status: ElasticRankStatus,
+        rollout_status: ElasticRankStatus,
+        env_run_task: asyncio.Future[Any] | None = None,
+        rollout_run_task: asyncio.Future[Any] | None = None,
+        final: bool = False,
+    ) -> str:
+        """Describe a paired-state mismatch without dumping full worker payloads."""
+
+        def summarize(value: str | None) -> str:
+            if value is None:
+                return "None"
+            return repr(value[:256])
+
+        def task_state(task: asyncio.Future[Any] | None) -> str:
+            if task is None:
+                return "missing"
+            if task.cancelled():
+                return "cancelled"
+            if not task.done():
+                return "pending"
+            try:
+                exception = task.exception()
+            except Exception as exc:
+                return (
+                    f"done_exception_unavailable:{type(exc).__name__}:{str(exc)[:128]}"
+                )
+            if exception is None:
+                return "done"
+            return (
+                f"done_with_exception:{type(exception).__name__}:{str(exception)[:256]}"
+            )
+
+        label = "final peer states" if final else "peer states"
+        return (
+            f"rank {rank} {label} do not match: "
+            f"env_state={env_status.state.value} "
+            f"rollout_state={rollout_status.state.value} "
+            f"env_lifecycle={env_status.lifecycle_generation} "
+            f"rollout_lifecycle={rollout_status.lifecycle_generation} "
+            f"env_policy={env_status.policy_version} "
+            f"rollout_policy={rollout_status.policy_version} "
+            f"env_resident={env_status.model_resident} "
+            f"rollout_resident={rollout_status.model_resident} "
+            f"env_snapshot_ready={env_status.snapshot_ready} "
+            f"rollout_snapshot_ready={rollout_status.snapshot_ready} "
+            f"env_drain_request_id={env_status.drain_request_id} "
+            f"rollout_drain_request_id={rollout_status.drain_request_id} "
+            f"env_failure={summarize(env_status.failure)} "
+            f"rollout_failure={summarize(rollout_status.failure)} "
+            f"env_run_task={task_state(env_run_task)} "
+            f"rollout_run_task={task_state(rollout_run_task)}"
+        )
 
     @staticmethod
     def _validate_status_identity(
@@ -490,17 +565,82 @@ class RLixResizeCoordinator:
         record = self._records[rank]
         if not record.callback_applied_active:
             raise RuntimeError(f"rank {rank} is not locally active")
+        if record.env_run_task is None or record.rollout_run_task is None:
+            raise ResizeCoordinatorError(f"rank {rank} has no stored run calls")
         env_status, rollout_status = await self._get_pair_status(rank)
         self._validate_status_identity(rank, env_status, context)
         self._validate_status_identity(rank, rollout_status, context)
+        states = {env_status.state, rollout_status.state}
         if env_status.state is not rollout_status.state:
-            raise ResizeCoordinatorError(f"rank {rank} peer states do not match")
-
-        if env_status.state is ElasticRankState.COMPLETED:
-            if record.env_run_task is None or record.rollout_run_task is None:
+            if not (
+                ElasticRankState.COMPLETED in states
+                and states
+                <= {
+                    ElasticRankState.ACTIVE,
+                    ElasticRankState.DRAIN_REQUESTED,
+                    ElasticRankState.COMPLETED,
+                }
+            ):
                 raise ResizeCoordinatorError(
-                    f"rank {rank} completed without stored run calls"
+                    self._format_peer_state_mismatch(
+                        rank,
+                        env_status=env_status,
+                        rollout_status=rollout_status,
+                        env_run_task=record.env_run_task,
+                        rollout_run_task=record.rollout_run_task,
+                    )
                 )
+
+        if (
+            env_status.state is not rollout_status.state
+            and ElasticRankState.COMPLETED in states
+        ):
+            env_result, rollout_result = await self._wait_tasks(
+                (record.env_run_task, record.rollout_run_task),
+                operation=f"rank {rank} completion race",
+            )
+            if not isinstance(env_result, ElasticRunResult) or not isinstance(
+                rollout_result, ElasticRunResult
+            ):
+                raise ResizeCoordinatorError(
+                    f"rank {rank} returned invalid run results"
+                )
+            if env_result.outcome is ElasticRunOutcome.COMPLETED and (
+                rollout_result.outcome is ElasticRunOutcome.COMPLETED
+            ):
+                await self._offload_completed_rank(rank, context)
+                record.token = None
+            else:
+                token = self._validate_pause_results(rank, env_result, rollout_result)
+                if (
+                    token.worker_rank != rank
+                    or token.lifecycle_generation != context.lifecycle_generation
+                    or token.policy_version != context.policy_version
+                ):
+                    raise ResizeCoordinatorError(
+                        f"rank {rank} pause token identity mismatch"
+                    )
+                env_receipt, rollout_receipt = await self._call_pair(
+                    rank,
+                    "offload_elastic_environment",
+                    "offload_elastic_rollout",
+                    operation="pause offload",
+                    env_args=(token,),
+                    rollout_args=(token,),
+                )
+                for receipt in (env_receipt, rollout_receipt):
+                    if (
+                        not isinstance(receipt, ResidencyReceipt)
+                        or receipt.token != token
+                        or (receipt.state is not ElasticRankState.PAUSED)
+                    ):
+                        raise ResizeCoordinatorError(
+                            f"rank {rank} returned an invalid pause receipt"
+                        )
+                record.token = token
+            record.last_env_result = env_result
+            record.last_rollout_result = rollout_result
+        elif env_status.state is ElasticRankState.COMPLETED:
             env_result, rollout_result = await self._wait_tasks(
                 (record.env_run_task, record.rollout_run_task),
                 operation=f"rank {rank} completed calls",
@@ -511,19 +651,42 @@ class RLixResizeCoordinator:
                 raise ResizeCoordinatorError(
                     f"rank {rank} returned invalid run results"
                 )
-            if env_result.outcome is not ElasticRunOutcome.COMPLETED or (
-                rollout_result.outcome is not ElasticRunOutcome.COMPLETED
+            if env_result.outcome is ElasticRunOutcome.COMPLETED and (
+                rollout_result.outcome is ElasticRunOutcome.COMPLETED
             ):
-                raise ResizeCoordinatorError(
-                    f"rank {rank} completed peer outcomes do not match"
+                await self._offload_completed_rank(rank, context)
+                record.token = None
+            else:
+                token = self._validate_pause_results(rank, env_result, rollout_result)
+                if (
+                    token.worker_rank != rank
+                    or token.lifecycle_generation != context.lifecycle_generation
+                    or token.policy_version != context.policy_version
+                ):
+                    raise ResizeCoordinatorError(
+                        f"rank {rank} pause token identity mismatch"
+                    )
+                env_receipt, rollout_receipt = await self._call_pair(
+                    rank,
+                    "offload_elastic_environment",
+                    "offload_elastic_rollout",
+                    operation="pause offload",
+                    env_args=(token,),
+                    rollout_args=(token,),
                 )
-            await self._offload_completed_rank(rank, context)
+                for receipt in (env_receipt, rollout_receipt):
+                    if (
+                        not isinstance(receipt, ResidencyReceipt)
+                        or receipt.token != token
+                        or (receipt.state is not ElasticRankState.PAUSED)
+                    ):
+                        raise ResizeCoordinatorError(
+                            f"rank {rank} returned an invalid pause receipt"
+                        )
+                record.token = token
             record.last_env_result = env_result
             record.last_rollout_result = rollout_result
-            record.token = None
         elif env_status.state is ElasticRankState.ACTIVE:
-            if record.env_run_task is None or record.rollout_run_task is None:
-                raise ResizeCoordinatorError(f"rank {rank} has no stored run calls")
             request = DrainRequest(
                 request_id=uuid.uuid4().hex,
                 worker_rank=rank,
@@ -598,7 +761,16 @@ class RLixResizeCoordinator:
 
         final_env, final_rollout = await self._get_pair_status(rank)
         if final_env.state is not final_rollout.state:
-            raise ResizeCoordinatorError(f"rank {rank} final peer states do not match")
+            raise ResizeCoordinatorError(
+                self._format_peer_state_mismatch(
+                    rank,
+                    env_status=final_env,
+                    rollout_status=final_rollout,
+                    env_run_task=record.env_run_task,
+                    rollout_run_task=record.rollout_run_task,
+                    final=True,
+                )
+            )
         if final_env.state not in {ElasticRankState.PAUSED, ElasticRankState.COMPLETED}:
             raise ResizeCoordinatorError(
                 f"rank {rank} did not reach a releasable state"

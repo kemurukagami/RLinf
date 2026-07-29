@@ -372,6 +372,36 @@ def test_rlinf_adapters_use_core_pipeline_identity_validation() -> None:
         )
 
 
+def test_paired_wait_surfaces_first_exception_without_waiting_for_peer() -> None:
+    async def run() -> None:
+        coordinator, _env, _rollout = _coordinator(timeout=1.0)
+        peer_release = asyncio.Event()
+
+        async def fail() -> None:
+            await asyncio.sleep(0)
+            raise RuntimeError("injected paired task failure")
+
+        async def block() -> None:
+            await peer_release.wait()
+
+        failed_task = asyncio.create_task(fail())
+        blocked_task = asyncio.create_task(block())
+        try:
+            with pytest.raises(RuntimeError, match="injected paired task failure"):
+                await asyncio.wait_for(
+                    coordinator._wait_tasks(
+                        (failed_task, blocked_task), operation="test paired tasks"
+                    ),
+                    timeout=0.1,
+                )
+            assert not blocked_task.done()
+        finally:
+            peer_release.set()
+            await asyncio.gather(blocked_task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
 def test_cold_expand_pause_shrink_and_exact_token_resume() -> None:
     async def run() -> None:
         coordinator, env, rollout = _coordinator()
@@ -532,6 +562,37 @@ def test_direct_mixed_callback_finishes_all_shrinks_before_expansion() -> None:
     asyncio.run(run())
 
 
+def test_shrink_tolerates_transient_completed_active_peer_race() -> None:
+    async def run() -> None:
+        coordinator, env, rollout = _coordinator()
+        await _configure(coordinator)
+        await coordinator.resize_infer([], [0])
+        env[0].complete_event.set()
+        while env[0].state is not ElasticRankState.COMPLETED:
+            await asyncio.sleep(0)
+        assert rollout[0].state is ElasticRankState.ACTIVE
+
+        async def complete_rollout_after_shrink_samples_status() -> None:
+            await asyncio.sleep(0.01)
+            rollout[0].complete_event.set()
+
+        completion = asyncio.create_task(complete_rollout_after_shrink_samples_status())
+        await coordinator.resize_infer([0], [])
+        await completion
+
+        assert env[0].state is ElasticRankState.COMPLETED
+        assert rollout[0].state is ElasticRankState.COMPLETED
+        assert not env[0].resident
+        assert not rollout[0].resident
+        assert env[0].completed_offload_count == 1
+        assert rollout[0].completed_offload_count == 1
+        status = await coordinator.get_status()
+        assert status.callback_applied_active_ranks == ()
+        assert status.completed_ranks == (0,)
+
+    asyncio.run(run())
+
+
 def test_callback_validation_rejects_malformed_ranks_before_worker_calls() -> None:
     async def run() -> None:
         coordinator, env, rollout = _coordinator()
@@ -549,6 +610,29 @@ def test_callback_validation_rejects_malformed_ranks_before_worker_calls() -> No
             await coordinator.resize_infer([0], [0])
         assert env[0].prepare_count == 0
         assert rollout[0].prepare_count == 0
+
+    asyncio.run(run())
+
+
+def test_shrink_peer_state_mismatch_reports_both_worker_states() -> None:
+    async def run() -> None:
+        coordinator, env, rollout = _coordinator()
+        await _configure(coordinator)
+        await coordinator.resize_infer([], [0])
+        env[0].state = ElasticRankState.SNAPSHOTTING
+        env[0].failure = "env diagnostic"
+        rollout[0].failure = "rollout diagnostic"
+
+        with pytest.raises(ResizeCoordinatorError) as exc_info:
+            await coordinator.resize_infer([0], [])
+
+        message = str(exc_info.value)
+        assert "env_state=snapshotting" in message
+        assert "rollout_state=active" in message
+        assert "env_run_task=pending" in message
+        assert "rollout_run_task=pending" in message
+        assert "env_failure='env diagnostic'" in message
+        assert "rollout_failure='rollout diagnostic'" in message
 
     asyncio.run(run())
 

@@ -15,6 +15,18 @@ import numpy as np
 import torch
 
 ACCEPTANCE_SCHEMA_VERSION = 1
+_SAFE_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.=-]*$")
+
+
+def validate_run_id(run_id: str) -> None:
+    """Validate a run id for artifact paths and Ray-owned names."""
+    if not _SAFE_RUN_ID_RE.fullmatch(run_id):
+        raise ValueError(
+            "run_id must be one safe output-directory and Ray-name component; "
+            "use letters, digits, '_', '.', '-', or '=', start with a letter or "
+            f"digit, and do not include '/', whitespace, or ':'. Got {run_id!r}."
+        )
+
 
 _KNOWN_EVENTS = frozenset(
     {
@@ -38,10 +50,40 @@ _KNOWN_EVENTS = frozenset(
         "unregistered",
         "policy_request_started",
         "policy_request_completed",
+        "bootstrap_dispatched",
         "chunk_started",
         "chunk_committed",
+        "world_model_onload_started",
+        "world_model_onload_completed",
+        "world_model_onload_failed",
+        "world_model_diffusion_started",
+        "world_model_diffusion_completed",
+        "world_model_diffusion_failed",
+        "world_model_reward_started",
+        "world_model_reward_completed",
+        "world_model_reward_failed",
+        "world_model_reward_returned",
+        "world_model_reward_differences_started",
+        "world_model_reward_differences_completed",
+        "world_model_success_estimation_started",
+        "world_model_success_estimation_completed",
+        "world_model_truncation_check_started",
+        "world_model_truncation_check_completed",
+        "world_model_done_check_started",
+        "world_model_done_check_completed",
+        "world_model_auto_reset_started",
+        "world_model_auto_reset_completed",
+        "world_model_metrics_started",
+        "world_model_metrics_completed",
+        "world_model_render_conversion_started",
+        "world_model_render_conversion_completed",
+        "world_model_chunk_step_returning",
+        "env_output_constructed",
         "pending_bootstrap_retained",
         "drain_requested",
+        "barrier_send_started",
+        "barrier_send_completed",
+        "barrier_send_failed",
         "drain_observed",
         "barrier_consumed",
         "snapshot_started",
@@ -103,10 +145,40 @@ _TRANSITION_EVENTS = frozenset(
     {
         "policy_request_started",
         "policy_request_completed",
+        "bootstrap_dispatched",
         "chunk_started",
         "chunk_committed",
+        "world_model_onload_started",
+        "world_model_onload_completed",
+        "world_model_onload_failed",
+        "world_model_diffusion_started",
+        "world_model_diffusion_completed",
+        "world_model_diffusion_failed",
+        "world_model_reward_started",
+        "world_model_reward_completed",
+        "world_model_reward_failed",
+        "world_model_reward_returned",
+        "world_model_reward_differences_started",
+        "world_model_reward_differences_completed",
+        "world_model_success_estimation_started",
+        "world_model_success_estimation_completed",
+        "world_model_truncation_check_started",
+        "world_model_truncation_check_completed",
+        "world_model_done_check_started",
+        "world_model_done_check_completed",
+        "world_model_auto_reset_started",
+        "world_model_auto_reset_completed",
+        "world_model_metrics_started",
+        "world_model_metrics_completed",
+        "world_model_render_conversion_started",
+        "world_model_render_conversion_completed",
+        "world_model_chunk_step_returning",
+        "env_output_constructed",
         "pending_bootstrap_retained",
         "drain_requested",
+        "barrier_send_started",
+        "barrier_send_completed",
+        "barrier_send_failed",
         "snapshot_started",
         "snapshot_completed",
         "restore_validated",
@@ -118,6 +190,7 @@ _TRANSITION_EVENTS = frozenset(
 _BUNDLE_EVENTS = frozenset(
     {
         "generation_granted",
+        "bootstrap_dispatched",
         "environment_offload_started",
         "environment_offload_verified",
         "rollout_offload_started",
@@ -174,8 +247,7 @@ class RunManifest:
         """Validate topology, inputs, and predeclared measurement gates."""
         if self.schema_version != ACCEPTANCE_SCHEMA_VERSION:
             raise ValueError(f"unsupported run schema version {self.schema_version}")
-        if not self.run_id or any(char.isspace() for char in self.run_id):
-            raise ValueError("run_id must be non-empty and contain no whitespace")
+        validate_run_id(self.run_id)
         if self.environment not in {"wan", "opensora"}:
             raise ValueError(f"unsupported environment {self.environment!r}")
         if self.mode not in {"disaggregated", "collocated"}:
@@ -259,8 +331,7 @@ class Task8RoleNames:
 
 def derive_role_names(*, run_id: str, role: str) -> Task8RoleNames:
     """Derive deterministic collision-free worker and channel identities."""
-    if not run_id or any(char.isspace() for char in run_id):
-        raise ValueError("run_id must be non-empty and contain no whitespace")
+    validate_run_id(run_id)
     if role not in {"a", "b"}:
         raise ValueError("Task 8 driver role must be 'a' or 'b'")
     prefix = f"t8_{run_id}_{role}"
@@ -322,8 +393,7 @@ class AcceptanceEvent:
             raise ValueError(
                 f"unsupported acceptance schema version {self.schema_version}"
             )
-        if not self.run_id or any(char.isspace() for char in self.run_id):
-            raise ValueError("run_id must be non-empty and contain no whitespace")
+        validate_run_id(self.run_id)
         if self.driver_role not in {"a", "b", "core", "orchestrator"}:
             raise ValueError(f"unknown driver role {self.driver_role!r}")
         if not self.component:
@@ -365,6 +435,18 @@ class AcceptanceEvent:
                 != self.lifecycle_generation
             ):
                 raise ValueError("transition lifecycle generation does not match event")
+        if self.event == "batch_sealed":
+            if self.transition_identity is not None:
+                raise ValueError(
+                    "batch_sealed is aggregate evidence and must not select one "
+                    "top-level transition_identity"
+                )
+            if self.component == "actor":
+                _validate_actor_batch_sealed_details(
+                    self.details,
+                    lifecycle_generation=self.lifecycle_generation,
+                    policy_version=self.policy_version,
+                )
         if self.event in _TRANSITION_EVENTS and self.transition_identity is None:
             raise ValueError(f"{self.event} requires transition_identity")
         if self.event in _TRANSITION_EVENTS and self.policy_version is None:
@@ -415,6 +497,7 @@ class AcceptanceEventSink:
         unique_key = (
             event.pipeline_id,
             event.lifecycle_generation,
+            event.policy_version,
             event.component,
             event.dp_rank,
             event.event,
@@ -488,6 +571,21 @@ class AcceptanceEventProducer:
         context = self._context_provider()
         if not isinstance(context, AcceptanceProducerContext):
             raise TypeError("context provider must return AcceptanceProducerContext")
+        transition_identity = context.transition_identity
+        if transition_identity is None and event_name in _RANK_EVENTS:
+            transition_identity = _find_transition_identity(details)
+        lifecycle_generation = context.lifecycle_generation
+        if lifecycle_generation is None and transition_identity is not None:
+            lifecycle_generation = transition_identity.lifecycle_generation
+        if lifecycle_generation is None:
+            lifecycle_generation = _find_non_negative_int(
+                details, keys=("lifecycle_generation",)
+            )
+        policy_version = context.policy_version
+        if policy_version is None:
+            policy_version = _find_non_negative_int(
+                details, keys=("policy_version", "expected_policy_version")
+            )
         event = AcceptanceEvent(
             run_id=self._run_id,
             producer_sequence=self._next_sequence,
@@ -495,12 +593,12 @@ class AcceptanceEventProducer:
             producer_pid=self._producer_pid,
             driver_role=self._driver_role,
             pipeline_id=context.pipeline_id,
-            lifecycle_generation=context.lifecycle_generation,
-            policy_version=context.policy_version,
+            lifecycle_generation=lifecycle_generation,
+            policy_version=policy_version,
             component=self._component,
             dp_rank=self._dp_rank,
             event=event_name,
-            transition_identity=context.transition_identity,
+            transition_identity=transition_identity,
             gpu_ids=context.gpu_ids,
             details=details,
         )
@@ -509,10 +607,155 @@ class AcceptanceEventProducer:
         return stamped
 
 
+def _find_transition_identity(value: Any) -> TransitionIdentity | None:
+    """Find the first normalized rollout transition identity in event details."""
+
+    if isinstance(value, Mapping):
+        if {
+            "lifecycle_generation",
+            "env_worker_rank",
+            "stage_id",
+            "sequence",
+        } <= set(value):
+            fields = {
+                "lifecycle_generation": value["lifecycle_generation"],
+                "worker_rank": value["env_worker_rank"],
+                "episode_generation": value["stage_id"],
+                "transition_id": value["sequence"],
+            }
+            if all(
+                isinstance(item, int) and not isinstance(item, bool) and item >= 0
+                for item in fields.values()
+            ):
+                return TransitionIdentity(**fields)
+        rank_key = None
+        if "env_worker_rank" in value:
+            rank_key = "env_worker_rank"
+        elif "worker_rank" in value:
+            rank_key = "worker_rank"
+        if rank_key is not None and {
+            "lifecycle_generation",
+            "episode_generation",
+            "transition_id",
+        } <= set(value):
+            fields = {
+                "lifecycle_generation": value["lifecycle_generation"],
+                "worker_rank": value[rank_key],
+                "episode_generation": value["episode_generation"],
+                "transition_id": value["transition_id"],
+            }
+            if all(
+                isinstance(item, int) and not isinstance(item, bool) and item >= 0
+                for item in fields.values()
+            ):
+                return TransitionIdentity(**fields)
+        for item in value.values():
+            identity = _find_transition_identity(item)
+            if identity is not None:
+                return identity
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for item in value:
+            identity = _find_transition_identity(item)
+            if identity is not None:
+                return identity
+    return None
+
+
+def _validate_actor_batch_sealed_details(
+    details: Mapping[str, Any] | None,
+    *,
+    lifecycle_generation: int | None,
+    policy_version: int | None,
+) -> None:
+    """Validate every transition represented by an aggregate actor batch seal."""
+
+    if not isinstance(details, Mapping):
+        raise ValueError("actor batch_sealed requires details")
+    receipt = details.get("receipt")
+    transition_records = details.get("transition_ids")
+    if not isinstance(receipt, Mapping):
+        raise ValueError("actor batch_sealed requires a receipt mapping")
+    if not isinstance(transition_records, Sequence) or isinstance(
+        transition_records, (str, bytes, bytearray)
+    ):
+        raise ValueError("actor batch_sealed requires a transition_ids sequence")
+    if not transition_records:
+        raise ValueError("actor batch_sealed requires at least one transition identity")
+
+    identities: list[TransitionIdentity] = []
+    for record in transition_records:
+        identity = _find_transition_identity(record)
+        if identity is None:
+            raise ValueError(
+                "actor batch_sealed contains an invalid transition identity"
+            )
+        identities.append(identity)
+    if len(set(identities)) != len(identities):
+        raise ValueError("actor batch_sealed contains duplicate transition identities")
+
+    receipt_lifecycle = receipt.get("lifecycle_generation")
+    receipt_policy = receipt.get("policy_version")
+    contributing_ranks = receipt.get("contributing_dp_ranks")
+    transition_count = receipt.get("transition_count")
+    if lifecycle_generation != receipt_lifecycle:
+        raise ValueError("actor batch_sealed lifecycle does not match its receipt")
+    if policy_version != receipt_policy:
+        raise ValueError("actor batch_sealed policy version does not match its receipt")
+    if any(
+        identity.lifecycle_generation != receipt_lifecycle for identity in identities
+    ):
+        raise ValueError(
+            "actor batch_sealed transition lifecycle does not match its receipt"
+        )
+    if not isinstance(contributing_ranks, Sequence) or isinstance(
+        contributing_ranks, (str, bytes, bytearray)
+    ):
+        raise ValueError("actor batch_sealed receipt has invalid contributing_dp_ranks")
+    if any(
+        not isinstance(rank, int) or isinstance(rank, bool) or rank < 0
+        for rank in contributing_ranks
+    ):
+        raise ValueError("actor batch_sealed receipt has invalid contributing rank")
+    observed_ranks = tuple(sorted({identity.worker_rank for identity in identities}))
+    expected_ranks = tuple(sorted(contributing_ranks))
+    if observed_ranks != expected_ranks:
+        raise ValueError(
+            "actor batch_sealed transition source ranks do not match contributing_dp_ranks"
+        )
+    if transition_count != len(identities):
+        raise ValueError(
+            "actor batch_sealed transition count does not match its receipt"
+        )
+
+
+def _find_non_negative_int(value: Any, *, keys: tuple[str, ...]) -> int | None:
+    """Find the first normalized non-negative integer under one of the keys."""
+
+    if isinstance(value, Mapping):
+        for key in keys:
+            item = value.get(key)
+            if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
+                return item
+        for item in value.values():
+            found = _find_non_negative_int(item, keys=keys)
+            if found is not None:
+                return found
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for item in value:
+            found = _find_non_negative_int(item, keys=keys)
+            if found is not None:
+                return found
+    return None
+
+
 def _canonical_array(value: Any) -> np.ndarray:
     if isinstance(value, torch.Tensor):
         if value.device.type != "cpu":
             raise ValueError("acceptance manifests require CPU tensors")
+        if value.dtype == torch.bfloat16:
+            raise TypeError(
+                "bfloat16 tensors require the dedicated acceptance manifest encoder"
+            )
         return np.ascontiguousarray(value.detach().numpy())
     if isinstance(value, np.ndarray):
         return np.ascontiguousarray(value)
@@ -521,6 +764,28 @@ def _canonical_array(value: Any) -> np.ndarray:
 
 def normalize_manifest(value: Any, *, inline_value_limit: int = 4096) -> Any:
     """Convert nested evidence to deterministic JSON-safe typed records."""
+    if isinstance(value, torch.Tensor) and value.dtype == torch.bfloat16:
+        if value.device.type != "cpu":
+            raise ValueError("acceptance manifests require CPU tensors")
+        tensor = value.detach().contiguous()
+        finite_values = tensor.to(dtype=torch.float32)
+        if not torch.isfinite(finite_values).all().item():
+            raise ValueError("acceptance manifests reject non-finite tensor values")
+        # NumPy has no native bfloat16 dtype, so hash the original two-byte
+        # storage through a uint16 view. Only the optional JSON values are
+        # widened to float32; production tensors and binary evidence remain
+        # untouched and bit-exact.
+        raw = tensor.view(torch.uint16).numpy().tobytes(order="C")
+        record: dict[str, Any] = {
+            "kind": "tensor",
+            "shape": list(tensor.shape),
+            "dtype": "bfloat16",
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "logical_bytes": len(raw),
+        }
+        if tensor.numel() <= inline_value_limit:
+            record["values"] = finite_values.reshape(-1).tolist()
+        return record
     if isinstance(value, (torch.Tensor, np.ndarray)):
         array = _canonical_array(value)
         if (
@@ -625,7 +890,9 @@ def compare_manifests(
 
 def logical_tensor_bytes(value: Any) -> int:
     """Count recursively reachable tensor and ndarray payload bytes."""
-    if isinstance(value, (torch.Tensor, np.ndarray)):
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, np.ndarray):
         return int(_canonical_array(value).nbytes)
     if is_dataclass(value) and not isinstance(value, type):
         return logical_tensor_bytes(asdict(value))

@@ -32,6 +32,7 @@ from task8_acceptance_support import (
     evaluate_utilization_trials,
     normalize_manifest,
     normalize_scheduler_commit_marker,
+    validate_run_id,
 )
 
 _COMMIT_QUERY = """
@@ -399,13 +400,7 @@ def prepare_acceptance_artifacts(
     """Create an isolated run tree, refusing an existing non-empty run."""
     run_manifest.validate()
     output_root = Path(output_dir)
-    run_component = Path(run_manifest.run_id)
-    if (
-        run_component.is_absolute()
-        or len(run_component.parts) != 1
-        or run_manifest.run_id in {".", ".."}
-    ):
-        raise ValueError("run_id must be one safe output-directory component")
+    validate_run_id(run_manifest.run_id)
     run_root = output_root / run_manifest.run_id
     if run_root.exists() and any(run_root.iterdir()):
         raise FileExistsError(f"acceptance run directory is not empty: {run_root}")

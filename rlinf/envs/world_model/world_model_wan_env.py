@@ -15,7 +15,7 @@
 import os
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import numpy as np
 import torch
@@ -115,6 +115,22 @@ class WanEnv(BaseWorldEnv):
         )
 
         self._is_offloaded = False
+        self._chunk_step_diagnostic_observer: (
+            Callable[[str, dict[str, Any]], None] | None
+        ) = None
+
+    def set_chunk_step_diagnostic_observer(
+        self, observer: Callable[[str, dict[str, Any]], None] | None
+    ) -> None:
+        """Set an optional observer for fine-grained chunk-step diagnostics."""
+        if observer is not None and not callable(observer):
+            raise TypeError("chunk-step diagnostic observer must be callable or None")
+        self._chunk_step_diagnostic_observer = observer
+
+    def _emit_chunk_step_diagnostic(self, event: str, **details: Any) -> None:
+        observer = self._chunk_step_diagnostic_observer
+        if observer is not None:
+            observer(event, details)
 
     def _continuation_config(self):
         config = super()._continuation_config()
@@ -783,10 +799,16 @@ class WanEnv(BaseWorldEnv):
 
         # Get rewards
         chunk_rewards = self._infer_next_chunk_rewards()
+        self._emit_chunk_step_diagnostic("reward_returned")
+
+        self._emit_chunk_step_diagnostic("reward_differences_started")
         chunk_rewards_tensors = self._calc_step_reward(chunk_rewards)
+        self._emit_chunk_step_diagnostic("reward_differences_completed")
 
         # Estimate success (terminations) based on rewards
+        self._emit_chunk_step_diagnostic("success_estimation_started")
         estimated_success = self._estimate_success_from_rewards(chunk_rewards)
+        self._emit_chunk_step_diagnostic("success_estimation_completed")
 
         # Create terminations tensor: success is marked at the last step of chunk
         raw_chunk_terminations = torch.zeros(
@@ -801,23 +823,37 @@ class WanEnv(BaseWorldEnv):
             self.device
         )
 
-        if truncations.any():
+        self._emit_chunk_step_diagnostic("truncation_check_started")
+        has_truncations = bool(truncations.any().item())
+        self._emit_chunk_step_diagnostic(
+            "truncation_check_completed", has_truncations=has_truncations
+        )
+        if has_truncations:
             raw_chunk_truncations[:, -1] = truncations
 
         past_terminations = raw_chunk_terminations.any(dim=1)
         past_truncations = raw_chunk_truncations.any(dim=1)
         past_dones = torch.logical_or(past_terminations, past_truncations)
 
-        if past_dones.any() and self.auto_reset:
+        self._emit_chunk_step_diagnostic("done_check_started")
+        has_past_dones = bool(past_dones.any().item())
+        self._emit_chunk_step_diagnostic(
+            "done_check_completed", has_past_dones=has_past_dones
+        )
+        if has_past_dones and self.auto_reset:
+            self._emit_chunk_step_diagnostic("auto_reset_started")
             extracted_obs, infos = self._handle_auto_reset(
                 past_dones, extracted_obs, {}
             )
+            self._emit_chunk_step_diagnostic("auto_reset_completed")
         else:
             infos = {}
 
+        self._emit_chunk_step_diagnostic("metrics_started")
         infos = self._record_metrics(
             chunk_rewards_tensors.sum(dim=1), past_terminations, infos
         )
+        self._emit_chunk_step_diagnostic("metrics_completed")
 
         chunk_terminations = torch.zeros_like(raw_chunk_terminations)
         chunk_terminations[:, -1] = past_terminations
@@ -826,6 +862,7 @@ class WanEnv(BaseWorldEnv):
         chunk_truncations[:, -1] = past_truncations
 
         # Get actions and rewards for rendering
+        self._emit_chunk_step_diagnostic("render_conversion_started")
         chunk_actions_for_render = policy_output_action
         if isinstance(chunk_actions_for_render, torch.Tensor):
             chunk_actions_for_render = chunk_actions_for_render.detach().cpu().numpy()
@@ -834,6 +871,8 @@ class WanEnv(BaseWorldEnv):
         # Reshape for rendering: [num_envs, chunk, action_dim] -> [chunk, num_envs, action_dim]
         chunk_actions_for_render = chunk_actions_for_render.transpose(1, 0, 2)
         chunk_rewards_for_render = chunk_rewards_for_render.T  # [chunk, num_envs]
+        self._emit_chunk_step_diagnostic("render_conversion_completed")
+        self._emit_chunk_step_diagnostic("chunk_step_returning")
 
         return (
             [extracted_obs],

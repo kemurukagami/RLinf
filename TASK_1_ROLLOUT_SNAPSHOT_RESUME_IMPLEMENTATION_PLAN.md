@@ -408,7 +408,7 @@ and provides a clean extension point for later pipeline work.
 Add to `env_worker.py`:
 
 ```python
-ENV_ROLLOUT_RESUME_SCHEMA_VERSION = 1
+ENV_ROLLOUT_RESUME_SCHEMA_VERSION = 3
 
 @dataclass(frozen=True, slots=True)
 class EnvRolloutResumeState:
@@ -428,6 +428,40 @@ class EnvRolloutResumeState:
     prefetched_train_bootstrap: tuple[EnvOutput, ...] | None
     history_state: Any | None
 ```
+
+Schema history:
+
+- version 1 introduced worker continuation snapshots;
+- version 2 added channel-visible elastic transition identity; and
+- version 3 defines `current_env_outputs` plus the unsent
+  `resume_bootstraps` as the canonical committed-boundary continuation.
+
+In version 3, `last_observations` and `last_intervened_info` are normalized
+from the committed output. They are not copied from the live end-of-rollout
+caches, because those caches may be empty under `auto_reset=False` or stale
+until rollout finalization under `auto_reset=True`. Snapshot creation validates
+the normalized record before returning it, and restore repopulates the runtime
+caches from the validated record.
+
+Partial `EmbodiedRolloutResult` validation must not assume that every model
+stores continuous `actions`. Required result state covers every committed
+boundary. Continuous actions and model `forward_inputs` are each optional, but
+one complete representation must cover all committed chunks; populated
+optional sequences cannot be partial. OpenVLA-OFT therefore resumes from its
+`action_tokens` forward inputs without adding a synthetic continuous training
+field. Elastic snapshots also require one transition identity per committed
+result boundary, and diagnostics include all sequence counts and forward-input
+keys.
+
+At `BOOTSTRAP_PENDING`, reward materialization intentionally lags the committed
+environment chunk. The partial trajectory contains rewards for all earlier
+commits, while `current_env_outputs`/`resume_bootstraps` retains the newest raw
+environment reward for the next bootstrap-value and optional external-reward
+calculation. Validation requires `committed_chunks - 1` materialized rewards
+and exactly one pending reward; snapshot never appends it. Done/termination,
+value, and elastic transition sequences use
+`committed_chunks + epoch_index` because completed epochs add a final bootstrap
+boundary without another policy action.
 
 Do not serialize `defaultdict` factories. Normalize metrics to plain mappings
 and immutable tuples in the snapshot.

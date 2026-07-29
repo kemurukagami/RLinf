@@ -29,10 +29,12 @@ def get_env_attr(env, name: str, default: Any = None) -> Any:
     """Fetch an attribute from a (possibly wrapped) gym/gymnasium env.
 
     Walks the wrapper stack so the attribute is found even when ``env`` is
-    nested, e.g. ``CollectEpisode(RecordVideo(base_env))``. This stays
-    compatible across versions: gymnasium >= 1.0 exposes ``get_wrapper_attr``
-    while older gymnasium/gym and custom wrappers rely on ``__getattr__``
-    delegation through plain ``getattr``.
+    nested, e.g. ``CollectEpisode(RecordVideo(base_env))``. Modern Gymnasium's
+    ``get_wrapper_attr`` cannot continue through an RLinf environment that is
+    not a ``gymnasium.Env``. If that lookup fails, this helper traverses each
+    wrapper's public ``env`` link directly. The fallback also supports older
+    Gym/Gymnasium wrappers and custom RLinf wrappers without relying on the
+    deprecated wrapper ``__getattr__`` delegation.
 
     Args:
         env: The (possibly wrapped) environment.
@@ -42,12 +44,38 @@ def get_env_attr(env, name: str, default: Any = None) -> Any:
     Returns:
         The resolved attribute, or ``default`` if it cannot be found.
     """
-    if hasattr(env, "get_wrapper_attr"):
+    getter = getattr(env, "get_wrapper_attr", None)
+    if callable(getter):
         try:
-            return env.get_wrapper_attr(name)
+            return getter(name)
         except AttributeError:
-            return default
-    return getattr(env, name, default)
+            # A Gymnasium wrapper may surround an RLinf world-model environment
+            # that does not implement get_wrapper_attr(). Continue through the
+            # wrapper chain instead of treating that boundary as a missing
+            # lifecycle capability.
+            pass
+
+    current = env
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        try:
+            # Calling object.__getattribute__ avoids Gymnasium's deprecated
+            # wrapper __getattr__ forwarding while retaining descriptors and
+            # methods defined by the current wrapper layer.
+            return object.__getattribute__(current, name)
+        except AttributeError:
+            pass
+
+        try:
+            wrapped = object.__getattribute__(current, "env")
+        except AttributeError:
+            # Preserve support for terminal custom environments that expose
+            # dynamic attributes through their own __getattr__ implementation.
+            return getattr(current, name, default)
+        current = wrapped
+
+    return default
 
 
 def to_tensor(

@@ -492,7 +492,55 @@ def _make_wan_env(monkeypatch):
     env.returns = torch.tensor([3.0, 4.0], dtype=torch.float32)
     env._is_start = False
     env._is_offloaded = False
+    env._chunk_step_diagnostic_observer = None
     return env
+
+
+def test_wan_chunk_step_diagnostics_are_ordered_and_optional(monkeypatch):
+    env = _make_wan_env(monkeypatch)
+    env.elapsed_steps = 0
+    env.cfg.max_episode_steps = 16
+    env.onload = lambda: None
+    env._infer_next_chunk_frames = lambda actions: None
+    env._wrap_obs = lambda: {"obs": torch.ones(2, 1)}
+    env._infer_next_chunk_rewards = lambda: torch.zeros(2, 8)
+    env._calc_step_reward = lambda rewards: rewards
+    env._estimate_success_from_rewards = lambda rewards: torch.zeros(
+        2, dtype=torch.bool
+    )
+    env._record_metrics = lambda rewards, terminations, infos: infos
+    events = []
+    env.set_chunk_step_diagnostic_observer(
+        lambda event, details: events.append((event, details))
+    )
+
+    result = env.chunk_step(torch.zeros(2, 8, 7))
+
+    assert result[1].shape == (2, 8)
+    assert [event for event, _ in events] == [
+        "reward_returned",
+        "reward_differences_started",
+        "reward_differences_completed",
+        "success_estimation_started",
+        "success_estimation_completed",
+        "truncation_check_started",
+        "truncation_check_completed",
+        "done_check_started",
+        "done_check_completed",
+        "metrics_started",
+        "metrics_completed",
+        "render_conversion_started",
+        "render_conversion_completed",
+        "chunk_step_returning",
+    ]
+    assert events[6][1] == {"has_truncations": False}
+    assert events[8][1] == {"has_past_dones": False}
+
+    env.set_chunk_step_diagnostic_observer(None)
+    events.clear()
+    env.elapsed_steps = 0
+    env.chunk_step(torch.zeros(2, 8, 7))
+    assert events == []
 
 
 def test_wan_round_trip_restores_queue_actions_and_seed(monkeypatch):
@@ -689,7 +737,7 @@ def _make_wan_worker(monkeypatch):
             max_episode_length=240,
             actions=[torch.ones(2, 56)],
             intervene_flags=[torch.zeros(2, 56, dtype=torch.bool)],
-            rewards=[torch.ones(2, 8)],
+            rewards=[],
             terminations=[torch.zeros(2, 8, dtype=torch.bool)],
             truncations=[torch.zeros(2, 8, dtype=torch.bool)],
             dones=[torch.zeros(2, 8, dtype=torch.bool)],
@@ -750,6 +798,200 @@ def test_wan_worker_snapshot_owns_cpu_state_and_restores(monkeypatch):
     )
 
 
+def test_wan_worker_snapshot_derives_continuation_with_empty_bootstrap_caches(
+    monkeypatch,
+):
+    worker = _make_wan_worker(monkeypatch)
+    worker.last_obs_list = []
+    worker.last_intervened_info_list = []
+
+    state = worker.snapshot_rollout_stage()
+
+    assert len(state.last_observations) == 1
+    assert len(state.last_intervened_info) == 1
+    assert worker.last_obs_list == []
+    assert worker.last_intervened_info_list == []
+    assert worker._continuation_values_equal(
+        state.last_observations[0], state.current_env_outputs[0].obs
+    )
+    assert state.last_intervened_info[0] == (None, None)
+    worker.validate_rollout_resume_state(
+        state,
+        expected_lifecycle_generation=2,
+        expected_policy_version=7,
+    )
+
+
+def test_wan_worker_snapshot_normalizes_stale_end_of_rollout_caches(monkeypatch):
+    worker = _make_wan_worker(monkeypatch)
+    stale_observation = {
+        **worker._current_env_outputs[0].obs,
+        "states": torch.full((2, 16), -1.0),
+    }
+    worker.last_obs_list = [stale_observation]
+    worker.last_intervened_info_list = [
+        (torch.ones(2, 8, 7), torch.ones(2, 8, dtype=torch.bool))
+    ]
+
+    state = worker.snapshot_rollout_stage()
+
+    assert worker.last_obs_list[0] is stale_observation
+    assert worker._continuation_values_equal(
+        state.last_observations[0], state.current_env_outputs[0].obs
+    )
+    assert state.last_intervened_info[0] == (None, None)
+
+
+def test_wan_worker_snapshot_accepts_token_action_representation(monkeypatch):
+    worker = _make_wan_worker(monkeypatch)
+    rollout_result = worker.rollout_results[0]
+    rollout_result.actions = []
+    rollout_result.intervene_flags = []
+    rollout_result.forward_inputs = [
+        {
+            "input_ids": torch.ones(2, 128, dtype=torch.int64),
+            "action_tokens": torch.ones(2, 8, 7, dtype=torch.int64),
+        }
+    ]
+
+    state = worker.snapshot_rollout_stage()
+
+    assert state.rollout_results[0].actions == []
+    assert len(state.rollout_results[0].forward_inputs) == 1
+    assert sorted(state.rollout_results[0].forward_inputs[0]) == [
+        "action_tokens",
+        "input_ids",
+    ]
+
+
+def test_wan_worker_snapshot_rejects_missing_pending_reward(monkeypatch):
+    worker = _make_wan_worker(monkeypatch)
+    worker._current_env_outputs[0].rewards = None
+
+    with pytest.raises(
+        ValueError,
+        match="retained pending bootstrap must contain the deferred reward",
+    ):
+        worker.snapshot_rollout_stage()
+
+
+def test_wan_worker_snapshot_rejects_duplicate_materialized_pending_reward(
+    monkeypatch,
+):
+    worker = _make_wan_worker(monkeypatch)
+    worker.rollout_results[0].rewards = [torch.ones(2, 8)]
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "rewards must exclude exactly the retained pending-bootstrap reward.*"
+            "rewards=1.*pending_reward_present=True"
+        ),
+    ):
+        worker.snapshot_rollout_stage()
+
+
+def test_wan_worker_deferred_reward_materializes_once_after_restore(monkeypatch):
+    uninterrupted = _make_wan_worker(monkeypatch)
+    state = uninterrupted.snapshot_rollout_stage()
+    resumed = _make_wan_worker(monkeypatch)
+    resumed.restore_rollout_stage(
+        state,
+        expected_lifecycle_generation=2,
+        expected_policy_version=7,
+    )
+
+    for worker in (uninterrupted, resumed):
+        pending_output = worker._resume_bootstraps[0]
+        # With no value or external reward adjustment, production
+        # compute_bootstrap_rewards materializes a clone of this retained value.
+        reward = pending_output.rewards.clone()
+        worker.rollout_results[0].append_step_result(ChunkStepResult(rewards=reward))
+
+    assert len(uninterrupted.rollout_results[0].rewards) == 1
+    assert len(resumed.rollout_results[0].rewards) == 1
+    torch.testing.assert_close(
+        resumed.rollout_results[0].rewards[0],
+        uninterrupted.rollout_results[0].rewards[0],
+    )
+
+
+def test_wan_worker_later_epoch_uses_result_boundary_counts(monkeypatch):
+    worker = _make_wan_worker(monkeypatch)
+    worker._rollout_cursor.epoch_index = 1
+    worker._rollout_cursor.chunk_index = 3
+    worker._rollout_cursor.next_transition_ids = (4,)
+    pending_identity = RolloutTransitionIdentity(
+        lifecycle_generation=2,
+        env_worker_rank=0,
+        stage_id=0,
+        sequence=4,
+    )
+    worker._current_env_outputs[0].transition_id = pending_identity
+    worker._resume_bootstraps[0].transition_id = pending_identity
+    rollout_result = worker.rollout_results[0]
+    rollout_result.actions = [torch.ones(2, 56) for _ in range(3)]
+    rollout_result.intervene_flags = [
+        torch.zeros(2, 56, dtype=torch.bool) for _ in range(3)
+    ]
+    rollout_result.rewards = [torch.ones(2, 8) for _ in range(2)]
+    rollout_result.terminations = [
+        torch.zeros(2, 8, dtype=torch.bool) for _ in range(4)
+    ]
+    rollout_result.truncations = [torch.zeros(2, 8, dtype=torch.bool) for _ in range(4)]
+    rollout_result.dones = [torch.zeros(2, 8, dtype=torch.bool) for _ in range(4)]
+    rollout_result.prev_logprobs = [torch.full((2, 8), 0.25) for _ in range(3)]
+    rollout_result.prev_values = [torch.full((2, 1), 0.5) for _ in range(4)]
+    rollout_result.versions = [torch.full((2, 8), 7.0) for _ in range(3)]
+    rollout_result.forward_inputs = [{"action": torch.ones(2, 56)} for _ in range(3)]
+    rollout_result.transition_ids = [
+        RolloutTransitionIdentity(
+            lifecycle_generation=2,
+            env_worker_rank=0,
+            stage_id=0,
+            sequence=sequence,
+        )
+        for sequence in range(4)
+    ]
+
+    state = worker.snapshot_rollout_stage()
+
+    assert len(state.rollout_results[0].rewards) == 2
+    assert len(state.rollout_results[0].dones) == 4
+    assert len(state.rollout_results[0].transition_ids) == 4
+
+
+def test_wan_worker_snapshot_rejects_missing_action_representation(monkeypatch):
+    worker = _make_wan_worker(monkeypatch)
+    rollout_result = worker.rollout_results[0]
+    rollout_result.actions = []
+    rollout_result.intervene_flags = []
+    rollout_result.forward_inputs = []
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "no complete continuous or model-input action representation.*"
+            "actions=0.*forward_inputs=0"
+        ),
+    ):
+        worker.snapshot_rollout_stage()
+
+
+def test_wan_worker_snapshot_rejects_divergent_pending_bootstrap(monkeypatch):
+    worker = _make_wan_worker(monkeypatch)
+    worker._resume_bootstraps[0] = worker._clone_env_output(
+        worker._current_env_outputs[0]
+    )
+    worker._resume_bootstraps[0].obs["states"].add_(1)
+
+    with pytest.raises(
+        ValueError,
+        match="pending bootstrap does not match the committed environment output",
+    ):
+        worker.snapshot_rollout_stage()
+
+
 def test_elastic_worker_snapshot_preserves_pending_transition_identity(monkeypatch):
     worker = _make_wan_worker(monkeypatch)
     identity = RolloutTransitionIdentity(
@@ -760,6 +1002,14 @@ def test_elastic_worker_snapshot_preserves_pending_transition_identity(monkeypat
     )
     worker._current_env_outputs[0].transition_id = identity
     worker._resume_bootstraps[0].transition_id = identity
+    worker.rollout_results[0].transition_ids = [
+        RolloutTransitionIdentity(
+            lifecycle_generation=2,
+            env_worker_rank=0,
+            stage_id=0,
+            sequence=0,
+        )
+    ]
 
     state = worker.snapshot_rollout_stage()
 

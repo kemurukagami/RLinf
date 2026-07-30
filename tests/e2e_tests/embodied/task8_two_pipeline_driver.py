@@ -445,6 +445,9 @@ def run_model_init_driver(args: argparse.Namespace) -> None:
                 "pipeline_namespace": launched.runtime.ray_namespace,
                 "candidate_mapping": registration["cluster_device_mappings"],
                 "candidate_dp_mapping": registration["cluster_dp_device_mappings"],
+                "generation_preemption_mode": registration[
+                    "generation_preemption_mode"
+                ],
                 "role_names": {
                     field: getattr(names, field)
                     for field in names.__dataclass_fields__
@@ -663,6 +666,9 @@ def run_generation_proof_driver(args: argparse.Namespace) -> None:
                 "pipeline_namespace": launched.runtime.ray_namespace,
                 "candidate_mapping": registration["cluster_device_mappings"],
                 "candidate_dp_mapping": registration["cluster_dp_device_mappings"],
+                "generation_preemption_mode": registration[
+                    "generation_preemption_mode"
+                ],
                 "role_names": {
                     field: getattr(names, field)
                     for field in names.__dataclass_fields__
@@ -753,11 +759,12 @@ def run_generation_proof_driver(args: argparse.Namespace) -> None:
                 policy_version=runner.global_step,
             )
             if iteration == 0:
-                ray.get(
-                    control_actor.wait_for_gate.remote(
-                        "allow_training", timeout_s=args.timeout_s
+                if role == "b":
+                    ray.get(
+                        control_actor.wait_for_gate.remote(
+                            "allow_b_training", timeout_s=args.timeout_s
+                        )
                     )
-                )
             _print_iteration_progress(
                 role=role,
                 iteration=iteration,
@@ -800,7 +807,8 @@ def run_generation_proof_driver(args: argparse.Namespace) -> None:
                 "message": (
                     f"{completed_iterations} linked RLix generation, batch-seal, "
                     "and GRPO training iterations passed; the first iteration "
-                    "included the gated cross-pipeline transfer. This is generation "
+                    "reused A's completed bundle, then used A's training request "
+                    "to pause and resume B. This is generation "
                     "proof, not the full Task 8 acceptance matrix."
                 ),
             },

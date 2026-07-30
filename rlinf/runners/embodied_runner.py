@@ -267,6 +267,7 @@ class EmbodiedRunner:
         with self.rlix_runtime.policy_sync_stage(
             expected_policy_version=self.global_step
         ) as stage:
+            self._on_rlix_policy_sync_stage_acquired()
             self._sync_rollout_weights()
             residencies = self._get_rlix_fixed_residencies(self.actor, self.rollout)
             stage.complete(
@@ -276,6 +277,9 @@ class EmbodiedRunner:
                     policy_version=self.global_step,
                 )
             )
+
+    def _on_rlix_policy_sync_stage_acquired(self) -> None:
+        """Hook invoked only after fixed policy-sync ownership is acquired."""
 
     def _sync_rollout_weights(self) -> None:
         """Run the existing all-rank actor/rollout collective pair."""
@@ -339,23 +343,29 @@ class EmbodiedRunner:
         """Train one sealed batch under fixed all-rank actor ownership."""
         from rlix_core.protocol.types import ACTOR_TRAIN_CLUSTER_NAME, Priority
 
-        actor_rollout_metrics = self.actor.compute_advantages_and_returns().wait()
+        consumed_policy_version = self.global_step
+        produced_policy_version = consumed_policy_version + 1
         with self.rlix_runtime.fixed_stage(
             cluster_name=ACTOR_TRAIN_CLUSTER_NAME,
             priority=Priority.ACTOR_TRAINING,
-            global_step=self.global_step,
+            global_step=consumed_policy_version,
         ) as stage:
+            actor_rollout_metrics = self.actor.compute_advantages_and_returns().wait()
             training_handle = self.actor.run_rlix_training(batch_receipt)
             actor_training_metrics = training_handle.wait()
+            # Publishing the version is part of the successful training
+            # transaction.  Policy sync must never depend on a caller remembering
+            # to update the actor's authoritative source-version stamp later.
+            self.actor.set_global_step(produced_policy_version).wait()
             residencies = self._get_rlix_fixed_residencies(self.actor)
             stage.complete(
                 self.rlix_runtime.fixed_residency_receipt(
                     cluster_name=ACTOR_TRAIN_CLUSTER_NAME,
                     worker_residencies=residencies,
-                    policy_version=self.global_step,
+                    policy_version=produced_policy_version,
                 )
             )
-        self.global_step += 1
+        self.global_step = produced_policy_version
         return actor_rollout_metrics, actor_training_metrics, training_handle
 
     def evaluate(self):

@@ -99,6 +99,7 @@ class ElasticCollectionSession:
     active_dp_ranks: set[int] = field(default_factory=set)
     released_dp_ranks: set[int] = field(default_factory=set)
     completed_dp_ranks: set[int] = field(default_factory=set)
+    reserved_dp_ranks: set[int] = field(default_factory=set)
     actor_receiver_handle: Any = None
     generation_owned: bool = False
     batch_receipt: ElasticBatchReceipt | None = None
@@ -116,6 +117,7 @@ class RegisteredRLixPipeline:
     ray_namespace: str
     placement_plan: RLixPlacementPlan
     operation_timeout_s: float = 300.0
+    retain_training_overlap: bool = False
     _closed: bool = field(default=False, init=False, repr=False)
     _stage_state: RunnerStageState = field(
         default=RunnerStageState.INACTIVE, init=False, repr=False
@@ -191,6 +193,13 @@ class RegisteredRLixPipeline:
             tracker=tracker,
             cluster_id=cluster_id,
         )
+        if self.retain_training_overlap:
+            training_devices = set(self.placement_plan.actor_train_devices)
+            session.reserved_dp_ranks = {
+                rank
+                for rank, bundle in self.placement_plan.actor_infer_bundles
+                if training_devices & set(bundle)
+            }
         self._stage_state = RunnerStageState.ELASTIC_COLLECTION
         self._collection = session
         try:
@@ -237,7 +246,10 @@ class RegisteredRLixPipeline:
 
     def _publish_collection_progress(self, session: ElasticCollectionSession) -> None:
         snapshot = session.tracker.snapshot(
-            active_dp_ranks=set(session.active_dp_ranks)
+            active_dp_ranks=set(session.active_dp_ranks),
+            reserved_dp_ranks=set(
+                session.reserved_dp_ranks & session.completed_dp_ranks
+            ),
         )
         _call_sync(
             self.scheduler,
@@ -346,10 +358,15 @@ class RegisteredRLixPipeline:
                     if env_metrics is not None:
                         session.final_env_metrics[observation.dp_rank] = env_metrics
         session.active_dp_ranks = callback_active
+        session.completed_dp_ranks.update(completed)
         self._publish_collection_progress(session)
         session.released_dp_ranks.update(completed - callback_active)
         to_release = tuple(
-            sorted((completed & session.active_dp_ranks) - session.released_dp_ranks)
+            sorted(
+                (completed & session.active_dp_ranks)
+                - session.released_dp_ranks
+                - session.reserved_dp_ranks
+            )
         )
         if to_release:
             _call_sync(
@@ -363,7 +380,6 @@ class RegisteredRLixPipeline:
             session.active_dp_ranks.difference_update(to_release)
             session.released_dp_ranks.update(to_release)
             self._publish_collection_progress(session)
-        session.completed_dp_ranks.update(completed)
         if session.released_dp_ranks == {rank for rank, _ in session.assignments}:
             session.generation_owned = False
         return completed == {rank for rank, _ in session.assignments}
@@ -382,8 +398,15 @@ class RegisteredRLixPipeline:
             raise RuntimeError("collection session is not active")
         if session.completed_dp_ranks != set(expected_ranks):
             raise RuntimeError("collection cannot seal before every rank completes")
-        if session.active_dp_ranks or session.generation_owned:
-            raise RuntimeError("collection cannot seal while generation is owned")
+        retained = session.reserved_dp_ranks & session.completed_dp_ranks
+        if session.active_dp_ranks != retained:
+            raise RuntimeError(
+                "collection can retain only completed ranks reserved for actor training"
+            )
+        if bool(retained) != session.generation_owned:
+            raise RuntimeError(
+                "collection generation ownership does not match retained ranks"
+            )
         if session.batch_receipt is not None:
             raise RuntimeError("collection is already sealed")
         try:
@@ -425,17 +448,16 @@ class RegisteredRLixPipeline:
                 ),
                 transition_count=sum(receipt.transition_count for receipt in receipts),
             )
-            _call_sync(
-                self.scheduler,
-                "clear_progress",
-                pipeline_id=self.pipeline_id,
-            )
         except BaseException:
             self._stage_state = RunnerStageState.FAILED_UNCERTAIN
             raise
         session.batch_receipt = aggregate
-        self._collection = None
-        self._stage_state = RunnerStageState.INACTIVE
+        if retained:
+            self._stage_state = RunnerStageState.SEALED_COLLECTION
+        else:
+            _call_sync(self.scheduler, "clear_progress", pipeline_id=self.pipeline_id)
+            self._collection = None
+            self._stage_state = RunnerStageState.INACTIVE
         return aggregate
 
     def fixed_residency_receipt(
@@ -486,6 +508,12 @@ class RegisteredRLixPipeline:
             expected = expected_by_cluster[cluster_name]
         except KeyError as exc:
             raise ValueError(f"unsupported fixed cluster {cluster_name!r}") from exc
+        version_is_required = cluster_name in {
+            POLICY_SYNC_CLUSTER_NAME,
+            ACTOR_TRAIN_CLUSTER_NAME,
+        }
+        if version_is_required and policy_version is None:
+            raise ValueError(f"{cluster_name!r} residency requires a policy version")
         observed: dict[str, list[int]] = {}
         for status in worker_residencies:
             if not isinstance(status, FixedWorkerResidency):
@@ -499,12 +527,14 @@ class RegisteredRLixPipeline:
                 raise RuntimeError(
                     f"{status.component} rank {status.rank} remains GPU-resident"
                 )
-            if (
-                cluster_name == POLICY_SYNC_CLUSTER_NAME
-                and status.policy_version != policy_version
-            ):
+            if version_is_required and status.policy_version != policy_version:
+                version_role = (
+                    "produced"
+                    if cluster_name == ACTOR_TRAIN_CLUSTER_NAME
+                    else "applied"
+                )
                 raise ValueError(
-                    f"{status.component} rank {status.rank} applied policy version "
+                    f"{status.component} rank {status.rank} {version_role} policy version "
                     f"{status.policy_version}, expected {policy_version}"
                 )
         normalized = {
@@ -558,7 +588,11 @@ class RegisteredRLixPipeline:
     ) -> tuple[int, ...]:
         if self._closed or self._stage_state == RunnerStageState.CLOSED:
             raise RuntimeError("RLix runtime is closed")
-        if self._stage_state != RunnerStageState.INACTIVE:
+        sealed_transition = (
+            self._stage_state == RunnerStageState.SEALED_COLLECTION
+            and cluster_name == ACTOR_TRAIN_CLUSTER_NAME
+        )
+        if self._stage_state != RunnerStageState.INACTIVE and not sealed_transition:
             raise RuntimeError(
                 f"cannot begin fixed stage while runtime is {self._stage_state.value}"
             )
@@ -577,15 +611,49 @@ class RegisteredRLixPipeline:
         cluster_id = f"{self.pipeline_id}_{cluster_name}"
         self._stage_state = state
         try:
-            granted = _call_sync(
-                self.scheduler,
-                "request_gpus",
-                cluster_id=cluster_id,
-                priority=priority,
-                global_step=global_step,
-            )
+            if sealed_transition:
+                session = self._collection
+                if session is None or session.batch_receipt is None:
+                    raise RuntimeError(
+                        "sealed collection transition is missing its batch receipt"
+                    )
+                retained = session.active_dp_ranks & session.reserved_dp_ranks
+                if not retained:
+                    raise RuntimeError(
+                        "sealed collection transition has no retained generation ranks"
+                    )
+                granted = _call_sync(
+                    self.scheduler,
+                    "release_dp_ranks_then_request_gpus",
+                    release_cluster_id=session.cluster_id,
+                    release_ranks=tuple(sorted(retained)),
+                    release_global_step=session.context.policy_version,
+                    request_cluster_id=cluster_id,
+                    request_priority=priority,
+                    request_global_step=global_step,
+                    timeout_s=self.operation_timeout_s,
+                )
+                session.active_dp_ranks.difference_update(retained)
+                session.released_dp_ranks.update(retained)
+                session.generation_owned = False
+                _call_sync(
+                    self.scheduler, "clear_progress", pipeline_id=self.pipeline_id
+                )
+                self._collection = None
+            else:
+                granted = _call_sync(
+                    self.scheduler,
+                    "request_gpus",
+                    cluster_id=cluster_id,
+                    priority=priority,
+                    global_step=global_step,
+                )
         except BaseException:
-            self._stage_state = RunnerStageState.INACTIVE
+            self._stage_state = (
+                RunnerStageState.FAILED_UNCERTAIN
+                if sealed_transition
+                else RunnerStageState.INACTIVE
+            )
             raise
         granted_tuple = tuple(sorted(granted))
         if len(granted_tuple) != len(set(granted_tuple)):
@@ -872,6 +940,7 @@ async def bootstrap_registered_rlix_pipeline(
         ray_namespace=ray_namespace,
         placement_plan=placement_plan,
         operation_timeout_s=operation_timeout_s,
+        retain_training_overlap=True,
     )
 
 

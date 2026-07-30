@@ -2,17 +2,26 @@
 
 ## 1. Status and source of truth
 
-Status: in progress. T0-T7 are implemented and have focused CPU coverage. The
-first T8 implementation slice now freezes the dependency-light run, event,
-transition, allocation, GPU-sample, and utilization schemas and provides CPU
-validators/analyzers for manifest normalization, tolerance comparison,
-exclusive ownership, direct-sample integration, and paired throughput gates.
-T8 is not complete: the local-Ray process-isolation proof now starts two
-independent clients against one detached `rlix-core` scheduler, but no recorded
-run has yet driven real Wan/OpenSora workers through composite-bundle transfer,
-resumed the interrupted shard, and demonstrated a utilization improvement.
+Status: in progress, updated 2026-07-30. T0-T7 are implemented and have focused
+CPU coverage. T8 now has an executable two-OS-driver harness, shared detached
+control plane, real Wan model initialization, real generation instrumentation,
+safe-point drain/resume evidence, sealed-batch evidence, a single-pipeline
+control, and a ten-iteration two-pipeline workload. Successive accelerator
+debug runs have reached real policy inference, Wan diffusion/reward, chunk
+commit, drain-barrier, snapshot/offload, completed-rank release, batch sealing,
+and GRPO stage boundaries, exposing and localizing several production and
+acceptance-contract defects recorded below. T8 is not complete: no single
+recorded two-driver run has yet completed the full linked ten-iteration
+generation/training proof, the newly implemented training-triggered
+interruption policy still needs real-GPU proof, and the Wan/OpenSora reference/
+recovery/utilization matrices have not passed. A 2026-07-30 run completed five linked
+generation/training iterations per driver and entered lifecycle 6 before an
+absolute harness timeout; this is substantial partial evidence, not T8
+acceptance, because it did not complete ten iterations or exercise preemption
+and resume.
 
-Implementation progress (2026-07-24):
+Implementation progress (through 2026-07-30; the dated entries below are an
+append-only evidence ledger):
 
 - `tests/e2e_tests/embodied/task8_acceptance_support.py` contains the frozen
   schema version, fail-closed event sink, deterministic CPU tensor manifests,
@@ -424,6 +433,11 @@ documentation decision after acceptance.
 - Collocated width-one rollout/environment bundles.
 - Scheduler-driven active shrink, safe-point pause, exact-rank resume, and
   completed-rank release.
+- Stage-aware completed-rank reservation: non-training-overlapping bundles are
+  released immediately, while an overlapping completed bundle remains
+  resident and owned until the batch is sealed.
+- Atomic retained-generation shrink plus fixed actor-training enqueue in one
+  scheduler cycle, with no lower-priority generation allocation interposed.
 - Real fixed initialization, policy synchronization, collection, batch seal,
   actor training, and cleanup.
 - An uninterrupted reference, a forced preemption/recovery case, and a matched
@@ -463,6 +477,9 @@ The acceptance command fails, rather than skips or weakens assertions, when:
 - event streams are incomplete, duplicated, or not monotonically ordered;
 - reference manifests cannot be compared;
 - either pipeline fails to seal or train a complete batch;
+- a reserved rank is not simultaneously active, completed, canonically owned,
+  and overlapping the declared next fixed stage;
+- B acquires the retained training bundle before A's sealed-batch transition;
 - post-release or final residency cannot be verified; or
 - required utilization repetitions do not meet the declared threshold.
 
@@ -947,9 +964,11 @@ logical trajectories, environment state, video work, and maximum model/environme
 interaction volume per collection.
 
 `generation-proof-only` executes ten linked collections and GRPO actor updates
-per pipeline. The first iteration retains the deterministic A-to-B-to-A
-preemption gates; after both first updates complete, iterations 2 through 10
-use normal shared scheduler arbitration. Each later collection synchronizes the
+per pipeline. The first iteration deterministically waits for A rank 0 to
+complete and release `(0, 2)`, runs useful B generation on that bundle, and then
+uses A's sealed-batch actor-training request to pause and resume B. After both
+first updates complete, iterations 2 through 10 use normal stage-aware shared
+scheduler arbitration. Each later collection synchronizes the
 policy produced by the preceding update before requesting generation. It does
 not execute the one warmup plus five measured utilization repetitions, which
 belong to the later full Task 8 acceptance matrix. With two pipelines, the proof
@@ -982,6 +1001,12 @@ not change transition, safe-point, or completion semantics.
 
 The acceptance-control actor owns the following deterministic gates:
 
+> **Gate compatibility note:** the control actor retains the old forced-
+> preemption gate names for the dependency-light recovery smoke, but the real
+> generation-proof orchestrator uses the completed-rank and per-role training
+> gates defined in Section 10. Generation demand no longer drains incomplete A
+> work in the RLinf scheduling mode.
+
 ```text
 both_drivers_initialized
 allow_b_policy_sync
@@ -992,18 +1017,20 @@ allow_a_collection
 a_generation_granted
 a_target_bootstrap_dispatched
 a_target_chunk_started
+a_target_rank_completed
 allow_b_collection
 b_generation_requested
-a_target_drain_requested
-a_target_chunk_committed
-a_target_snapshot_offloaded
 transfer_to_b_observed
 b_useful_work_observed
-allow_b_release
-b_release_observed
-a_resume_observed
-allow_training
-both_batches_sealed
+a_batch_sealed
+allow_a_training
+a_training_started
+a_training_completed
+b_resume_observed
+b_batch_sealed
+allow_b_training
+b_training_started
+b_training_completed
 both_training_completed
 ```
 
@@ -1022,33 +1049,33 @@ The expected pipeline interaction is:
     ownership and reports `policy_synchronized`.
 6.  Driver A enters production collection. The scheduler grants A both
     actor-infer bundles. A rank 0 owns `(0, 2)`; A rank 1 owns `(1, 3)`.
-7.  A rank 0 runs real Wan bootstrap, assigns the initial transition identity,
-    and awaits `_send_elastic_observation()`. Only after the production channel
-    send completes does its recording worker emit `bootstrap_dispatched` for
-    bundle `(0, 2)`. Recording before the awaited send is forbidden because it
-    could release the gate while bootstrap is blocked or has failed.
-8.  The orchestrator releases B collection demand after the acknowledged A
-    rank 0 bootstrap dispatch. A rank 1 remains eligible/productive and B does
-    not rerun fixed policy sync at this point. Later `policy_request_completed`,
-    `chunk_started`, and `chunk_committed` evidence remains required to prove
-    real policy inference and environment advancement; bootstrap dispatch alone
-    is a scheduling milestone, not final generation success.
-9.  RLix requests shrink of A rank 0. A rank 0 must emit `drain_requested`
-    before the current chunk finishes, then `chunk_committed` exactly once.
-10. A retains the next bootstrap, snapshots rank 0 continuation state to CPU,
-    offloads rollout and environment residency for bundle `(0, 2)`, and only
-    then allows the scheduler callback to return.
-11. The scheduler emits `release_committed` for A rank 0 bundle `(0, 2)`.
-12. The scheduler emits `allocation_committed` for B on the exact same bundle
-    `(0, 2)`. B emits at least one real useful model-work event on that bundle.
-13. B safely releases enough generation ownership for A to resume.
-14. A reacquires rank 0 on `(0, 2)`, validates the same-rank pause token,
-    onloads rollout and environment state, restores the CPU snapshot, and
-    emits one `resumed_bootstrap_dispatched` for the retained transition.
-15. A and B each complete a bounded collection, seal complete single-version
-    batches, and only then enter production fixed actor training.
-16. After training, both runtimes release fixed ownership, verify final
-    offload, unregister, close workers, and persist events/results.
+7.  A rank 0 completes its assigned trajectories naturally, reports durable
+    `COMPLETED`, and releases `(0, 2)` through completion-aware selected-rank
+    release. This offloads both peers without creating a pause token.
+8.  The orchestrator releases B collection demand. In `fixed_stage_only` mode,
+    B may acquire `(0, 2)` after A's release commit but cannot drain A rank 1.
+9.  B emits real policy or chunk work on `(0, 2)`. Meanwhile A finishes rank 1,
+    releases it, validates the aggregate actor receipt, and emits runner-level
+    `batch_sealed`.
+10. Only after both B useful work and A seal are observed does the orchestrator
+    release A to call `_train_rlix_batch()`. Its `ACTOR_TRAINING` request needs
+    GPU 0 and therefore drains B's atomic rank 0 bundle `(0, 2)` at the next
+    safe chunk boundary. A does not directly request a B drain.
+11. B commits the current chunk exactly once, snapshots its retained
+    continuation, offloads both peers, and returns the callback. Scheduler
+    ownership transfers to A's fixed actor-training allocation only afterward.
+12. A computes GRPO values, completes its actor update, offloads fixed state,
+    and releases GPU 0. A then waits instead of starting iteration 2.
+13. B's paused rank receives expansion preference, reacquires `(0, 2)`, validates
+    its same-rank token/policy, restores, and dispatches the retained bootstrap
+    exactly once.
+14. B completes and seals its own batch. The orchestrator then permits B actor
+    training. Both first updates must complete before either driver advances.
+15. Iterations 2 through 10 repeat normal stage-aware arbitration without the
+    first-iteration gates: completion-released bundles feed competing
+    generation, and fixed training requests preempt only overlapping bundles.
+16. After ten updates, both runtimes release ownership, verify final offload,
+    unregister, close workers, and persist events/results.
 ```
 
 Shrink completion-race semantics:
@@ -1431,7 +1458,7 @@ Record both recursive logical tensor bytes and encoded snapshot bytes. Assert:
 The real report lists current observation, image/latent queue, action
 conditioning, partial trajectory, and other dominant fields separately.
 
-## 10. Forced preemption, reuse, and resume scenario
+## 10. Training-readiness preemption, reuse, and resume scenario
 
 ### 10.1 Preparation
 
@@ -1451,26 +1478,33 @@ conditioning, partial trajectory, and other dominant fields separately.
 
 ### 10.2 Trigger
 
-Select rank 0 by default. Hold the acceptance gate until its real world-model
-worker emits `chunk_started(transition n)`. Immediately allow already-synced B
-to enter `_collect_rlix_rollouts()` (or the equivalent production collection
-stage API) without repeating policy sync. Record B's `actor_infer` request
-enqueue. After sealing, B still trains through `_train_rlix_batch()` and the
-normal fixed actor-training stage; the acceptance driver does not bypass any
-T7 allocation or batch barrier.
+Allow A to collect on both ranks until one rank completes its assigned
+trajectories naturally. A reports that rank in `completed_dp_ranks` and invokes
+the completion-aware selected-rank release. Only after callback-verified
+offload and scheduler release commit may already-synchronized B enter
+`_collect_rlix_rollouts()` and acquire that idle bundle. B's generation request
+alone must not drain A's other active, incomplete generation rank.
 
-The configured chunk must be long enough for the drain request to become
-observable during diffusion. If the chunk commits before `drain_requested`,
-the repetition is invalid and must be rerun with a production-valid longer
-diffusion setting or additional environments; do not add a sleep inside
-`chunk_step()` and call it real-model timing.
+When A's remaining rank also completes, A validates and seals its complete CPU
+batch and submits the normal fixed `ACTOR_TRAINING` request. That pending fixed
+request is the authoritative training-readiness signal. The scheduler drains
+only B generation bundles that overlap A's fixed training mapping, at the
+existing world-model chunk safe point. For the four-GPU test, actor training
+uses GPU 0, so B rank 0's atomic `(0, 2)` bundle is drained even though GPU 2
+is not used by the trainer; B rank 1 on `(1, 3)` may continue. A production
+all-GPU FSDP mapping would drain both B bundles.
+
+The acceptance driver must not infer training readiness from trajectory counts
+alone or bypass batch sealing, reward resolution, advantage calculation, or
+the T7 fixed-stage API.
 
 ### 10.3 Shrink acceptance
 
-Require:
+For the training-triggered B shrink, require:
 
-- only selected A rank(s) receive drain;
-- an unselected A sibling commits later work while the selected rank drains;
+- A's naturally completed rank was released without creating a pause token;
+- B generation demand did not evict A's incomplete sibling;
+- only B rank(s) overlapping A's fixed training request receive drain;
 - the current real chunk commits exactly once;
 - no next observation is sent before pause;
 - peer safe-point tokens match;
@@ -1481,24 +1515,30 @@ Require:
 
 ### 10.4 Competing reuse acceptance
 
-Require B to acquire the exact released GPU set, first through any required
-fixed sync ownership and then for real collection work. At least one recorded
-B VLA prediction or Wan/OpenSora chunk must execute on that bundle while A's
-selected rank remains paused.
+Require B to acquire the exact bundle voluntarily released by A's completed
+rank and perform at least one recorded VLA prediction or Wan/OpenSora chunk
+while A's sibling continues. When A later requests training, B must retain any
+non-overlapping bundle and safely pause/offload each overlapping bundle before
+A's fixed allocation commits.
 
 Logical trace slices and physically resident process intervals must not overlap
 between A and B on the transferred GPUs.
 
 ### 10.5 Resume acceptance
 
-Allow B to complete/release enough work for A to become eligible. Require A to
-expand the same canonical rank on the same registered bundle, validate the
-stored token and policy version, onload both peers, restore, and dispatch the
-retained bootstrap once.
+After A trains, offloads, and releases fixed ownership, give B's paused
+resumable rank preference over A's new collection demand. Require B to expand
+the same canonical rank on the same registered bundle, validate the stored
+token and policy version, onload both peers, restore, and dispatch the retained
+bootstrap once.
 
-A then completes all assigned work. Both A and B must release every elastic
-rank, seal a complete batch, train only after the seal, verify fixed offload,
-return inactive, unregister, and close.
+B then completes its assigned work and may request its own fixed actor-training
+stage, symmetrically interrupting overlapping generation from A's next
+collection. Both pipelines must release every elastic rank, seal complete
+batches, train only after their own seals, verify fixed offload, return
+inactive, unregister, and close. Equal-priority training requests require
+deterministic FIFO arbitration, and a just-trained pipeline must not starve
+older resumed work by immediately starting a new collection.
 
 ## 11. Utilization experiment and thresholds
 
@@ -2362,8 +2402,8 @@ The two-driver generation proof now composes the same Wan workload used by the
 single-pipeline control: 16 total environments, two environment DP ranks,
 eight environments and one group per rank, GRPO group size 8, rollout epoch 1,
 256 primitive steps per trajectory, five Wan diffusion steps, and ten linked
-training iterations per driver. The first iteration remains explicitly gated
-to prove the required transfer and resume. After both first actor updates,
+training iterations per driver. The first iteration is explicitly gated to
+prove completed-rank reuse followed by training-triggered B pause/resume. After both first actor updates,
 iterations 2 through 10 synchronize the preceding policy and run through normal
 shared scheduler arbitration.
 
@@ -2429,6 +2469,165 @@ RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
   2>&1 | tee /tmp/task8-generation-proof/generation-proof-zero-reward-videos-1.console.log
 ```
 
+### 19.12 End-to-end progress and target arbitration correction (2026-07-29)
+
+The end-to-end effort has progressed beyond connectivity and model-init smoke.
+Two independent model-bearing processes have cold-initialized and offloaded on
+the four-GPU host while sharing one detached scheduler. Successive two-driver
+generation runs have executed real OpenVLA policy calls and Wan environment
+chunks and have exercised scheduler shrink entry, paired worker observation,
+drain-barrier routing, continuation snapshot construction, offload diagnostics,
+completed-rank release, aggregate batch sealing, and GRPO boundaries. These
+runs exposed real defects rather than producing acceptance passes: transient
+peer-state skew, hidden `FAILED_RESIDENT` causes, an unconfigured observer,
+strict event-vocabulary rejection, BF16 evidence encoding, unsafe live-result
+normalization, global-versus-local barrier cardinality, paired-task exception
+propagation, result-boundary accounting, aggregate seal semantics, and stale
+completed-rank release. Each repaired boundary remains fail-closed and has
+focused regression coverage.
+
+The single-pipeline Wan control completed through production generation and
+training without cross-pipeline preemption. It demonstrated that unsuccessful
+trajectories are legal RL samples: the production runner can seal them,
+calculate finite GRPO values, and complete an optimizer boundary even when a
+uniform group supplies no useful relative-policy gradient. The diagnostic now
+retains sealed CPU batches, reward summaries, videos, metrics, and terminal
+logs. This isolates the remaining two-driver failures from the baseline Wan
+pipeline and prevents zero task success from being misclassified as lifecycle
+failure.
+
+The current two-pipeline workload is 16 environments, two DP ranks, one
+eight-trajectory GRPO group per rank, five Wan diffusion steps per chunk, up to
+256 primitive environment steps per trajectory, inclusive reward-filter bounds
+covering the full binary reward range, video recording, streamed and retained
+driver logs, switchable phase diagnostics, and ten linked collections and
+actor updates per driver. Acceptance identity and terminal-event uniqueness
+are policy-version-aware. The focused regression set at that checkpoint
+reported 94 passing tests, and focused Ruff lint and formatting checks passed.
+These are code-level results, not accelerator acceptance.
+
+The intended scheduler interaction is now clarified as stage-aware rather than
+unrestricted generation-demand rebalancing:
+
+```text
+A generation rank completes naturally
+  -> A reports durable completion and releases that exact bundle
+  -> B may start generation on the idle bundle while A's sibling continues
+  -> A completes its collection, seals its batch, and requests actor training
+  -> the higher-priority training request drains only overlapping B bundles
+  -> A trains, offloads, and releases
+  -> B's paused ranks receive restoration preference and resume
+  -> the same cycle may later occur with A and B reversed
+```
+
+Generation demand may consume idle or completion-released bundles but must not,
+by itself, evict another pipeline's active incomplete generation. A sealed-batch
+fixed-stage request may preempt overlapping generation at a safe point. The
+pending `ACTOR_TRAINING` request, not `completed == target` inferred by the
+scheduler, is the authoritative readiness signal because reward resolution,
+batch validation, and sealing occur between trajectory completion and training.
+After the fixed stage, paused work should be restored before new collection
+demand to avoid churn and starvation.
+
+This corrects the original first-iteration acceptance choreography, which
+deliberately submitted B generation demand during A's active chunk to force an
+A-to-B-to-A pause. That choreography remains a lower-level safe-point recovery
+test. Core registration now defaults legacy callers to `gap_ratio`, while RLinf
+registers `fixed_stage_only`; its generation demand cannot select active donors,
+fixed generation-priority policy sync waits for availability, actor training
+retains higher-priority overlapping-bundle reclaim, and paused ranks are
+preferred when resources return. The ten-iteration harness now waits for A's
+completed rank before B demand and uses A training to interrupt B. This code is
+covered by focused regressions but still requires a clean real-GPU run. No
+completed two-driver generation proof, utilization improvement, or OpenSora
+acceptance is recorded yet.
+
+### 19.13 Five-iteration two-pipeline partial proof and timeout finding (2026-07-30)
+
+The two-driver run `generation-proof-dormant-lifecycle-fix-1` used the
+four-GPU disaggregated Wan workload and completed five full linked lifecycles
+per pipeline before termination. Its artifact root is:
+
+```text
+/tmp/task8-generation-proof/generation-proof-dormant-lifecycle-fix-1
+```
+
+The single 3,600-second harness deadline started at run creation, before cold
+model initialization. The run was created at 15:39:24 UTC, both drivers were
+ready at 15:43:51, work was released at 15:48:09, and the harness terminated it
+at 16:39:25 while lifecycle 6 was active. The terminal
+`pair_failure.json` contains `timed out waiting for driver a result.json`.
+This is an orchestration-policy timeout: no worker or scheduler failure was
+observed before termination. In particular, the event stream contains zero
+callback, world-model onload, diffusion, reward, and barrier-send failures.
+Pipeline B emitted 1,232 events and committed 61 lifecycle-6 Wan chunks in the
+last five minutes, demonstrating that the run was progressing rather than
+deadlocked.
+
+Completed aggregate evidence is:
+
+- five completed iterations per pipeline, ten total;
+- 16 trajectories and 66 transition records per sealed batch;
+- 160 completed trajectories and 660 transition records total;
+- ten sealed batches, ten actor-training calls, and twenty completed rank runs;
+- approximately 295.1 MiB of logical actor batch data per iteration;
+- approximately 3.2 completed trajectories per minute over completed work;
+- six policy syncs per pipeline: initial version 0 and versions 1 through 5;
+- five of ten optimizer updates with nonzero gradients.
+
+The per-iteration learning evidence is:
+
+| Pipeline | Iteration | recorded `success_once` | GRPO reward | Grad norm | Total loss |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A | 1 | 0/16 | 0.000000 | 0.000 | 0.000000 |
+| A | 2 | 9/16 | 0.016071 | 34.166 | 0.003793 |
+| A | 3 | 0/16 | 0.000000 | 0.000 | 0.000000 |
+| A | 4 | 0/16 | 0.000000 | 0.000 | 0.000000 |
+| A | 5 | 9/16 | 0.018204 | 79.137 | 0.006605 |
+| B | 1 | 1/16 | 0.001248 | 34.707 | 0.004411 |
+| B | 2 | 8/16 | 0.013477 | 0.000 | 0.000000 |
+| B | 3 | 1/16 | 0.001230 | 19.050 | 0.002504 |
+| B | 4 | 0/16 | 0.000000 | 0.000 | 0.000000 |
+| B | 5 | 12/16 | 0.028958 | 25.182 | 0.002471 |
+
+`success_once` is a recorded world-model metric, not independently verified
+visual task success. Zero-gradient rows are valid completed GRPO optimizer
+boundaries when the group supplies no usable relative advantage; they are not
+lifecycle failures.
+
+This run repeatedly proves collection, batch seal, actor-training acquisition,
+optimizer completion, actor policy publication from `N` to `N+1`, rollout
+policy synchronization, fixed-stage release, and next-lifecycle admission.
+Both pipelines published and synchronized version 5 and opened lifecycle 6.
+It also exercises the dormant lifecycle rule: an offloaded canonical rank may
+remain `COMPLETED(N)` while the pipeline opens collection `N+1`, contributes no
+current progress, and is prepared with exact `N+1` lifecycle and policy
+identity before onload.
+
+The proof boundary is intentionally narrower than T8 completion. The run has
+no drain, continuation snapshot, or resume events, so it does not demonstrate
+the required training-triggered safe-point interruption and recovery. It also
+does not demonstrate ten completed iterations per pipeline, reference
+equivalence, a material utilization gain, or OpenSora. Because the harness
+terminated the drivers, it emitted no terminal `summary.json`, driver
+`result.json`, or final acceptance report. The retained central
+`core/events.jsonl`, driver stdout/stderr logs, and twenty videos provide
+normalized execution evidence, but no raw reloadable `.pt` trajectory tensors
+were saved.
+
+Timeout handling must distinguish slow startup from a stalled workload. The
+target harness policy is a 1,800-second startup deadline, a 1,200-second stall
+deadline refreshed by meaningful lifecycle/model events, and a 14,400-second
+overall safety ceiling. Until those independent clocks are implemented, the
+next run should use `--timeout-s 10800`. This only prevents premature
+termination; it does not relax any correctness, interruption, utilization, or
+acceptance gate.
+
+Post-fix regression baselines are 347 passed with two skipped tests for the
+broad RLinf RLix suite and 129 passed with one skipped test for `rlix-core`.
+Ruff and diff checks pass. T8 remains in progress and the definition of done
+below is unchanged.
+
 ## 20. Definition of done
 
 T8 and the T0-T8 project are complete only when all of the following are true:
@@ -2439,21 +2638,25 @@ T8 and the T0-T8 project are complete only when all of the following are true:
   actor or channel name collision.
 - Both register at least two exact canonical actor-infer bundles whose
   candidate physical GPU IDs intentionally overlap across pipelines.
-- Pipeline A initially activates at least two whole bundles.
-- Pipeline B's demand is emitted after a selected A rank starts a real Wan or
-  OpenSora diffusion chunk and before that chunk commits.
-- The chunk commits exactly once before snapshot/offload and callback success.
-- A productive A sibling continues while the selected rank drains.
-- Both selected peers snapshot/offload and prove non-residency before core
-  release commit.
-- The complete exact bundle transfers A to B with no logical or physical
-  ownership overlap.
-- B performs useful real-model work on the transferred bundle.
-- B releases safely and A later expands the same canonical rank on its exact
-  registered bundle.
-- A validates/restores the same-rank snapshot and dispatches the retained next
-  transition exactly once.
-- Interrupted A matches its uninterrupted reference for transition order,
+- Pipeline A initially activates at least two whole bundles, and one rank
+  completes its assigned trajectories naturally while its sibling continues.
+- A's completed rank publishes durable completion and releases its exact bundle
+  without a pause token; callback success and verified non-residency precede
+  core release commit.
+- Pipeline B acquires that completion-released bundle with no logical or
+  physical ownership overlap and performs useful real-model work on it.
+- B's generation request does not evict A's active incomplete sibling.
+- A's remaining rank completes, A seals a complete batch, and only its pending
+  fixed actor-training request triggers shrink of overlapping B generation.
+- Affected B chunks commit exactly once before matching snapshot/offload and
+  callback success; non-overlapping B siblings remain productive.
+- After A training and fixed release, B expands the same paused canonical rank
+  on its exact registered bundle, validates/restores its same-rank snapshot,
+  and dispatches the retained next transition exactly once.
+- Paused resumable work is preferred over a just-trained pipeline's new
+  collection, and equal-priority training requests have deterministic fair
+  ordering.
+- Interrupted B matches its uninterrupted reference for transition order,
   trajectory counts, policy versions, rewards, done/reset state, observations,
   metrics, and Wan/OpenSora final conditioning state within declared tolerances.
 - Both pipelines seal one complete lifecycle/version-consistent batch before

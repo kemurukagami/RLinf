@@ -610,6 +610,7 @@ def test_model_init_ready_pair_requires_offloaded_residencies() -> None:
             "pipeline_namespace": f"namespace-{role}",
             "candidate_mapping": {"actor_infer": [0, 1, 2, 3]},
             "candidate_dp_mapping": {"actor_infer": {"0": [0, 2], "1": [1, 3]}},
+            "generation_preemption_mode": "fixed_stage_only",
             "role_names": {"actor": f"actor-{role}"},
             "runtime_state": "inactive",
             "actor_infer_bundles": [[0, 2], [1, 3]],
@@ -618,6 +619,10 @@ def test_model_init_ready_pair_requires_offloaded_residencies() -> None:
 
     pair = {role: ready(role) for role in ("a", "b")}
     validate_driver_ready_pair(pair)
+    incompatible = {role: ready(role) for role in ("a", "b")}
+    incompatible["b"]["generation_preemption_mode"] = "gap_ratio"
+    with pytest.raises(ValueError, match="stage-aware generation"):
+        validate_driver_ready_pair(incompatible)
     pair["b"]["residencies"][0]["model_resident"] = True
     pair["b"]["residencies"][0]["safe_to_release"] = False
     with pytest.raises(ValueError, match="accelerator-resident"):
@@ -1672,6 +1677,12 @@ def test_acceptance_control_tracks_generation_proof_gates(tmp_path: Path) -> Non
     )
     control.record_event(
         _event(
+            event="rank_completed",
+            producer_sequence=3,
+        )
+    )
+    control.record_event(
+        _event(
             event="generation_requested",
             producer_sequence=1,
             component="runner",
@@ -1740,7 +1751,7 @@ def test_acceptance_control_tracks_generation_proof_gates(tmp_path: Path) -> Non
     )
     control.record_event(
         _event(
-            event="training_completed",
+            event="training_started",
             producer_sequence=4,
             component="runner",
             dp_rank=None,
@@ -1751,7 +1762,29 @@ def test_acceptance_control_tracks_generation_proof_gates(tmp_path: Path) -> Non
     control.record_event(
         _event(
             event="training_completed",
+            producer_sequence=5,
+            component="runner",
+            dp_rank=None,
+            transition_identity=None,
+            gpu_ids=(),
+        )
+    )
+    control.record_event(
+        _event(
+            event="training_started",
             producer_sequence=4,
+            driver_role="b",
+            pipeline_id="rlinf_b123456789ab",
+            component="runner",
+            dp_rank=None,
+            transition_identity=None,
+            gpu_ids=(),
+        )
+    )
+    control.record_event(
+        _event(
+            event="training_completed",
+            producer_sequence=5,
             driver_role="b",
             pipeline_id="rlinf_b123456789ab",
             component="runner",
@@ -1765,13 +1798,20 @@ def test_acceptance_control_tracks_generation_proof_gates(tmp_path: Path) -> Non
     assert control.gate_status()["a_policy_sync_completed"] is True
     assert control.gate_status()["a_generation_requested"] is True
     assert control.gate_status()["a_generation_granted"] is True
+    assert control.gate_status()["a_target_rank_completed"] is True
     assert control.gate_status()["b_generation_requested"] is True
     assert control.gate_status()["transfer_to_b_observed"] is True
     assert control.gate_status()["both_batches_sealed"] is True
+    assert control.gate_status()["a_batch_sealed"] is True
+    assert control.gate_status()["b_batch_sealed"] is True
+    assert control.gate_status()["a_training_started"] is True
+    assert control.gate_status()["b_training_started"] is True
+    assert control.gate_status()["a_training_completed"] is True
+    assert control.gate_status()["b_training_completed"] is True
     assert control.gate_status()["both_training_completed"] is True
 
 
-def test_generation_proof_releases_b_after_acknowledged_bootstrap(monkeypatch) -> None:
+def test_generation_proof_releases_b_after_a_target_rank_completes(monkeypatch) -> None:
     calls = []
 
     class RemoteMethod:
@@ -1790,10 +1830,19 @@ def test_generation_proof_releases_b_after_acknowledged_bootstrap(monkeypatch) -
 
     _orchestrator._drive_generation_proof_gates(control_actor, timeout_s=1.0)
 
-    assert calls.index(("wait", "a_target_bootstrap_dispatched")) < calls.index(
+    assert calls.index(("wait", "a_target_rank_completed")) < calls.index(
         ("release", "allow_b_collection")
     )
-    assert ("wait", "a_target_chunk_started") not in calls
+    assert ("release", "allow_a_training") not in calls
+    assert calls.index(("wait", "b_useful_work_observed")) < calls.index(
+        ("wait", "a_training_started")
+    )
+    assert calls.index(("wait", "a_training_completed")) < calls.index(
+        ("wait", "b_batch_sealed")
+    )
+    assert calls.index(("wait", "b_batch_sealed")) < calls.index(
+        ("release", "allow_b_training")
+    )
 
 
 def test_acceptance_control_explicit_gates_and_fail_closed_driver_loss(

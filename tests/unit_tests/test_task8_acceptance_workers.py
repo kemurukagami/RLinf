@@ -166,6 +166,9 @@ class _FakeRunner:
 
     def update_rollout_weights(self):
         self.calls.append(("sync", self.global_step))
+        hook = getattr(self, "_on_rlix_policy_sync_stage_acquired", None)
+        if hook is not None:
+            hook()
         return "synced"
 
     def _collect_rlix_rollouts(self):
@@ -342,6 +345,7 @@ def test_recording_runner_preserves_grpo_stage_outputs_and_policy_advance() -> N
     assert recorded.calls == plain.calls
     assert recorded.global_step == plain.global_step == 4
     assert [event.event for event in events] == [
+        "stage_requested",
         "stage_acquired",
         "policy_synchronized",
         "stage_released",

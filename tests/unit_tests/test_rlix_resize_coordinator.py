@@ -519,6 +519,66 @@ def test_completed_pair_can_activate_only_in_strictly_newer_collection() -> None
     asyncio.run(run())
 
 
+def test_unallocated_completed_rank_is_dormant_in_new_collection() -> None:
+    async def run() -> None:
+        coordinator, env, rollout = _coordinator(ranks=2)
+        await _configure(coordinator, ranks=2)
+        await coordinator.resize_infer([], [0, 1])
+        for rank in (0, 1):
+            env[rank].complete_event.set()
+            rollout[rank].complete_event.set()
+            await coordinator.get_rank_results(rank, wait=True)
+        await coordinator.resize_infer([0, 1], [])
+
+        await coordinator.configure_collection(
+            ElasticCollectionContext(2, 4, (0, 1)),
+            env_input_channel=object(),
+            rollout_request_channel=object(),
+        )
+        await coordinator.resize_infer([], [1])
+
+        dormant = await coordinator.get_rank_observation(0)
+        assert dormant.env_status.state is ElasticRankState.COMPLETED
+        assert dormant.env_status.lifecycle_generation == 1
+        assert dormant.progress is None
+        assert dormant.paired_results is None
+        assert not dormant.callback_applied_active
+
+        await coordinator.resize_infer([], [0])
+        activated = await coordinator.get_rank_observation(0)
+        assert activated.env_status.lifecycle_generation == 2
+        assert activated.rollout_status.lifecycle_generation == 2
+        assert activated.callback_applied_active
+        assert activated.progress.lifecycle_generation == 2
+
+    asyncio.run(run())
+
+
+def test_dormant_completed_rank_requires_matching_safe_peer_identity() -> None:
+    async def run() -> None:
+        coordinator, env, rollout = _coordinator()
+        await _configure(coordinator)
+        await coordinator.resize_infer([], [0])
+        env[0].complete_event.set()
+        rollout[0].complete_event.set()
+        await coordinator.get_rank_results(0, wait=True)
+        await coordinator.resize_infer([0], [])
+        await coordinator.configure_collection(
+            ElasticCollectionContext(2, 4, (0,)),
+            env_input_channel=object(),
+            rollout_request_channel=object(),
+        )
+        rollout[0].policy_version = 99
+
+        with pytest.raises(
+            ResizeCoordinatorError,
+            match=r"reported_lifecycle=1 expected_lifecycle=2",
+        ):
+            await coordinator.get_rank_observation(0)
+
+    asyncio.run(run())
+
+
 def test_selected_rank_resize_leaves_sibling_active() -> None:
     async def run() -> None:
         coordinator, env, rollout = _coordinator(ranks=2)

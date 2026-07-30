@@ -33,17 +33,28 @@ _DEFAULT_GATES = frozenset(
         "a_generation_granted",
         "a_target_bootstrap_dispatched",
         "a_target_chunk_started",
+        "a_target_rank_completed",
         "allow_b_collection",
         "b_generation_requested",
         "b_generation_granted",
         "allow_b_demand",
         "transfer_to_b_observed",
+        "b_useful_work_observed",
         "both_batches_sealed",
         "allow_training",
+        "allow_a_training",
+        "allow_b_training",
+        "a_batch_sealed",
+        "b_batch_sealed",
+        "a_training_started",
+        "b_training_started",
+        "a_training_completed",
+        "b_training_completed",
         "both_training_completed",
         "allow_b_release",
         "b_release_observed",
         "a_resume_observed",
+        "b_resume_observed",
     }
 )
 
@@ -194,12 +205,20 @@ class AcceptanceControlCore:
                 and set(self._config.target_bundle).issubset(set(event.gpu_ids))
             ):
                 self._gates["transfer_to_b_observed"] = True
-        if event.event == "batch_sealed" and event.driver_role in {"a", "b"}:
+        if (
+            event.event == "batch_sealed"
+            and event.component == "runner"
+            and event.driver_role in {"a", "b"}
+        ):
             self._batches_sealed.add(event.driver_role)
+            self._gates[f"{event.driver_role}_batch_sealed"] = True
             if self._batches_sealed == {"a", "b"}:
                 self._gates["both_batches_sealed"] = True
+        if event.event == "training_started" and event.driver_role in {"a", "b"}:
+            self._gates[f"{event.driver_role}_training_started"] = True
         if event.event == "training_completed" and event.driver_role in {"a", "b"}:
             self._training_completed.add(event.driver_role)
+            self._gates[f"{event.driver_role}_training_completed"] = True
             if self._training_completed == {"a", "b"}:
                 self._gates["both_training_completed"] = True
         if (
@@ -216,6 +235,19 @@ class AcceptanceControlCore:
             and event.gpu_ids == self._config.target_bundle
         ):
             self._gates["a_target_chunk_started"] = True
+        if (
+            event.driver_role == "a"
+            and event.event == "rank_completed"
+            and event.dp_rank == self._config.target_rank
+            and event.gpu_ids == self._config.target_bundle
+        ):
+            self._gates["a_target_rank_completed"] = True
+        if (
+            event.driver_role == "b"
+            and event.event in {"policy_request_completed", "chunk_committed"}
+            and event.gpu_ids == self._config.target_bundle
+        ):
+            self._gates["b_useful_work_observed"] = True
         if (
             event.driver_role == "b"
             and event.event == "allocation_committed"
@@ -235,6 +267,13 @@ class AcceptanceControlCore:
             and event.gpu_ids == self._config.target_bundle
         ):
             self._gates["a_resume_observed"] = True
+        if (
+            event.driver_role == "b"
+            and event.event in {"restore_validated", "resumed_bootstrap_dispatched"}
+            and event.dp_rank == self._config.target_rank
+            and event.gpu_ids == self._config.target_bundle
+        ):
+            self._gates["b_resume_observed"] = True
 
     def _require_gate(self, gate: str) -> None:
         if gate not in self._gates:

@@ -362,7 +362,7 @@ class RecordingEmbodiedRunnerMixin(AcceptanceWorkerRecorderMixin):
     def update_rollout_weights(self) -> Any:
         policy_version = self.global_step
         self._record_acceptance(
-            "stage_acquired", stage="policy_sync", policy_version=policy_version
+            "stage_requested", stage="policy_sync", policy_version=policy_version
         )
         result = super().update_rollout_weights()
         self._record_acceptance("policy_synchronized", policy_version=policy_version)
@@ -370,6 +370,14 @@ class RecordingEmbodiedRunnerMixin(AcceptanceWorkerRecorderMixin):
             "stage_released", stage="policy_sync", policy_version=policy_version
         )
         return result
+
+    def _on_rlix_policy_sync_stage_acquired(self) -> None:
+        parent_hook = getattr(super(), "_on_rlix_policy_sync_stage_acquired", None)
+        if parent_hook is not None:
+            parent_hook()
+        self._record_acceptance(
+            "stage_acquired", stage="policy_sync", policy_version=self.global_step
+        )
 
     def _collect_rlix_rollouts(self) -> Any:
         policy_version = self.global_step

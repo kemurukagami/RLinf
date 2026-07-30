@@ -98,7 +98,12 @@ class ElasticProgressTracker:
             raise ValueError("Completed trajectory progress cannot decrease")
         self._worker_progress[progress.dp_rank] = progress
 
-    def snapshot(self, *, active_dp_ranks: set[int]) -> ElasticPipelineProgress:
+    def snapshot(
+        self,
+        *,
+        active_dp_ranks: set[int],
+        reserved_dp_ranks: set[int] | None = None,
+    ) -> ElasticPipelineProgress:
         """Build deterministic wire metrics without importing rlix-core."""
         if not isinstance(active_dp_ranks, set):
             raise TypeError("active_dp_ranks must be a set of integers")
@@ -112,6 +117,12 @@ class ElasticProgressTracker:
         unknown_active = active_dp_ranks - self._assignments.keys()
         if unknown_active:
             raise ValueError(f"Unknown active DP ranks {sorted(unknown_active)!r}")
+        include_reserved = reserved_dp_ranks is not None
+        reserved_dp_ranks = set() if reserved_dp_ranks is None else reserved_dp_ranks
+        if not isinstance(reserved_dp_ranks, set):
+            raise TypeError("reserved_dp_ranks must be a set of integers")
+        if not reserved_dp_ranks.issubset(active_dp_ranks):
+            raise ValueError("reserved DP ranks must be active")
 
         resumable: set[int] = set()
         completed: set[int] = set()
@@ -142,14 +153,17 @@ class ElasticProgressTracker:
             }:
                 safe.add(rank)
 
+        metrics: dict[str, int | list[int] | str] = {
+            "mode": self._mode,
+            "completed": completed_trajectories,
+            "active_dp_ranks": sorted(active_dp_ranks),
+            "resumable_dp_ranks": sorted(resumable),
+            "completed_dp_ranks": sorted(completed),
+            "at_safe_point_dp_ranks": sorted(safe),
+        }
+        if include_reserved:
+            metrics["reserved_dp_ranks"] = sorted(reserved_dp_ranks)
         return ElasticPipelineProgress(
             step_target_trajectories=self.step_target_trajectories,
-            metrics={
-                "mode": self._mode,
-                "completed": completed_trajectories,
-                "active_dp_ranks": sorted(active_dp_ranks),
-                "resumable_dp_ranks": sorted(resumable),
-                "completed_dp_ranks": sorted(completed),
-                "at_safe_point_dp_ranks": sorted(safe),
-            },
+            metrics=metrics,
         )

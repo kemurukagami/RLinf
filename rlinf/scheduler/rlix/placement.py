@@ -42,6 +42,7 @@ class RLixPlacementPlan:
             INITIALIZATION_CLUSTER_NAME,
             POLICY_SYNC_CLUSTER_NAME,
             AllocationPolicy,
+            GenerationPreemptionMode,
         )
 
         names_and_devices = (
@@ -68,6 +69,7 @@ class RLixPlacementPlan:
                     rank: list(bundle) for rank, bundle in self.actor_infer_bundles
                 }
             },
+            "generation_preemption_mode": GenerationPreemptionMode.FIXED_STAGE_ONLY.value,
         }
 
 

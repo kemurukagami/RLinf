@@ -22,6 +22,7 @@ class RunnerStageState(str, Enum):
     FIXED_INITIALIZATION = "fixed_initialization"
     FIXED_POLICY_SYNC = "fixed_policy_sync"
     ELASTIC_COLLECTION = "elastic_collection"
+    SEALED_COLLECTION = "sealed_collection"
     FIXED_ACTOR_TRAIN = "fixed_actor_train"
     FIXED_EVALUATION = "fixed_evaluation"
     FAILED_UNCERTAIN = "failed_uncertain"

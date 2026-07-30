@@ -51,6 +51,7 @@ class _Group:
     def __init__(self, component: str, events: list[str]) -> None:
         self.component = component
         self.events = events
+        self.policy_version = 0
 
     def init_worker(self):
         self.events.append(f"start_init:{self.component}")
@@ -76,8 +77,21 @@ class _Group:
                     model_resident=False,
                     optimizer_resident=False,
                     cuda_graph_captured=False,
+                    policy_version=self.policy_version,
                 )
             ],
+        )
+
+    def set_global_step(self, global_step):
+        self.events.append(f"start_set_global_step:{self.component}:{global_step}")
+
+        class _SetGlobalStepHandle(_Handle):
+            def wait(handle_self):
+                self.policy_version = global_step
+                return super().wait()
+
+        return _SetGlobalStepHandle(
+            self.events, f"wait_set_global_step:{self.component}:{global_step}"
         )
 
     def sync_model_from_actor(self):
@@ -425,12 +439,14 @@ def test_fixed_actor_training_advances_version_only_after_verified_release() -> 
     assert training_metrics == ["training-metrics"]
     assert runner.global_step == 10
     assert events == [
-        "start_advantages",
-        "wait_advantages",
         "fixed_stage:actor_train:9",
         "acquire_actor_train",
+        "start_advantages",
+        "wait_advantages",
         "start_training:batch-9",
         "wait_training",
+        "start_set_global_step:actor:10",
+        "wait_set_global_step:actor:10",
         "start_residency:actor",
         "wait_residency:actor",
         "verify:actor",
@@ -455,6 +471,29 @@ def test_failed_actor_training_does_not_advance_policy_version() -> None:
     )
 
     with pytest.raises(RuntimeError, match="optimizer failed"):
+        runner._train_rlix_batch("batch-9")
+
+    assert runner.global_step == 9
+    assert not any("set_global_step" in event for event in events)
+    assert "complete:verified-receipt" not in events
+
+
+def test_failed_actor_version_publication_does_not_release_or_advance() -> None:
+    events: list[str] = []
+    runtime = _Runtime(events)
+    runner = _runner(events, runtime=runtime)
+    runner.global_step = 9
+
+    class _FailedHandle:
+        def wait(self):
+            events.append("wait_set_global_step:actor:10")
+            raise RuntimeError("version publication failed")
+
+    runner.actor.set_global_step = lambda version: (
+        events.append(f"start_set_global_step:actor:{version}") or _FailedHandle()
+    )
+
+    with pytest.raises(RuntimeError, match="version publication failed"):
         runner._train_rlix_batch("batch-9")
 
     assert runner.global_step == 9

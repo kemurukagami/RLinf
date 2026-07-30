@@ -96,6 +96,7 @@ def test_registration_payload_is_complete_and_defensively_copied() -> None:
         "policy_sync": "fixed",
         "evaluation": "fixed",
     }
+    assert first["generation_preemption_mode"] == "fixed_stage_only"
     first["cluster_device_mappings"]["actor_infer"].append(7)
     first["cluster_dp_device_mappings"]["actor_infer"][0].append(7)
 

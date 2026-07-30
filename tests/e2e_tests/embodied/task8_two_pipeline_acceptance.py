@@ -178,6 +178,7 @@ def validate_driver_ready_pair(
             common
             | (
                 {"runtime_state", "actor_infer_bundles", "residencies"}
+                | {"generation_preemption_mode"}
                 if scope in {"generation_proof_only", "model_init_only"}
                 else set()
             )
@@ -202,6 +203,10 @@ def validate_driver_ready_pair(
         if not isinstance(names, Mapping) or len(names) != len(set(names.values())):
             raise ValueError(f"driver {role} has invalid role-owned names")
         if scope in {"generation_proof_only", "model_init_only"}:
+            if payload["generation_preemption_mode"] != "fixed_stage_only":
+                raise ValueError(
+                    f"driver {role} did not register stage-aware generation"
+                )
             if payload["runtime_state"] != "inactive":
                 raise ValueError(f"driver {role} model runtime is not inactive")
             bundles = payload["actor_infer_bundles"]
@@ -614,7 +619,7 @@ def _drive_generation_proof_gates(control_actor: Any, *, timeout_s: float) -> No
     )
     ray.get(
         control_actor.wait_for_gate.remote(
-            "a_target_bootstrap_dispatched", timeout_s=timeout_s
+            "a_target_rank_completed", timeout_s=timeout_s
         )
     )
     ray.get(control_actor.release_gate.remote("allow_b_collection"))
@@ -629,9 +634,19 @@ def _drive_generation_proof_gates(control_actor: Any, *, timeout_s: float) -> No
         )
     )
     ray.get(
-        control_actor.wait_for_gate.remote("both_batches_sealed", timeout_s=timeout_s)
+        control_actor.wait_for_gate.remote(
+            "b_useful_work_observed", timeout_s=timeout_s
+        )
     )
-    ray.get(control_actor.release_gate.remote("allow_training"))
+    ray.get(control_actor.wait_for_gate.remote("a_batch_sealed", timeout_s=timeout_s))
+    ray.get(
+        control_actor.wait_for_gate.remote("a_training_started", timeout_s=timeout_s)
+    )
+    ray.get(
+        control_actor.wait_for_gate.remote("a_training_completed", timeout_s=timeout_s)
+    )
+    ray.get(control_actor.wait_for_gate.remote("b_batch_sealed", timeout_s=timeout_s))
+    ray.get(control_actor.release_gate.remote("allow_b_training"))
     ray.get(
         control_actor.wait_for_gate.remote(
             "both_training_completed", timeout_s=timeout_s
@@ -756,8 +771,10 @@ def main() -> None:
             AcceptanceControlConfig(
                 run_id=args.run_id,
                 event_log_path=str(layout.core / "events.jsonl"),
-                target_bundle=bundles[0],
-                target_rank=0,
+                # Actor training uses GPU 0 in the four-GPU acceptance layout.
+                # Hand off the non-overlapping rank while retaining [0, 2].
+                target_bundle=bundles[1],
+                target_rank=1,
             ),
             namespace=RLIX_NAMESPACE,
         )

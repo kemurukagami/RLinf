@@ -69,6 +69,13 @@ class _Scheduler:
     async def await_release_dp_ranks(self, **kwargs) -> None:
         self.events.append(f"await_release:{tuple(kwargs['ranks'])}")
 
+    async def release_dp_ranks_then_request_gpus(self, **kwargs):
+        self.events.append(
+            f"transition:{tuple(kwargs['release_ranks'])}:"
+            f"{kwargs['request_cluster_id']}:{kwargs['request_priority'].name}"
+        )
+        return self.grants.get(kwargs["request_cluster_id"], [2])
+
 
 class _ControlPlane:
     def __init__(self, events: list[str]) -> None:
@@ -109,7 +116,11 @@ class _Controller:
 
 
 def _runtime(
-    events: list[str], *, scheduler: _Scheduler | None = None
+    events: list[str],
+    *,
+    scheduler: _Scheduler | None = None,
+    actor_train_devices: tuple[int, ...] = (2,),
+    retain_training_overlap: bool = False,
 ) -> RegisteredRLixPipeline:
     return RegisteredRLixPipeline(
         control_plane=_ControlPlane(events),
@@ -124,10 +135,11 @@ def _runtime(
             actor_infer_devices=(0, 1, 3, 4),
             actor_infer_bundles=((0, (0, 1)), (1, (3, 4))),
             initialization_devices=(0, 1, 2),
-            actor_train_devices=(2,),
+            actor_train_devices=actor_train_devices,
             policy_sync_devices=(0, 2),
             evaluation_devices=(0, 1),
         ),
+        retain_training_overlap=retain_training_overlap,
     )
 
 
@@ -473,6 +485,74 @@ def test_collection_reports_completion_before_exact_release() -> None:
         "wait_receiver",
         "clear_progress:rlinf_123456789abc",
     ]
+
+
+def test_collection_retains_training_bundle_and_transitions_atomically() -> None:
+    events: list[str] = []
+    scheduler = _Scheduler(
+        events,
+        grants={
+            "rlinf_123456789abc_actor_infer": [0, 1, 3, 4],
+            "rlinf_123456789abc_actor_train": [0],
+        },
+    )
+    runtime = _runtime(
+        events,
+        scheduler=scheduler,
+        actor_train_devices=(0,),
+        retain_training_overlap=True,
+    )
+    receiver = SimpleNamespace(wait=lambda: events.append("wait_receiver"))
+    session = runtime.begin_collection(
+        policy_version=2,
+        assigned_trajectories_by_rank={0: 2, 1: 2},
+        env_input_channel="env",
+        rollout_request_channel="rollout",
+        actor_channel="actor",
+        actor_receiver_start=lambda: receiver,
+    )
+    result = ElasticRunResult(ElasticRunOutcome.COMPLETED, None, None)
+    for rank in (0, 1):
+        runtime.controller.observations[rank] = SimpleNamespace(
+            dp_rank=rank,
+            failure=None,
+            callback_applied_active=True,
+            progress=ElasticRankProgress(
+                dp_rank=rank,
+                lifecycle_generation=1,
+                state=ElasticRankState.COMPLETED,
+                assigned_trajectories=2,
+                completed_trajectories=2,
+                snapshot_ready=False,
+                failed=False,
+            ),
+            paired_results=(result, result),
+        )
+
+    assert runtime.monitor_collection_once(session)
+    assert session.active_dp_ranks == {0}
+    assert session.released_dp_ranks == {1}
+    assert scheduler.reports[-1].metrics["reserved_dp_ranks"] == [0]
+    runtime.seal_collection(
+        session,
+        actor_seal_start=lambda expected: SimpleNamespace(
+            wait=lambda: [ElasticBatchReceipt(1, 2, (0, 1), expected, expected, 12)]
+        ),
+    )
+    assert runtime.stage_state == RunnerStageState.SEALED_COLLECTION
+
+    with runtime.fixed_stage(
+        cluster_name=ACTOR_TRAIN_CLUSTER_NAME,
+        priority=Priority.ACTOR_TRAINING,
+        global_step=2,
+    ) as stage:
+        stage.complete(_receipt(ACTOR_TRAIN_CLUSTER_NAME, (0,)))
+
+    assert "transition:(0,):rlinf_123456789abc_actor_train:ACTOR_TRAINING" in events
+    assert events.index(
+        "transition:(0,):rlinf_123456789abc_actor_train:ACTOR_TRAINING"
+    ) < events.index("clear_progress:rlinf_123456789abc")
+    assert runtime.stage_state == RunnerStageState.INACTIVE
     assert runtime.stage_state == RunnerStageState.INACTIVE
 
 
@@ -586,4 +666,31 @@ def test_fixed_receipt_requires_exact_safe_worker_coverage() -> None:
                 *statuses[:2],
                 FixedWorkerResidency("environment", 0, True, False, False),
             ],
+        )
+
+
+def test_actor_training_receipt_requires_published_successor_version() -> None:
+    runtime = _runtime([])
+    published = [FixedWorkerResidency("actor", 0, False, False, False, 10)]
+
+    receipt = runtime.fixed_residency_receipt(
+        cluster_name=ACTOR_TRAIN_CLUSTER_NAME,
+        worker_residencies=published,
+        policy_version=10,
+    )
+    assert receipt.policy_version == 10
+
+    with pytest.raises(ValueError, match="produced policy version 9, expected 10"):
+        runtime.fixed_residency_receipt(
+            cluster_name=ACTOR_TRAIN_CLUSTER_NAME,
+            worker_residencies=[
+                FixedWorkerResidency("actor", 0, False, False, False, 9)
+            ],
+            policy_version=10,
+        )
+
+    with pytest.raises(ValueError, match="requires a policy version"):
+        runtime.fixed_residency_receipt(
+            cluster_name=ACTOR_TRAIN_CLUSTER_NAME,
+            worker_residencies=published,
         )

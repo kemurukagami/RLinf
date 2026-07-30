@@ -280,12 +280,52 @@ class RLixResizeCoordinator:
             return
         if status.lifecycle_generation != context.lifecycle_generation:
             raise ResizeCoordinatorError(
-                f"rank {rank} lifecycle does not match collection"
+                f"rank {rank} lifecycle does not match collection: "
+                f"component_state={status.state.value} "
+                f"reported_lifecycle={status.lifecycle_generation} "
+                f"expected_lifecycle={context.lifecycle_generation} "
+                f"reported_policy={status.policy_version} "
+                f"expected_policy={context.policy_version}"
             )
         if status.policy_version != context.policy_version:
             raise ResizeCoordinatorError(
                 f"rank {rank} policy version does not match collection"
             )
+
+    @staticmethod
+    def _is_dormant_completed_pair(
+        rank: int,
+        env_status: ElasticRankStatus,
+        rollout_status: ElasticRankStatus,
+        context: ElasticCollectionContext,
+        record: _RankRecord,
+    ) -> bool:
+        """Recognize an offloaded rank not yet admitted to this collection."""
+        tasks_resolved = all(
+            task is None or task.done()
+            for task in (record.env_run_task, record.rollout_run_task)
+        )
+        return (
+            not record.callback_applied_active
+            and tasks_resolved
+            and record.token is None
+            and record.last_env_result is None
+            and record.last_rollout_result is None
+            and env_status.worker_rank == rank
+            and rollout_status.worker_rank == rank
+            and env_status.state is ElasticRankState.COMPLETED
+            and rollout_status.state is ElasticRankState.COMPLETED
+            and env_status.lifecycle_generation is not None
+            and env_status.lifecycle_generation == rollout_status.lifecycle_generation
+            and env_status.lifecycle_generation < context.lifecycle_generation
+            and env_status.policy_version == rollout_status.policy_version
+            and env_status.model_resident is False
+            and rollout_status.model_resident is False
+            and env_status.cuda_graph_captured is False
+            and rollout_status.cuda_graph_captured is False
+            and env_status.failure is None
+            and rollout_status.failure is None
+        )
 
     async def configure_collection(
         self,
@@ -1031,6 +1071,19 @@ class RLixResizeCoordinator:
             raise ValueError(f"unknown rank {rank}")
         context = self._require_collection()
         env_status, rollout_status = await self._get_pair_status(rank)
+        record = self._records[rank]
+        if self._is_dormant_completed_pair(
+            rank, env_status, rollout_status, context, record
+        ):
+            return ElasticRankObservation(
+                dp_rank=rank,
+                env_status=env_status,
+                rollout_status=rollout_status,
+                progress=None,
+                paired_results=None,
+                callback_applied_active=False,
+                failure=None,
+            )
         self._validate_status_identity(
             rank,
             env_status,
@@ -1056,7 +1109,6 @@ class RLixResizeCoordinator:
                     f"rank {rank} returned invalid elastic progress"
                 )
         paired_results = await self.get_rank_results(rank, wait=False)
-        record = self._records[rank]
         return ElasticRankObservation(
             dp_rank=rank,
             env_status=env_status,

@@ -161,6 +161,14 @@ class EnvWorker(Worker):
         self._elastic_failure: str | None = None
         self._elastic_completed_trajectories = 0
         self._environment_resident = False
+        stop_rank_when_all_done = OmegaConf.select(
+            self.cfg,
+            "env.train.stop_rank_when_all_done",
+            default=False,
+        )
+        if not isinstance(stop_rank_when_all_done, bool):
+            raise TypeError("env.train.stop_rank_when_all_done must be a boolean")
+        self.stop_rank_when_all_done = stop_rank_when_all_done
         self.enable_rlt = (
             OmegaConf.select(self.cfg, "algorithm.loss_type", default="") == "rlt_ac"
         )
@@ -1297,7 +1305,11 @@ class EnvWorker(Worker):
         await work.async_wait()
 
     async def _send_elastic_observation(
-        self, rollout_channel: Channel, env_output: EnvOutput
+        self,
+        rollout_channel: Channel,
+        env_output: EnvOutput,
+        *,
+        final_bootstrap: bool = False,
     ) -> None:
         identity = env_output.transition_id
         if not isinstance(identity, RolloutTransitionIdentity):
@@ -1312,8 +1324,71 @@ class EnvWorker(Worker):
                 transition_id=identity,
                 logical_batch_size=infer_env_output_batch_size(env_output_dict),
                 env_output=env_output_dict,
+                final_bootstrap=final_bootstrap,
             ),
         )
+
+    def _record_rank_trajectory_completions(
+        self,
+        env_output: EnvOutput,
+        *,
+        stage_id: int,
+        epoch: int,
+        chunk_step_idx: int,
+    ) -> bool:
+        """Record sticky per-environment success and report rank completion."""
+        terminations = env_output.terminations
+        if terminations is None:
+            raise RuntimeError(
+                "Rank early completion requires environment termination flags"
+            )
+        termination_steps = terminations.to(dtype=torch.bool).reshape(
+            terminations.shape[0], -1
+        )
+        if termination_steps.shape[1] not in {
+            1,
+            self.model_cfg.num_action_chunks,
+        }:
+            raise RuntimeError(
+                "Environment termination width must be one or num_action_chunks"
+            )
+        current_success = termination_steps.any(dim=-1)
+        if tuple(current_success.shape) != (self.train_num_envs_per_stage,):
+            raise RuntimeError(
+                "Environment termination flags do not match the rank-local batch"
+            )
+        previous_success = self.train_prev_done[stage_id]
+        new_success = current_success & ~previous_success
+        self.train_prev_done[stage_id] = previous_success | current_success
+        local_base = self._rank * self.train_num_envs_per_stage
+        for env_index in new_success.nonzero(as_tuple=False).flatten().tolist():
+            if termination_steps.shape[1] == 1:
+                completion_offset = self.model_cfg.num_action_chunks
+            else:
+                completion_offset = (
+                    int(termination_steps[env_index].nonzero(as_tuple=False)[0].item())
+                    + 1
+                )
+            action_step = (
+                chunk_step_idx * self.model_cfg.num_action_chunks + completion_offset
+            )
+            self.log_info(
+                "RLIX_TRAJECTORY_COMPLETED "
+                f"rank={self._rank} env_index={env_index} "
+                f"global_env_index={local_base + env_index} "
+                f"lifecycle={self._rollout_cursor.lifecycle_generation} "
+                f"policy={self._rollout_cursor.policy_version} epoch={epoch} "
+                f"chunk={chunk_step_idx + 1} step={action_step} outcome=success"
+            )
+        completed_before_epoch = epoch * self.train_num_envs_per_stage * self.stage_num
+        completed_in_epoch = sum(
+            int(mask.sum().item()) for mask in self.train_prev_done
+        )
+        self._elastic_completed_trajectories = max(
+            self._elastic_completed_trajectories,
+            completed_before_epoch + completed_in_epoch,
+        )
+        return all(bool(mask.all().item()) for mask in self.train_prev_done)
 
     async def _send_elastic_barrier(
         self, rollout_channel: Channel, token: SafePointToken
@@ -2123,15 +2198,27 @@ class EnvWorker(Worker):
 
         for epoch in range(first_epoch, self.rollout_epoch):
             self._rollout_cursor.epoch_index = epoch
-            if resumed and epoch == first_epoch:
+            resuming_epoch = resumed and epoch == first_epoch
+            if not resuming_epoch and self.stop_rank_when_all_done:
+                for stage_id in range(self.stage_num):
+                    self.train_prev_done[stage_id].zero_()
+            if resuming_epoch:
                 env_outputs = self._current_env_outputs
                 for stage_id in range(self.stage_num):
                     if elastic_mode:
                         env_output = self._resume_bootstraps[stage_id]
                         if env_output is None:
                             raise RuntimeError("Elastic resume bootstrap is missing")
+                        committed_in_epoch = (
+                            self._rollout_cursor.chunk_index
+                            - epoch * self.n_train_chunk_steps
+                        )
                         await self._send_elastic_observation(
-                            rollout_channel, env_output
+                            rollout_channel,
+                            env_output,
+                            final_bootstrap=(
+                                committed_in_epoch == self.n_train_chunk_steps
+                            ),
                         )
                         self._resume_bootstraps[stage_id] = None
                         self._rollout_cursor.phase = (
@@ -2168,6 +2255,8 @@ class EnvWorker(Worker):
             self._current_env_outputs = env_outputs
             self._rollout_cursor.phase = RolloutCursorPhase.WAITING_FOR_POLICY
             resumed = False
+            early_finalized = False
+            completed_chunk_steps = committed_in_epoch
 
             for chunk_step_idx in range(committed_in_epoch, self.n_train_chunk_steps):
                 for stage_id in range(self.stage_num):
@@ -2286,9 +2375,18 @@ class EnvWorker(Worker):
                         )
 
                     env_outputs[stage_id] = env_output
+                    rank_all_successful = False
+                    if elastic_mode and self.stop_rank_when_all_done:
+                        rank_all_successful = self._record_rank_trajectory_completions(
+                            env_output,
+                            stage_id=stage_id,
+                            epoch=epoch,
+                            chunk_step_idx=chunk_step_idx,
+                        )
                     should_record = (
                         self.cfg.env.train.auto_reset
                         or self.cfg.env.train.ignore_terminations
+                        or rank_all_successful
                         or chunk_step_idx == self.n_train_chunk_steps - 1
                     )
                     if should_record:
@@ -2301,7 +2399,23 @@ class EnvWorker(Worker):
                     if elastic_mode:
                         self._assign_elastic_transition_identity(env_output, stage_id)
                         await asyncio.sleep(0)
-                        if self._elastic_state is ElasticRankState.DRAIN_REQUESTED:
+                        horizon_complete = (
+                            chunk_step_idx == self.n_train_chunk_steps - 1
+                        )
+                        if rank_all_successful:
+                            await self._send_elastic_observation(
+                                rollout_channel,
+                                env_output,
+                                final_bootstrap=True,
+                            )
+                            self._resume_bootstraps[stage_id] = None
+                            self._rollout_cursor.phase = (
+                                RolloutCursorPhase.WAITING_FOR_POLICY
+                            )
+                            early_finalized = (
+                                chunk_step_idx < self.n_train_chunk_steps - 1
+                            )
+                        elif self._elastic_state is ElasticRankState.DRAIN_REQUESTED:
                             drain_request = self._elastic_drain_request
                             if drain_request is None:
                                 raise RuntimeError(
@@ -2334,15 +2448,21 @@ class EnvWorker(Worker):
                                 token=token,
                                 metrics=None,
                             )
-                        await self._send_elastic_observation(
-                            rollout_channel, env_output
-                        )
-                        self._resume_bootstraps[stage_id] = None
-                        self._rollout_cursor.phase = (
-                            RolloutCursorPhase.WAITING_FOR_POLICY
-                        )
+                        else:
+                            await self._send_elastic_observation(
+                                rollout_channel,
+                                env_output,
+                                final_bootstrap=horizon_complete,
+                            )
+                            self._resume_bootstraps[stage_id] = None
+                            self._rollout_cursor.phase = (
+                                RolloutCursorPhase.WAITING_FOR_POLICY
+                            )
                     else:
                         self._send_pending_bootstrap(rollout_channel, stage_id)
+                completed_chunk_steps = chunk_step_idx + 1
+                if early_finalized:
+                    break
 
             self._rollout_cursor.phase = RolloutCursorPhase.EPOCH_FINALIZING
             for stage_id in range(self.stage_num):
@@ -2403,6 +2523,26 @@ class EnvWorker(Worker):
                     transition_id=rollout_result.transition_id,
                 )
                 self.rollout_results[stage_id].append_step_result(chunk_step_result)
+                if early_finalized:
+                    stage_rollout = self.rollout_results[stage_id]
+                    if type(stage_rollout) is not EmbodiedRolloutResult:
+                        raise RuntimeError(
+                            "Rank early completion requires EmbodiedRolloutResult"
+                        )
+                    saved_chunks = stage_rollout.pad_completed_epoch(
+                        completed_epoch_index=epoch,
+                        target_chunk_steps=self.n_train_chunk_steps,
+                        policy_version=self._rollout_cursor.policy_version,
+                    )
+                    self.log_info(
+                        "RLIX_RANK_EARLY_FINALIZED "
+                        f"rank={self._rank} "
+                        f"lifecycle={self._rollout_cursor.lifecycle_generation} "
+                        f"policy={self._rollout_cursor.policy_version} epoch={epoch} "
+                        f"exit_chunk={completed_chunk_steps} "
+                        f"exit_step={completed_chunk_steps * self.model_cfg.num_action_chunks} "
+                        f"padded_chunks={saved_chunks}"
+                    )
                 if (
                     self.reward_mode == "history_buffer"
                     and self.history_reward_assign

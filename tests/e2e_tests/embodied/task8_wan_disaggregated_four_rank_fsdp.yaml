@@ -1,0 +1,43 @@
+# Isolated Task 8 variant proving that four-rank FSDP training reclaims all
+# four GPUs from two elastic generation bundles. The original Task 8 topology
+# remains unchanged.
+acceptance:
+  environment: wan
+  mode: disaggregated
+  expected_bundles: [[0, 2], [1, 3]]
+
+models:
+  vla:
+    checkpoint: ${oc.env:RLINF_VLA_CHECKPOINT,/workspace/VLA/Openvla-oft-SFT-libero-spatial-traj1}
+    precision: bf16
+    unnorm_key: libero_spatial_no_noops
+  world_model:
+    checkpoint: ${oc.env:RLINF_WM_CHECKPOINT,/workspace/WM/RLinf-Wan-LIBERO-Spatial}
+    num_inference_steps: 5
+
+smoke:
+  base_config: wan_libero_spatial_grpo_openvlaoft_rlix
+  # Four actor processes form one FSDP world and each owns one model shard.
+  # Tensor and pipeline model parallelism remain one in the base config.
+  actor_gpus: [0, 1, 2, 3]
+  rollout_gpu: [0, 1]
+  env_gpu: [2, 3]
+  completed_bundle_handoff: release_before_training
+  operation_timeout_s: 900.0
+  monitor_poll_interval_s: 0.1
+  output_dir: ${oc.env:RLINF_TASK8_OUTPUT,/tmp/rlinf_task8_four_rank_fsdp}
+  # Four FSDP actor ranks must each receive complete GRPO groups. With two
+  # environment ranks and a group size of eight, 32 global environments route
+  # as 16 per environment rank and then 8 per actor rank.
+  total_num_envs: 32
+  adv_type: grpo
+  group_size: 8
+  filter_rewards: true
+  rewards_lower_bound: 0.0
+  rewards_upper_bound: 5.0
+  rollout_epoch: 1
+  max_episode_steps: 256
+  max_steps_per_rollout_epoch: 256
+  max_train_steps: 10
+  run_evaluation: false
+  save_checkpoint: false

@@ -73,6 +73,7 @@ def launch_registered_rlix_workers(
     operation_timeout_s: float,
     enable_gpu_tracing: bool,
     bootstrapper: Callable[..., Awaitable[Any]],
+    completed_bundle_handoff: str = "retain_overlap",
 ) -> LaunchedRLixWorkers:
     """Launch replayed placements and atomically bootstrap their registration."""
     groups = [actor_group, rollout_group, env_group]
@@ -94,16 +95,19 @@ def launch_registered_rlix_workers(
             placement_strategy=resolved.env_strategy,
             max_concurrency=worker_max_concurrency,
         )
-        runtime = asyncio.run(
-            bootstrapper(
-                env_worker_group=env,
-                rollout_worker_group=rollout,
-                placement_plan=resolved.plan,
-                worker_max_concurrency=worker_max_concurrency,
-                operation_timeout_s=operation_timeout_s,
-                enable_gpu_tracing=enable_gpu_tracing,
-            )
-        )
+        bootstrap_kwargs = {
+            "env_worker_group": env,
+            "rollout_worker_group": rollout,
+            "placement_plan": resolved.plan,
+            "worker_max_concurrency": worker_max_concurrency,
+            "operation_timeout_s": operation_timeout_s,
+            "enable_gpu_tracing": enable_gpu_tracing,
+        }
+        # Preserve the exact legacy bootstrap call for default-mode callers,
+        # including injected bootstrappers with the old keyword signature.
+        if completed_bundle_handoff != "retain_overlap":
+            bootstrap_kwargs["completed_bundle_handoff"] = completed_bundle_handoff
+        runtime = asyncio.run(bootstrapper(**bootstrap_kwargs))
     except BaseException as primary_error:
         from .runtime import close_worker_groups_after_bootstrap_failure
 

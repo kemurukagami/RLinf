@@ -1244,13 +1244,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         observed_ranks = tuple(
             sorted({identity.env_worker_rank for identity in transition_ids})
         )
-        if observed_ranks != contributing_dp_ranks:
-            raise ValueError("actor transition ranks do not match collection")
+        unknown_ranks = set(observed_ranks) - set(contributing_dp_ranks)
+        if unknown_ranks:
+            raise ValueError(
+                "actor transition ranks are outside the collection: "
+                f"observed={observed_ranks}, collection={contributing_dp_ranks}"
+            )
         received_trajectories = int(versions.shape[1])
         receipt = ElasticBatchReceipt(
             lifecycle_generation=lifecycle_generation,
             policy_version=policy_version,
-            contributing_dp_ranks=contributing_dp_ranks,
+            # This is a shard-local receipt. The runtime validates global rank
+            # coverage and routing multiplicity across every actor receipt.
+            contributing_dp_ranks=observed_ranks,
             expected_trajectories=expected_trajectories,
             received_trajectories=received_trajectories,
             transition_count=len(transition_ids),

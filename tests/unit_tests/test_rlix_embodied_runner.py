@@ -359,6 +359,40 @@ def test_actor_seals_only_complete_single_version_cpu_batch() -> None:
         )
 
 
+def test_actor_seal_reports_local_subset_of_collection_contributors() -> None:
+    actor = object.__new__(EmbodiedFSDPActor)
+    actor._rlix_batch_receipt = None
+    actor.rollout_batch = {"versions": torch.full((3, 8, 1), 6)}
+    actor._rlix_received_transition_ids = (
+        RolloutTransitionIdentity(2, 0, 0, 0),
+        RolloutTransitionIdentity(2, 0, 0, 1),
+    )
+
+    receipt = actor.seal_rlix_batch(
+        lifecycle_generation=2,
+        policy_version=6,
+        contributing_dp_ranks=(0, 1),
+        expected_trajectories=8,
+    )
+
+    assert receipt.contributing_dp_ranks == (0,)
+
+
+def test_actor_seal_rejects_contributor_outside_collection() -> None:
+    actor = object.__new__(EmbodiedFSDPActor)
+    actor._rlix_batch_receipt = None
+    actor.rollout_batch = {"versions": torch.full((3, 8, 1), 6)}
+    actor._rlix_received_transition_ids = (RolloutTransitionIdentity(2, 2, 0, 0),)
+
+    with pytest.raises(ValueError, match="outside the collection"):
+        actor.seal_rlix_batch(
+            lifecycle_generation=2,
+            policy_version=6,
+            contributing_dp_ranks=(0, 1),
+            expected_trajectories=8,
+        )
+
+
 def test_actor_rejects_partial_or_mixed_version_batch() -> None:
     actor = object.__new__(EmbodiedFSDPActor)
     actor._rlix_batch_receipt = None

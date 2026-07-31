@@ -901,6 +901,20 @@ class MultiStepRolloutWorker(Worker):
             )
         if self.version != cursor.policy_version:
             raise ValueError("Applied rollout policy version changed during collection")
+        if request.kind is ElasticRolloutRequestKind.OBSERVATION:
+            if request.final_bootstrap and cursor.committed_chunk_count == 0:
+                raise ValueError(
+                    "Elastic final bootstrap requires at least one committed chunk"
+                )
+            if cursor.committed_chunk_count > self.n_train_chunk_steps:
+                raise ValueError("Elastic rollout exceeded its fixed chunk horizon")
+            if (
+                not request.final_bootstrap
+                and cursor.committed_chunk_count == self.n_train_chunk_steps
+            ):
+                raise ValueError(
+                    "Fixed-horizon final observation is missing final-bootstrap marker"
+                )
 
     def _build_train_rollout_result(
         self,
@@ -1043,9 +1057,7 @@ class MultiStepRolloutWorker(Worker):
                 if self._elastic_dagger_epoch_index != cursor.epoch_index:
                     self.update_dagger_beta()
                     self._elastic_dagger_epoch_index = cursor.epoch_index
-                final_bootstrap = (
-                    cursor.committed_chunk_count == self.n_train_chunk_steps
-                )
+                final_bootstrap = request.final_bootstrap
                 cursor.phase = (
                     RolloutPeerPhase.FINALIZING
                     if final_bootstrap

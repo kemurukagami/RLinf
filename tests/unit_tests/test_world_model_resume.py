@@ -772,6 +772,7 @@ def _make_wan_worker(monkeypatch):
 
 def test_wan_worker_snapshot_owns_cpu_state_and_restores(monkeypatch):
     source = _make_wan_worker(monkeypatch)
+    source.train_prev_done[0][1] = True
     state = source.snapshot_rollout_stage()
     BaseWorldEnv.assert_cpu_only(state)
 
@@ -787,6 +788,7 @@ def test_wan_worker_snapshot_owns_cpu_state_and_restores(monkeypatch):
         expected_lifecycle_generation=2,
         expected_policy_version=7,
     )
+    assert target.train_prev_done[0].tolist() == [False, True]
 
     assert target._rollout_cursor.phase is RolloutCursorPhase.BOOTSTRAP_PENDING
     assert target._resume_bootstraps[0] is not None

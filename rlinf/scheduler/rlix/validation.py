@@ -20,7 +20,12 @@ _RLIX_DEFAULTS: dict[str, Any] = {
     "worker_max_concurrency": 2,
     "operation_timeout_s": 300.0,
     "enable_gpu_tracing": False,
+    "completed_bundle_handoff": "retain_overlap",
 }
+
+_COMPLETED_BUNDLE_HANDOFF_POLICIES = frozenset(
+    {"retain_overlap", "release_before_training"}
+)
 
 
 def _select(cfg: DictConfig, path: str, default: Any = None) -> Any:
@@ -45,6 +50,21 @@ def _require_false(cfg: DictConfig, path: str) -> None:
     value = _select(cfg, path, False)
     if value is not False:
         _reject(path, value, "to be false")
+
+
+def validate_rank_early_completion_config(cfg: DictConfig) -> None:
+    """Validate the opt-in rank-level trajectory completion contract."""
+    stop_rank_when_all_done = _select(cfg, "env.train.stop_rank_when_all_done", False)
+    if not isinstance(stop_rank_when_all_done, bool):
+        _reject(
+            "env.train.stop_rank_when_all_done",
+            stop_rank_when_all_done,
+            "to be a boolean",
+        )
+    if stop_rank_when_all_done:
+        _require_exact(cfg, "rollout.pipeline_stage_num", 1)
+        _require_false(cfg, "env.train.auto_reset")
+        _require_false(cfg, "env.train.ignore_terminations")
 
 
 def normalize_rlix_config(cfg: DictConfig) -> None:
@@ -100,6 +120,16 @@ def validate_elastic_vla_config(cfg: DictConfig) -> None:
             cfg.rlix.enable_gpu_tracing,
             "to be a boolean",
         )
+    handoff = cfg.rlix.completed_bundle_handoff
+    if (
+        not isinstance(handoff, str)
+        or handoff not in _COMPLETED_BUNDLE_HANDOFF_POLICIES
+    ):
+        _reject(
+            "rlix.completed_bundle_handoff",
+            handoff,
+            "to be 'retain_overlap' or 'release_before_training'",
+        )
 
     _require_exact(cfg, "cluster.num_nodes", 1)
     _require_exact(cfg, "runner.task_type", "embodied")
@@ -142,6 +172,7 @@ def validate_elastic_vla_config(cfg: DictConfig) -> None:
     if env_type not in {"wan_wm", "opensora_wm"}:
         _reject("env.train.env_type", env_type, "to be 'wan_wm' or 'opensora_wm'")
     _require_true(cfg, "env.train.use_fixed_reset_state_ids")
+    validate_rank_early_completion_config(cfg)
     _require_false(cfg, "env.train.data_collection.enabled")
     _require_false(cfg, "algorithm.dagger.online_lerobot.enabled")
     if _select(cfg, "algorithm.loss_type", "") == "rlt_ac":
@@ -216,6 +247,7 @@ def validate_elastic_vla_placement(
 __all__ = [
     "RLixConfigurationError",
     "normalize_rlix_config",
+    "validate_rank_early_completion_config",
     "validate_elastic_vla_config",
     "validate_rlix_entrypoint",
     "validate_elastic_vla_placement",

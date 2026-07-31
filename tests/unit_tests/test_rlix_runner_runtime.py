@@ -121,6 +121,8 @@ def _runtime(
     scheduler: _Scheduler | None = None,
     actor_train_devices: tuple[int, ...] = (2,),
     retain_training_overlap: bool = False,
+    actor_worker_count: int = 1,
+    env_worker_count: int = 1,
 ) -> RegisteredRLixPipeline:
     return RegisteredRLixPipeline(
         control_plane=_ControlPlane(events),
@@ -129,9 +131,15 @@ def _runtime(
         pipeline_id="rlinf_123456789abc",
         ray_namespace="namespace",
         placement_plan=SimpleNamespace(
-            actor_workers=(SimpleNamespace(rank=0),),
-            rollout_workers=(SimpleNamespace(rank=0),),
-            env_workers=(SimpleNamespace(rank=0),),
+            actor_workers=tuple(
+                SimpleNamespace(rank=rank) for rank in range(actor_worker_count)
+            ),
+            rollout_workers=tuple(
+                SimpleNamespace(rank=rank) for rank in range(env_worker_count)
+            ),
+            env_workers=tuple(
+                SimpleNamespace(rank=rank) for rank in range(env_worker_count)
+            ),
             actor_infer_devices=(0, 1, 3, 4),
             actor_infer_bundles=((0, (0, 1)), (1, (3, 4))),
             initialization_devices=(0, 1, 2),
@@ -553,7 +561,144 @@ def test_collection_retains_training_bundle_and_transitions_atomically() -> None
         "transition:(0,):rlinf_123456789abc_actor_train:ACTOR_TRAINING"
     ) < events.index("clear_progress:rlinf_123456789abc")
     assert runtime.stage_state == RunnerStageState.INACTIVE
+
+
+def test_full_gpu_training_releases_both_completed_bundles_before_request() -> None:
+    events: list[str] = []
+    scheduler = _Scheduler(
+        events,
+        grants={
+            "rlinf_123456789abc_actor_infer": [0, 1, 3, 4],
+            "rlinf_123456789abc_actor_train": [0, 1, 3, 4],
+        },
+    )
+    runtime = _runtime(
+        events,
+        scheduler=scheduler,
+        actor_train_devices=(0, 1, 3, 4),
+        retain_training_overlap=False,
+    )
+    session = runtime.begin_collection(
+        policy_version=2,
+        assigned_trajectories_by_rank={0: 2, 1: 2},
+        env_input_channel="env",
+        rollout_request_channel="rollout",
+        actor_channel="actor",
+        actor_receiver_start=lambda: SimpleNamespace(
+            wait=lambda: events.append("wait_receiver")
+        ),
+    )
+    result = ElasticRunResult(ElasticRunOutcome.COMPLETED, None, None)
+    for rank in (0, 1):
+        runtime.controller.observations[rank] = SimpleNamespace(
+            dp_rank=rank,
+            failure=None,
+            callback_applied_active=True,
+            progress=ElasticRankProgress(
+                dp_rank=rank,
+                lifecycle_generation=1,
+                state=ElasticRankState.COMPLETED,
+                assigned_trajectories=2,
+                completed_trajectories=2,
+                snapshot_ready=False,
+                failed=False,
+            ),
+            paired_results=(result, result),
+        )
+
+    assert runtime.monitor_collection_once(session)
+    assert session.released_dp_ranks == {0, 1}
+    assert session.active_dp_ranks == set()
+    assert session.reserved_dp_ranks == set()
+    runtime.seal_collection(
+        session,
+        actor_seal_start=lambda expected: SimpleNamespace(
+            wait=lambda: [ElasticBatchReceipt(1, 2, (0, 1), expected, expected, 12)]
+        ),
+    )
+    assert runtime.stage_state is RunnerStageState.INACTIVE
+
+    with runtime.fixed_stage(
+        cluster_name=ACTOR_TRAIN_CLUSTER_NAME,
+        priority=Priority.ACTOR_TRAINING,
+        global_step=2,
+    ) as stage:
+        stage.complete(_receipt(ACTOR_TRAIN_CLUSTER_NAME, (0, 1, 3, 4)))
+
+    assert "await_release:(0, 1)" in events
+    request = "request:rlinf_123456789abc_actor_train:ACTOR_TRAINING:2"
+    assert request in events
+    assert events.index("await_release:(0, 1)") < events.index(request)
+    assert not any(event.startswith("transition:") for event in events)
     assert runtime.stage_state == RunnerStageState.INACTIVE
+
+
+@pytest.mark.parametrize(
+    ("contributors", "error"),
+    [
+        (((0,), (0,), (1,), (1,)), None),
+        (((0,), (0,), (0,), (1,)), "routing multiplicity"),
+        (((0,), (0,), (0,), (0,)), "do not cover every collection rank"),
+    ],
+)
+def test_four_actor_seal_validates_global_contributor_coverage(
+    contributors: tuple[tuple[int, ...], ...], error: str | None
+) -> None:
+    events: list[str] = []
+    scheduler = _Scheduler(
+        events,
+        grants={"rlinf_123456789abc_actor_infer": [0, 1, 3, 4]},
+    )
+    runtime = _runtime(
+        events,
+        scheduler=scheduler,
+        actor_worker_count=4,
+        env_worker_count=2,
+    )
+    session = runtime.begin_collection(
+        policy_version=2,
+        assigned_trajectories_by_rank={0: 16, 1: 16},
+        env_input_channel="env",
+        rollout_request_channel="rollout",
+        actor_channel="actor",
+        actor_receiver_start=lambda: SimpleNamespace(wait=lambda: None),
+    )
+    result = ElasticRunResult(ElasticRunOutcome.COMPLETED, None, None)
+    for rank in (0, 1):
+        runtime.controller.observations[rank] = SimpleNamespace(
+            dp_rank=rank,
+            failure=None,
+            callback_applied_active=True,
+            progress=ElasticRankProgress(
+                dp_rank=rank,
+                lifecycle_generation=1,
+                state=ElasticRankState.COMPLETED,
+                assigned_trajectories=16,
+                completed_trajectories=16,
+                snapshot_ready=False,
+                failed=False,
+            ),
+            paired_results=(result, result),
+        )
+    assert runtime.monitor_collection_once(session)
+
+    def seal(expected: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            wait=lambda: [
+                ElasticBatchReceipt(1, 2, ranks, expected, expected, 33)
+                for ranks in contributors
+            ]
+        )
+
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            runtime.seal_collection(session, actor_seal_start=seal)
+        return
+
+    aggregate = runtime.seal_collection(session, actor_seal_start=seal)
+    assert aggregate.contributing_dp_ranks == (0, 1)
+    assert aggregate.expected_trajectories == 32
+    assert aggregate.received_trajectories == 32
 
 
 def test_scheduler_driven_completed_rank_shrink_is_not_released_twice() -> None:

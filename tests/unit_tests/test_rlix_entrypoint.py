@@ -68,8 +68,10 @@ def test_preflight_resolves_and_validates_before_launch() -> None:
     actor = _Group("actor", events)
     rollout = _Group("rollout", events)
     env = _Group("env", events)
+    bootstrap_kwargs = {}
 
     async def bootstrapper(**kwargs):
+        bootstrap_kwargs.update(kwargs)
         events.append("bootstrap")
         return "runtime"
 
@@ -85,6 +87,7 @@ def test_preflight_resolves_and_validates_before_launch() -> None:
         worker_max_concurrency=3,
         operation_timeout_s=12.0,
         enable_gpu_tracing=False,
+        completed_bundle_handoff="release_before_training",
         bootstrapper=bootstrapper,
     )
 
@@ -96,6 +99,7 @@ def test_preflight_resolves_and_validates_before_launch() -> None:
         "launch:env",
         "bootstrap",
     ]
+    assert bootstrap_kwargs["completed_bundle_handoff"] == ("release_before_training")
 
 
 def test_preflight_failure_launches_no_groups() -> None:

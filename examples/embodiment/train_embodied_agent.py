@@ -135,6 +135,7 @@ def main(cfg) -> None:
             worker_max_concurrency=cfg.rlix.worker_max_concurrency,
             operation_timeout_s=cfg.rlix.operation_timeout_s,
             enable_gpu_tracing=cfg.rlix.enable_gpu_tracing,
+            completed_bundle_handoff=cfg.rlix.completed_bundle_handoff,
             bootstrapper=bootstrap_registered_rlix_pipeline,
         )
         actor_group = launched.actor

@@ -2628,6 +2628,58 @@ broad RLinf RLix suite and 129 passed with one skipped test for `rlix-core`.
 Ruff and diff checks pass. T8 remains in progress and the definition of done
 below is unchanged.
 
+The separate root document
+`../FUTURE_FUNGIBLE_WORK_AND_FULL_GPU_TRAINING_DESIGN.md` records deferred
+logical-work/physical-slot separation and an all-four-GPU actor-training
+experiment. Those proposals do not alter this plan's current pinned-rank
+acceptance contract or definition of done.
+
+The initial all-four-GPU FSDP experiment was implemented on 2026-07-30 as
+separate `task8_four_rank_fsdp_acceptance.py`,
+`task8_four_rank_fsdp_driver.py`, and
+`task8_wan_disaggregated_four_rank_fsdp.yaml` files. The existing Task 8 E2E
+files remain unchanged. The opt-in `completed_bundle_handoff` runtime policy
+defaults to `retain_overlap`; only the new experiment selects
+`release_before_training`, allowing both completed bundles to reach the other
+pipeline before a fixed `[0,1,2,3]` actor-training request preempts them. The
+new gate holds A after its first seal until B has entered real chunks on both
+generation ranks; terminal validation requires drain/offload/restore evidence
+from both B ranks and completed training events from all four A actor ranks. CPU
+configuration/runtime regressions pass, but no four-rank GPU run has yet been
+recorded, so this is implementation progress rather than T8 acceptance.
+
+The first GPU attempt reached real generation but exposed a local GRPO routing
+constraint before batch seal: sixteen global trajectories became four per
+actor rank, which is not divisible by `group_size: 8`. The isolated overlay now
+uses 32 environments, yielding eight trajectories per actor rank, and its
+driver rejects partial local GRPO groups before Ray/model startup.
+
+The next GPU attempt passed that preflight and reached production batch seal.
+It failed because the previous actor receipt contract compared every actor's
+local transition contributors with the complete global collection contributor
+tuple `(0, 1)`. Four-way FSDP routing does not replicate the whole collection
+to every actor: environment rank 0 supplies actor ranks 0 and 1, while
+environment rank 1 supplies actor ranks 2 and 3. The correct local receipts are
+therefore `(0,)`, `(0,)`, `(1,)`, and `(1,)`, each for eight trajectories.
+
+The seal contract now separates local evidence from aggregate validation:
+
+- each actor reports only the generation ranks observed in its local shard and
+  rejects any contributor outside the declared collection;
+- lifecycle, policy version, and exact per-actor trajectory count remain
+  mandatory on every receipt;
+- the registered runtime requires the union of actor-local contributors to
+  equal the complete collection contributor set; and
+- the runtime validates topology-derived sender fanout. With `S` environment
+  senders and `A` actor receivers, each sender must occur in
+  `lcm(S, A) / S` receipts, which is two for this two-sender/four-actor layout.
+
+This is not a relaxation of complete-batch validation. A missing sender,
+foreign sender, duplicated route, partial actor shard, or mixed lifecycle or
+policy still fails before advantage calculation and training. The focused
+four-rank/acceptance regression set passes 136 tests, and the broad RLix suite
+passes 253 tests with two skips. Four-rank GPU rerun evidence remains pending.
+
 ## 20. Definition of done
 
 T8 and the T0-T8 project are complete only when all of the following are true:

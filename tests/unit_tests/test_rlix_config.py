@@ -76,6 +76,7 @@ def test_enabled_mode_inserts_documented_defaults() -> None:
         "worker_max_concurrency": 2,
         "operation_timeout_s": 300.0,
         "enable_gpu_tracing": False,
+        "completed_bundle_handoff": "retain_overlap",
     }
 
 
@@ -87,6 +88,11 @@ def test_enabled_mode_inserts_documented_defaults() -> None:
         ("rlix.operation_timeout_s", False, "operation_timeout_s"),
         ("rlix.operation_timeout_s", 0, "operation_timeout_s"),
         ("rlix.enable_gpu_tracing", 1, "enable_gpu_tracing"),
+        (
+            "rlix.completed_bundle_handoff",
+            "release_immediately",
+            "completed_bundle_handoff",
+        ),
         ("cluster.num_nodes", 2, "cluster.num_nodes"),
         ("cluster.profiling.enabled", True, "cluster.profiling.enabled"),
         ("runner.task_type", "embodied_eval", "runner.task_type"),
@@ -110,6 +116,11 @@ def test_enabled_mode_inserts_documented_defaults() -> None:
         ("env.train.enable_init_offload", False, "enable_init_offload"),
         ("env.train.env_type", "libero", "env.train.env_type"),
         ("env.train.use_fixed_reset_state_ids", False, "use_fixed_reset_state_ids"),
+        (
+            "env.train.stop_rank_when_all_done",
+            "yes",
+            "stop_rank_when_all_done",
+        ),
         ("env.train.data_collection.enabled", True, "data_collection"),
         ("algorithm.dagger.online_lerobot.enabled", True, "online_lerobot"),
         ("algorithm.loss_type", "rlt_ac", "algorithm.loss_type"),
@@ -135,6 +146,18 @@ def test_enabled_evaluation_requires_environment_offload() -> None:
     cfg.env.eval.enable_offload = False
 
     with pytest.raises(RLixConfigurationError, match="env.eval.enable_offload"):
+        validate_elastic_vla_config(cfg)
+
+
+@pytest.mark.parametrize(
+    "path", ["env.train.auto_reset", "env.train.ignore_terminations"]
+)
+def test_rank_early_completion_requires_post_terminal_masking(path: str) -> None:
+    cfg = _valid_config()
+    cfg.env.train.stop_rank_when_all_done = True
+    OmegaConf.update(cfg, path, True, force_add=True)
+
+    with pytest.raises(RLixConfigurationError, match=path):
         validate_elastic_vla_config(cfg)
 
 

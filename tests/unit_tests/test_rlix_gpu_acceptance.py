@@ -16,7 +16,10 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.scheduler.rlix.validation import validate_elastic_vla_config
+from rlinf.scheduler.rlix.validation import (
+    validate_elastic_vla_config,
+    validate_rank_early_completion_config,
+)
 
 
 def _load_acceptance_support():
@@ -946,6 +949,47 @@ def test_four_gpu_wan_driver_config_composes_two_rank_topology(tmp_path: Path) -
     assert channels == names.runner_channel_names()
 
 
+def test_four_rank_fsdp_variant_composes_all_gpu_actor_world(tmp_path: Path) -> None:
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "e2e_tests"
+        / "embodied"
+        / "task8_wan_disaggregated_four_rank_fsdp.yaml"
+    )
+    names = derive_role_names(run_id="four-rank-fsdp", role="a")
+
+    def pure_validator(cfg):
+        validate_elastic_vla_config(cfg)
+        return cfg
+
+    cfg, _ = compose_wan_model_driver_config(
+        config_path,
+        names=names,
+        driver_dir=tmp_path / "driver-a",
+        validator=pure_validator,
+    )
+
+    assert OmegaConf.to_container(cfg.cluster.component_placement) == {
+        "actor": "0,1,2,3",
+        "rollout": "0,1",
+        "env": "2,3",
+    }
+    assert cfg.actor.training_backend == "fsdp"
+    assert (
+        OmegaConf.select(cfg, "actor.model.tensor_model_parallel_size", default=1) == 1
+    )
+    assert (
+        OmegaConf.select(cfg, "actor.model.pipeline_model_parallel_size", default=1)
+        == 1
+    )
+    assert cfg.actor.global_batch_size == 32
+    assert cfg.actor.micro_batch_size == 1
+    assert cfg.env.train.total_num_envs == 32
+    assert OmegaConf.load(config_path).smoke.completed_bundle_handoff == (
+        "release_before_training"
+    )
+
+
 def test_single_pipeline_diagnostic_preserves_task8_config_and_enables_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -970,6 +1014,7 @@ def test_single_pipeline_diagnostic_preserves_task8_config_and_enables_artifacts
     trajectory_dir = configure_single_pipeline_artifacts(
         cfg, run_dir=tmp_path / "single-control"
     )
+    validate_rank_early_completion_config(cfg)
 
     assert names.prefix == "t8_single-control_single"
     assert channels == names.runner_channel_names()
@@ -989,6 +1034,7 @@ def test_single_pipeline_diagnostic_preserves_task8_config_and_enables_artifacts
     assert cfg.algorithm.filter_rewards is True
     assert cfg.algorithm.rewards_lower_bound == 0.0
     assert cfg.algorithm.rewards_upper_bound == 5.0
+    assert cfg.env.train.stop_rank_when_all_done is True
     assert cfg.env.train.video_cfg.save_video is True
     assert Path(cfg.env.train.video_cfg.video_base_dir) == trajectory_dir / "videos"
     assert Path(cfg.runner.task8_single_pipeline_artifact_dir) == trajectory_dir

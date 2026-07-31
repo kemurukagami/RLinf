@@ -119,6 +119,7 @@ def _bootstrap(
     *,
     controller_fail_close: bool = False,
     enable_gpu_tracing: bool = False,
+    completed_bundle_handoff: str = "retain_overlap",
 ):
     controller_holder = {}
 
@@ -139,6 +140,7 @@ def _bootstrap(
             worker_max_concurrency=3,
             operation_timeout_s=15.0,
             enable_gpu_tracing=enable_gpu_tracing,
+            completed_bundle_handoff=completed_bundle_handoff,
             control_plane_factory=lambda **kwargs: (
                 setattr(control_plane, "env_vars", kwargs["env_vars"]) or control_plane
             ),
@@ -177,6 +179,24 @@ def test_bootstrap_uses_allocated_identity_and_exact_order() -> None:
     assert control_plane.registration["cluster_dp_device_mappings"] == {
         "actor_infer": {0: [0, 1]}
     }
+
+
+def test_bootstrap_release_before_training_disables_overlap_retention() -> None:
+    events: list[str] = []
+    runtime, _ = _bootstrap(
+        _ControlPlane(events),
+        completed_bundle_handoff="release_before_training",
+    )
+
+    assert runtime.retain_training_overlap is False
+
+
+def test_bootstrap_rejects_unknown_completed_bundle_handoff() -> None:
+    with pytest.raises(ValueError, match="completed_bundle_handoff"):
+        _bootstrap(
+            _ControlPlane([]),
+            completed_bundle_handoff="release_eventually",
+        )
 
 
 def test_bootstrap_uses_detached_core_client_and_remote_actor_api(monkeypatch) -> None:

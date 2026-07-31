@@ -436,6 +436,7 @@ class ElasticRolloutRequest:
     logical_batch_size: int
     env_output: dict[str, Any] | None
     drain_request_id: str | None = None
+    final_bootstrap: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, ElasticRolloutRequestKind):
@@ -448,6 +449,8 @@ class ElasticRolloutRequest:
             raise TypeError("logical_batch_size must be an integer")
         if self.logical_batch_size <= 0:
             raise ValueError("logical_batch_size must be positive")
+        if not isinstance(self.final_bootstrap, bool):
+            raise TypeError("final_bootstrap must be a boolean")
         if self.kind is ElasticRolloutRequestKind.OBSERVATION:
             if self.env_output is None:
                 raise ValueError("An observation request must contain env_output")
@@ -466,6 +469,8 @@ class ElasticRolloutRequest:
                     "Observation envelope logical batch size does not match env_output"
                 )
         else:
+            if self.final_bootstrap:
+                raise ValueError("A drain barrier cannot be a final bootstrap")
             if self.env_output is not None:
                 raise ValueError("A drain barrier cannot contain env_output")
             if not self.drain_request_id:
@@ -509,6 +514,7 @@ def split_elastic_rollout_request(
             transition_id=request.transition_id,
             logical_batch_size=size,
             env_output=env_output,
+            final_bootstrap=request.final_bootstrap,
         )
         for size, env_output in zip(split_sizes, split_outputs)
     ]
@@ -533,6 +539,11 @@ def merge_elastic_rollout_requests(
         raise ValueError(
             "Cannot merge rollout requests with different drain request IDs"
         )
+    final_bootstrap_values = {request.final_bootstrap for request in requests}
+    if len(final_bootstrap_values) != 1:
+        raise ValueError(
+            "Cannot merge rollout requests with different final-bootstrap markers"
+        )
 
     if requests[0].kind is ElasticRolloutRequestKind.DRAIN_BARRIER:
         if len(requests) != 1:
@@ -556,6 +567,7 @@ def merge_elastic_rollout_requests(
                 if request.env_output is not None
             ]
         ),
+        final_bootstrap=requests[0].final_bootstrap,
     )
 
 
@@ -770,6 +782,152 @@ class EmbodiedRolloutResult:
 
     curr_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
     next_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
+
+    @staticmethod
+    def _zero_like_nested(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return torch.zeros_like(value)
+        if isinstance(value, dict):
+            return {
+                key: EmbodiedRolloutResult._zero_like_nested(item)
+                for key, item in value.items()
+            }
+        if value is None:
+            return None
+        raise TypeError(
+            "Early-completion padding supports only tensor, mapping, and None "
+            f"values; got {type(value).__name__}"
+        )
+
+    @staticmethod
+    def _clone_nested(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.clone()
+        if isinstance(value, dict):
+            return {
+                key: EmbodiedRolloutResult._clone_nested(item)
+                for key, item in value.items()
+            }
+        if value is None:
+            return None
+        raise TypeError(
+            "Early-completion padding supports only tensor, mapping, and None "
+            f"values; got {type(value).__name__}"
+        )
+
+    def pad_completed_epoch(
+        self,
+        *,
+        completed_epoch_index: int,
+        target_chunk_steps: int,
+        policy_version: int,
+    ) -> int:
+        """Pad one early-completed epoch to fixed-horizon trajectory shapes.
+
+        The real terminal boundary is preserved. Synthetic optimization fields
+        are zero, structurally constrained model inputs repeat the last valid
+        input, synthetic boundary flags are false, and policy versions retain
+        the version used for the real rollout. Consequently the existing
+        cumulative done mask treats every padded action as post-terminal and
+        excludes it from training exactly as in an unshortened fixed-horizon
+        episode.
+
+        Returns:
+            Number of synthetic chunk steps appended.
+        """
+        if not isinstance(completed_epoch_index, int) or isinstance(
+            completed_epoch_index, bool
+        ):
+            raise TypeError("completed_epoch_index must be an integer")
+        if completed_epoch_index < 0:
+            raise ValueError("completed_epoch_index must be non-negative")
+        if not isinstance(target_chunk_steps, int) or isinstance(
+            target_chunk_steps, bool
+        ):
+            raise TypeError("target_chunk_steps must be an integer")
+        if target_chunk_steps <= 0:
+            raise ValueError("target_chunk_steps must be positive")
+        if not isinstance(policy_version, int) or isinstance(policy_version, bool):
+            raise TypeError("policy_version must be an integer")
+        if policy_version < 0:
+            raise ValueError("policy_version must be non-negative")
+
+        action_start = completed_epoch_index * target_chunk_steps
+        boundary_start = completed_epoch_index * (target_chunk_steps + 1)
+        if not self.versions:
+            raise ValueError(
+                "completed epoch has no policy versions from which to infer its chunk count"
+            )
+        action_count = len(self.versions) - action_start
+        boundary_count = len(self.dones) - boundary_start
+        if action_count <= 0 or action_count > target_chunk_steps:
+            raise ValueError(
+                "completed epoch has an invalid chunk count: "
+                f"completed_epoch_index={completed_epoch_index} "
+                f"target_chunk_steps={target_chunk_steps} "
+                f"versions={len(self.versions)} actions={len(self.actions)} "
+                f"forward_inputs={len(self.forward_inputs)}"
+            )
+        if boundary_count != action_count + 1:
+            raise ValueError("completed epoch must contain T+1 done boundaries")
+        terminal_boundaries = torch.stack(
+            self.dones[boundary_start : boundary_start + boundary_count]
+        ).to(dtype=torch.bool)
+        if (
+            not terminal_boundaries.reshape(
+                boundary_count, terminal_boundaries.shape[1], -1
+            )
+            .any(dim=-1)
+            .any(dim=0)
+            .all()
+        ):
+            raise ValueError(
+                "every trajectory must have a real terminal boundary before padding"
+            )
+
+        action_fields = (
+            "actions",
+            "intervene_flags",
+            "rewards",
+            "prev_logprobs",
+            "versions",
+            "forward_inputs",
+            "curr_obs",
+            "next_obs",
+        )
+        boundary_fields = ("terminations", "truncations", "dones", "prev_values")
+        for name in action_fields:
+            values = getattr(self, name)
+            if values and len(values) != action_start + action_count:
+                raise ValueError(f"{name} does not align with completed epoch actions")
+        for name in boundary_fields:
+            values = getattr(self, name)
+            if values and len(values) != boundary_start + boundary_count:
+                raise ValueError(
+                    f"{name} does not align with completed epoch boundaries"
+                )
+
+        padding_count = target_chunk_steps - action_count
+        for _ in range(padding_count):
+            for name in action_fields:
+                values = getattr(self, name)
+                if not values:
+                    continue
+                if name == "versions":
+                    values.append(torch.full_like(values[-1], float(policy_version)))
+                elif name in {"forward_inputs", "curr_obs", "next_obs"}:
+                    # Padded model inputs still pass through the actor forward
+                    # path before the cumulative-done mask removes their loss.
+                    # Repeat a valid input instead of inventing all-zero token
+                    # sequences or attention masks that violate model contracts.
+                    values.append(self._clone_nested(values[-1]))
+                else:
+                    values.append(self._zero_like_nested(values[-1]))
+            for name in boundary_fields:
+                values = getattr(self, name)
+                if values:
+                    values.append(self._zero_like_nested(values[-1]))
+        return padding_count
 
     def append_step_result(self, result: ChunkStepResult):
         if result.actions is not None:

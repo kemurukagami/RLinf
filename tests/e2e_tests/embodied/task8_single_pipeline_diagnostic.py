@@ -44,6 +44,7 @@ from rlinf.scheduler.rlix.entrypoint import (
 )
 from rlinf.scheduler.rlix.protocol import RunnerStageState
 from rlinf.scheduler.rlix.runtime import bootstrap_registered_rlix_pipeline
+from rlinf.scheduler.rlix.validation import validate_rank_early_completion_config
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 from rlinf.workers.env.env_worker import EnvWorker
@@ -75,6 +76,7 @@ def configure_single_pipeline_artifacts(
     root = Path(run_dir).resolve()
     trajectory_dir = root / "trajectories"
     with open_dict(cfg):
+        cfg.env.train.stop_rank_when_all_done = True
         cfg.env.train.video_cfg.save_video = True
         cfg.env.train.video_cfg.video_base_dir = str(trajectory_dir / "videos")
         cfg.env.train.video_cfg.info_on_video = True
@@ -285,6 +287,7 @@ def run(args: argparse.Namespace) -> None:
         driver_dir=run_dir,
     )
     trajectory_dir = configure_single_pipeline_artifacts(cfg, run_dir=run_dir)
+    validate_rank_early_completion_config(cfg)
     (run_dir / "resolved_config.yaml").write_text(
         OmegaConf.to_yaml(cfg, resolve=True), encoding="utf-8"
     )

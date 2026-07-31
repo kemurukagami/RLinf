@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, TypeVar
 
@@ -428,16 +430,43 @@ class RegisteredRLixPipeline:
             )
             if not isinstance(receipts, list) or len(receipts) != actor_count:
                 raise ValueError("actor seal must return one receipt per actor rank")
+            contribution_counts: Counter[int] = Counter()
+            expected_rank_set = set(expected_ranks)
             for receipt in receipts:
                 if not isinstance(receipt, ElasticBatchReceipt):
                     raise TypeError("actor returned an invalid batch receipt")
                 if (
                     receipt.lifecycle_generation != session.context.lifecycle_generation
                     or receipt.policy_version != session.context.policy_version
-                    or receipt.contributing_dp_ranks != expected_ranks
                     or receipt.expected_trajectories != target // actor_count
                 ):
                     raise ValueError("actor batch receipt does not match collection")
+                unknown_ranks = set(receipt.contributing_dp_ranks) - expected_rank_set
+                if unknown_ranks:
+                    raise ValueError(
+                        "actor batch receipt contains contributors outside collection: "
+                        f"{sorted(unknown_ranks)}"
+                    )
+                contribution_counts.update(receipt.contributing_dp_ranks)
+            observed_rank_set = set(contribution_counts)
+            if observed_rank_set != expected_rank_set:
+                raise ValueError(
+                    "actor batch receipts do not cover every collection rank: "
+                    f"expected={expected_ranks}, observed={tuple(sorted(observed_rank_set))}"
+                )
+            sender_count = len(self.placement_plan.env_workers)
+            expected_fanout = math.lcm(sender_count, actor_count) // sender_count
+            invalid_multiplicity = {
+                rank: contribution_counts[rank]
+                for rank in expected_ranks
+                if contribution_counts[rank] != expected_fanout
+            }
+            if invalid_multiplicity:
+                raise ValueError(
+                    "actor batch contributor routing multiplicity does not match "
+                    f"env-to-actor topology: expected_fanout={expected_fanout}, "
+                    f"observed={invalid_multiplicity}"
+                )
             aggregate = ElasticBatchReceipt(
                 lifecycle_generation=session.context.lifecycle_generation,
                 policy_version=session.context.policy_version,
@@ -877,12 +906,23 @@ async def bootstrap_registered_rlix_pipeline(
     worker_max_concurrency: int,
     operation_timeout_s: float,
     enable_gpu_tracing: bool = False,
+    completed_bundle_handoff: str = "retain_overlap",
     control_plane_factory: Callable[..., Any] | None = None,
     controller_factory: Callable[..., Any] = RLixStageController,
 ) -> RegisteredRLixPipeline:
     """Create, register, and admit one pipeline without requesting allocation."""
     if not isinstance(enable_gpu_tracing, bool):
         raise TypeError("enable_gpu_tracing must be a boolean")
+    if not isinstance(
+        completed_bundle_handoff, str
+    ) or completed_bundle_handoff not in {
+        "retain_overlap",
+        "release_before_training",
+    }:
+        raise ValueError(
+            "completed_bundle_handoff must be 'retain_overlap' or "
+            "'release_before_training'"
+        )
     factory = control_plane_factory or connect_control_plane
     control_plane = factory(
         env_vars={"RLIX_ENABLE_GPU_TRACING": "1"} if enable_gpu_tracing else {}
@@ -940,7 +980,7 @@ async def bootstrap_registered_rlix_pipeline(
         ray_namespace=ray_namespace,
         placement_plan=placement_plan,
         operation_timeout_s=operation_timeout_s,
-        retain_training_overlap=True,
+        retain_training_overlap=completed_bundle_handoff == "retain_overlap",
     )
 
 

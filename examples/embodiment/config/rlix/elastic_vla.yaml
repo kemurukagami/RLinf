@@ -5,3 +5,7 @@ progress_unit: trajectories
 worker_max_concurrency: 2
 operation_timeout_s: 300.0
 enable_gpu_tracing: false
+# Keep completed generation bundles resident for the common narrow-training
+# topology. Set release_before_training when fixed FSDP training spans every
+# generation bundle and must reclaim them through scheduler preemption.
+completed_bundle_handoff: retain_overlap

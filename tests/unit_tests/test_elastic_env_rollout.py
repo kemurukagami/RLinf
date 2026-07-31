@@ -6,9 +6,12 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+from rlinf.algorithms.registry import calculate_adv_and_returns
 from rlinf.data.embodied_io_struct import (
+    ChunkStepResult,
     ElasticRolloutRequest,
     ElasticRolloutRequestKind,
+    EmbodiedRolloutResult,
     EnvOutput,
     RolloutResult,
     infer_elastic_rollout_request_batch_size,
@@ -19,6 +22,7 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.scheduler.rlix.coordinator import RLixResizeCoordinator
 from rlinf.scheduler.rlix.protocol import ElasticCollectionContext
 from rlinf.scheduler.worker.routing import build_send_plan
+from rlinf.utils.metric_utils import compute_loss_mask
 from rlinf.workers.elastic_rollout_lifecycle import (
     CompletedResidencyReceipt,
     DrainRequest,
@@ -240,6 +244,7 @@ def _elastic_env_worker(*, rank=0, world_size=1):
     worker._elastic_failure = None
     worker._environment_resident = False
     worker._lifecycle_generation = 0
+    worker.stop_rank_when_all_done = False
     worker._validate_snapshot_capability = lambda: None
     worker.sent_requests = []
     worker.send_works = []
@@ -264,6 +269,10 @@ def _configure_single_chunk_env(worker, *, snapshot_factory=lambda: object()):
     worker.use_training_pipeline = False
     worker.enable_online_lerobot = False
     worker.enable_rlt = False
+    worker.stop_rank_when_all_done = False
+    worker.train_prev_done = [
+        torch.zeros(worker.train_num_envs_per_stage, dtype=torch.bool)
+    ]
     worker.model_cfg = SimpleNamespace(num_action_chunks=1)
     worker._rollout_call_active = False
     worker._policy_request_in_flight = False
@@ -330,6 +339,50 @@ def test_transition_identity_merge_preserves_legacy_and_identified_values():
 
     assert merge_transition_identities([None, None]) is None
     assert merge_transition_identities([identity, identity]) == identity
+
+
+def test_elastic_rollout_request_validates_final_bootstrap_marker():
+    with pytest.raises(TypeError, match="final_bootstrap must be a boolean"):
+        ElasticRolloutRequest(
+            kind=ElasticRolloutRequestKind.OBSERVATION,
+            transition_id=_identity(),
+            logical_batch_size=1,
+            env_output=_env_output(_identity()).to_dict(),
+            final_bootstrap=1,
+        )
+
+    with pytest.raises(ValueError, match="drain barrier cannot be a final"):
+        ElasticRolloutRequest(
+            kind=ElasticRolloutRequestKind.DRAIN_BARRIER,
+            transition_id=_identity(),
+            logical_batch_size=1,
+            env_output=None,
+            drain_request_id="drain-1",
+            final_bootstrap=True,
+        )
+
+
+def test_elastic_rollout_request_split_and_merge_preserve_final_bootstrap():
+    output = EnvOutput(
+        obs={"states": torch.zeros((2, 2))},
+        dones=torch.zeros((2, 1), dtype=torch.bool),
+        transition_id=_identity(),
+    )
+    request = ElasticRolloutRequest(
+        kind=ElasticRolloutRequestKind.OBSERVATION,
+        transition_id=_identity(),
+        logical_batch_size=2,
+        env_output=output.to_dict(),
+        final_bootstrap=True,
+    )
+
+    shards = split_elastic_rollout_request(request, [1, 1])
+    assert all(shard.final_bootstrap for shard in shards)
+    assert merge_elastic_rollout_requests(shards).final_bootstrap
+
+    shards[1].final_bootstrap = False
+    with pytest.raises(ValueError, match="different final-bootstrap"):
+        merge_elastic_rollout_requests(shards)
 
 
 def test_rollout_result_merge_preserves_identity():
@@ -691,6 +744,7 @@ def test_elastic_rollout_completes_chunk_and_final_bootstrap_once():
             transition_id=_identity(sequence=sequence),
             logical_batch_size=1,
             env_output=_env_output(_identity(sequence=sequence)).to_dict(),
+            final_bootstrap=sequence == 1,
         )
         for sequence in (0, 1)
     ]
@@ -706,6 +760,375 @@ def test_elastic_rollout_completes_chunk_and_final_bootstrap_once():
     assert worker.sent_results[0].versions is not None
     assert worker.sent_results[1].versions is None
     assert all(work.awaited for work in worker.send_works)
+
+
+def test_elastic_rollout_accepts_early_final_bootstrap():
+    requests = [
+        ElasticRolloutRequest(
+            kind=ElasticRolloutRequestKind.OBSERVATION,
+            transition_id=_identity(sequence=sequence),
+            logical_batch_size=1,
+            env_output=_env_output(_identity(sequence=sequence)).to_dict(),
+            final_bootstrap=sequence == 1,
+        )
+        for sequence in (0, 1)
+    ]
+    worker = _elastic_rollout_worker(requests)
+    worker.n_train_chunk_steps = 4
+    worker.prepare_elastic_collection(lifecycle_generation=1, expected_policy_version=3)
+
+    result = asyncio.run(worker.generate_until_pause_or_complete(None, None))
+
+    assert result.outcome is ElasticRunOutcome.COMPLETED
+    assert worker.predict_count == 2
+    assert worker.sent_results[0].versions is not None
+    assert worker.sent_results[1].versions is None
+
+
+def test_elastic_rollout_rejects_final_bootstrap_before_committed_chunk():
+    request = ElasticRolloutRequest(
+        kind=ElasticRolloutRequestKind.OBSERVATION,
+        transition_id=_identity(),
+        logical_batch_size=1,
+        env_output=_env_output(_identity()).to_dict(),
+        final_bootstrap=True,
+    )
+    worker = _elastic_rollout_worker([request])
+    worker.prepare_elastic_collection(lifecycle_generation=1, expected_policy_version=3)
+
+    with pytest.raises(ValueError, match="at least one committed chunk"):
+        asyncio.run(worker.generate_until_pause_or_complete(None, None))
+
+    assert worker.predict_count == 0
+
+
+def _completed_early_rollout_result() -> EmbodiedRolloutResult:
+    result = EmbodiedRolloutResult(max_episode_length=4)
+    batch_size = 2
+    for step in range(2):
+        done = torch.zeros((batch_size, 1), dtype=torch.bool)
+        result.append_step_result(
+            ChunkStepResult(
+                actions=torch.full((batch_size, 2), float(step + 1)),
+                rewards=torch.tensor([[float(step + 1)], [float(2 * (step + 1))]]),
+                terminations=torch.zeros_like(done),
+                truncations=torch.zeros_like(done),
+                dones=torch.zeros_like(done),
+                prev_logprobs=torch.full((batch_size, 1), 0.25),
+                prev_values=torch.full((batch_size, 1), 0.5),
+                versions=torch.full((batch_size, 1), 7.0),
+                forward_inputs={"action": torch.full((batch_size, 2), 1.0)},
+            )
+        )
+        result.append_transitions(
+            {"states": torch.full((batch_size, 2), float(step))},
+            {"states": torch.full((batch_size, 2), float(step + 1))},
+        )
+    result.append_step_result(
+        ChunkStepResult(
+            rewards=None,
+            terminations=torch.ones((batch_size, 1), dtype=torch.bool),
+            truncations=torch.zeros((batch_size, 1), dtype=torch.bool),
+            dones=torch.ones((batch_size, 1), dtype=torch.bool),
+            prev_values=torch.full((batch_size, 1), 0.5),
+        )
+    )
+    return result
+
+
+def test_completed_epoch_padding_preserves_fixed_shapes_and_policy_version():
+    result = _completed_early_rollout_result()
+
+    padded = result.pad_completed_epoch(
+        completed_epoch_index=0,
+        target_chunk_steps=4,
+        policy_version=7,
+    )
+    trajectory = result.to_trajectory()
+
+    assert padded == 2
+    for name in (
+        "actions",
+        "intervene_flags",
+        "rewards",
+        "prev_logprobs",
+        "versions",
+    ):
+        assert getattr(trajectory, name).shape[0] == 4
+    for name in ("terminations", "truncations", "dones", "prev_values"):
+        assert getattr(trajectory, name).shape[0] == 5
+    assert trajectory.curr_obs["states"].shape[0] == 4
+    assert trajectory.next_obs["states"].shape[0] == 4
+    assert torch.all(trajectory.versions[2:] == 7)
+    assert not trajectory.dones[3:].any()
+    assert not trajectory.terminations[3:].any()
+    assert torch.count_nonzero(trajectory.actions[2:]) == 0
+    assert torch.count_nonzero(trajectory.rewards[2:]) == 0
+
+
+def test_completed_epoch_padding_supports_openvla_results_without_actions():
+    result = EmbodiedRolloutResult(max_episode_length=4)
+    batch_size = 2
+    sequence_length = 5
+    for step in range(2):
+        done = torch.zeros((batch_size, 1), dtype=torch.bool)
+        result.append_step_result(
+            ChunkStepResult(
+                actions=None,
+                rewards=torch.ones((batch_size, 1)),
+                terminations=torch.zeros_like(done),
+                truncations=torch.zeros_like(done),
+                dones=done,
+                prev_logprobs=torch.full((batch_size, 1), 0.25),
+                prev_values=torch.full((batch_size, 1), 0.5),
+                versions=torch.full((batch_size, 1), 7.0),
+                forward_inputs={
+                    "action_tokens": torch.full(
+                        (batch_size, 1, 7), step + 10, dtype=torch.long
+                    ),
+                    "attention_mask": torch.ones(
+                        (batch_size, sequence_length), dtype=torch.long
+                    ),
+                    "input_ids": torch.tensor(
+                        [[1, 2, 3, 4, step + 5]] * batch_size, dtype=torch.long
+                    ),
+                    "pixel_values": torch.full((batch_size, 3, 2, 2), float(step + 1)),
+                },
+            )
+        )
+    result.append_step_result(
+        ChunkStepResult(
+            rewards=None,
+            terminations=torch.ones((batch_size, 1), dtype=torch.bool),
+            truncations=torch.zeros((batch_size, 1), dtype=torch.bool),
+            dones=torch.ones((batch_size, 1), dtype=torch.bool),
+            prev_values=torch.full((batch_size, 1), 0.5),
+        )
+    )
+
+    padded = result.pad_completed_epoch(
+        completed_epoch_index=0,
+        target_chunk_steps=4,
+        policy_version=7,
+    )
+
+    assert padded == 2
+    assert result.actions == []
+    assert result.intervene_flags == []
+    assert len(result.forward_inputs) == 4
+    assert (
+        result.forward_inputs[2]["input_ids"]
+        is not result.forward_inputs[1]["input_ids"]
+    )
+    assert (
+        result.forward_inputs[3]["pixel_values"]
+        is not result.forward_inputs[2]["pixel_values"]
+    )
+    assert (
+        result.forward_inputs[2]["attention_mask"].data_ptr()
+        != result.forward_inputs[1]["attention_mask"].data_ptr()
+    )
+
+    trajectory = result.to_trajectory()
+    assert trajectory.actions is None
+    assert trajectory.intervene_flags is None
+    assert trajectory.forward_inputs["action_tokens"].shape[0] == 4
+    assert trajectory.forward_inputs["attention_mask"][2:].all()
+    assert trajectory.forward_inputs["input_ids"][2:, :, -1].ne(0).all()
+    assert torch.count_nonzero(trajectory.rewards[2:]) == 0
+    assert torch.count_nonzero(trajectory.prev_logprobs[2:]) == 0
+    assert torch.all(trajectory.versions[2:] == 7)
+    assert not compute_loss_mask(trajectory.dones)[0][2:].any()
+
+
+def test_completed_epoch_padding_matches_regular_post_terminal_masking():
+    early = _completed_early_rollout_result()
+    early.pad_completed_epoch(
+        completed_epoch_index=0,
+        target_chunk_steps=4,
+        policy_version=7,
+    )
+    padded = early.to_trajectory()
+    regular_dones = padded.dones.clone()
+    regular_rewards = padded.rewards.clone()
+    regular_logprobs = padded.prev_logprobs.clone()
+    regular_rewards[2:] = 99.0
+    regular_logprobs[2:] = -37.0
+
+    padded_mask, padded_count = compute_loss_mask(padded.dones)
+    regular_mask, regular_count = compute_loss_mask(regular_dones)
+
+    torch.testing.assert_close(padded_mask, regular_mask)
+    torch.testing.assert_close(padded_count, regular_count)
+    torch.testing.assert_close(
+        padded.rewards * padded_mask,
+        regular_rewards * regular_mask,
+    )
+    torch.testing.assert_close(
+        padded.prev_logprobs * padded_mask,
+        regular_logprobs * regular_mask,
+    )
+    padded_advantages = calculate_adv_and_returns(
+        adv_type="grpo",
+        task_type="embodied",
+        reward_type="step_level",
+        rewards=padded.rewards,
+        dones=padded.dones,
+        loss_mask=padded_mask,
+        loss_mask_sum=padded_count,
+        group_size=2,
+    )["advantages"]
+    regular_advantages = calculate_adv_and_returns(
+        adv_type="grpo",
+        task_type="embodied",
+        reward_type="step_level",
+        rewards=regular_rewards,
+        dones=regular_dones,
+        loss_mask=regular_mask,
+        loss_mask_sum=regular_count,
+        group_size=2,
+    )["advantages"]
+    torch.testing.assert_close(padded_advantages, regular_advantages)
+    assert not padded_mask[2:].any()
+
+
+def test_completed_epoch_padding_requires_every_trajectory_to_be_terminal():
+    result = _completed_early_rollout_result()
+    result.dones[-1][1] = False
+    result.terminations[-1][1] = False
+
+    with pytest.raises(ValueError, match="every trajectory"):
+        result.pad_completed_epoch(
+            completed_epoch_index=0,
+            target_chunk_steps=4,
+            policy_version=7,
+        )
+
+
+def test_environment_rank_early_completion_drives_final_bootstrap_and_padding():
+    env_worker = _elastic_env_worker()
+    _configure_single_chunk_env(env_worker)
+    env_worker.n_train_chunk_steps = 3
+    env_worker.stop_rank_when_all_done = True
+    env_worker.cfg.env.train.auto_reset = False
+    env_worker._prepare_rollout_results = lambda _previous: [
+        EmbodiedRolloutResult(max_episode_length=3)
+    ]
+    bootstrap = EnvOutput(
+        obs={"states": torch.zeros((1, 2))},
+        dones=torch.zeros((1, 1), dtype=torch.bool),
+        terminations=torch.zeros((1, 1), dtype=torch.bool),
+        truncations=torch.zeros((1, 1), dtype=torch.bool),
+    )
+    env_worker.bootstrap_step = lambda: [bootstrap]
+    step_calls = 0
+
+    def successful_step(_actions, _stage_id):
+        nonlocal step_calls
+        step_calls += 1
+        return (
+            EnvOutput(
+                obs={"states": torch.ones((1, 2))},
+                dones=torch.ones((1, 1), dtype=torch.bool),
+                terminations=torch.ones((1, 1), dtype=torch.bool),
+                truncations=torch.zeros((1, 1), dtype=torch.bool),
+                rewards=torch.ones((1, 1)),
+            ),
+            {},
+            {},
+        )
+
+    env_worker.env_interact_step = successful_step
+    env_worker.compute_bootstrap_rewards = lambda output, *_args: (
+        None if output.rewards is None else output.rewards.clone()
+    )
+    env_worker.record_env_metrics = lambda *_args: None
+    env_worker.store_last_obs_and_intervened_info = lambda _outputs: None
+    env_worker.finish_rollout = lambda: None
+    markers = []
+    env_worker.log_info = markers.append
+
+    rollout_worker = _elastic_rollout_worker([])
+    rollout_worker.n_train_chunk_steps = 3
+
+    async def run_case():
+        env_to_rollout = asyncio.Queue()
+        rollout_to_env = asyncio.Queue()
+        env_worker.send_to = lambda **kwargs: _QueuePutWork(
+            env_to_rollout, kwargs["data"]
+        )
+        env_worker.recv_from = lambda **_kwargs: _QueueGetWork(rollout_to_env)
+        rollout_worker.recv_from = lambda **_kwargs: _QueueGetWork(env_to_rollout)
+        rollout_worker.send_to = lambda **kwargs: _QueuePutWork(
+            rollout_to_env, kwargs["data"]
+        )
+        env_worker.prepare_elastic_collection(
+            lifecycle_generation=1, expected_policy_version=3
+        )
+        rollout_worker.prepare_elastic_collection(
+            lifecycle_generation=1, expected_policy_version=3
+        )
+        return await asyncio.gather(
+            rollout_worker.generate_until_pause_or_complete(None, None),
+            env_worker.interact_until_pause_or_complete(None, None, None),
+        )
+
+    rollout_result, env_result = asyncio.run(run_case())
+
+    assert rollout_result.outcome is ElasticRunOutcome.COMPLETED
+    assert env_result.outcome is ElasticRunOutcome.COMPLETED
+    assert step_calls == 1
+    assert rollout_worker.predict_count == 2
+    trajectory = env_worker.rollout_results[0].to_trajectory()
+    assert trajectory.actions.shape[0] == 3
+    assert trajectory.dones.shape[0] == 4
+    assert not compute_loss_mask(trajectory.dones)[0][1:].any()
+    assert env_worker.get_elastic_progress().completed_trajectories == 1
+    assert any("RLIX_TRAJECTORY_COMPLETED" in marker for marker in markers)
+    assert any("RLIX_RANK_EARLY_FINALIZED" in marker for marker in markers)
+
+
+def test_rank_completion_is_sticky_until_every_environment_succeeds():
+    worker = _elastic_env_worker()
+    worker.train_num_envs_per_stage = 2
+    worker.train_batch_size = 2
+    worker.train_prev_done = [torch.zeros(2, dtype=torch.bool)]
+    worker.model_cfg = SimpleNamespace(num_action_chunks=8)
+    worker.log_info = lambda message: markers.append(message)
+    markers = []
+    worker.prepare_elastic_collection(lifecycle_generation=1, expected_policy_version=3)
+
+    first = EnvOutput(
+        obs={"states": torch.zeros((2, 2))},
+        terminations=torch.tensor(
+            [
+                [False, False, False, False, False, False, False, False],
+                [False, False, False, True, False, False, False, False],
+            ]
+        ),
+    )
+    second = EnvOutput(
+        obs={"states": torch.zeros((2, 2))},
+        terminations=torch.tensor(
+            [
+                [False, True, False, False, False, False, False, False],
+                [False, False, False, False, False, False, False, False],
+            ]
+        ),
+    )
+
+    assert not worker._record_rank_trajectory_completions(
+        first, stage_id=0, epoch=0, chunk_step_idx=2
+    )
+    assert worker.get_elastic_progress().completed_trajectories == 1
+    assert worker._record_rank_trajectory_completions(
+        second, stage_id=0, epoch=0, chunk_step_idx=4
+    )
+    assert worker.train_prev_done[0].tolist() == [True, True]
+    assert worker.get_elastic_progress().completed_trajectories == 2
+    assert len(markers) == 2
+    assert "env_index=1" in markers[0] and "step=20" in markers[0]
+    assert "env_index=0" in markers[1] and "step=34" in markers[1]
 
 
 def test_elastic_rollout_rejects_stale_observation_before_inference():

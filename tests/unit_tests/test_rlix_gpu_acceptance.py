@@ -769,8 +769,10 @@ def test_environment_records_bootstrap_only_after_elastic_send_completes() -> No
     order = []
 
     class ProductionEnv:
-        async def _send_elastic_observation(self, rollout_channel, env_output):
-            order.append("send_completed")
+        async def _send_elastic_observation(
+            self, rollout_channel, env_output, *, final_bootstrap=False
+        ):
+            order.append(("send_completed", final_bootstrap))
 
     class Recorder(RecordingEnvWorkerMixin, ProductionEnv):
         _rollout_cursor = SimpleNamespace(
@@ -788,12 +790,17 @@ def test_environment_records_bootstrap_only_after_elastic_send_completes() -> No
     import asyncio
 
     asyncio.run(
-        recorder._send_elastic_observation(object(), {"transition_id": _transition()})
+        recorder._send_elastic_observation(
+            object(),
+            {"transition_id": _transition()},
+            final_bootstrap=True,
+        )
     )
 
-    assert order == ["send_completed", "bootstrap_dispatched"]
+    assert order == [("send_completed", True), "bootstrap_dispatched"]
     assert observations[0].details["lifecycle_generation"] == 3
     assert observations[0].details["policy_version"] == 7
+    assert observations[0].details["final_bootstrap"] is True
 
 
 def test_environment_records_world_model_diagnostic_phases_without_changing_result() -> (
@@ -935,6 +942,8 @@ def test_four_gpu_wan_driver_config_composes_two_rank_topology(tmp_path: Path) -
         "env": "2,3",
     }
     assert cfg.env.train.total_num_envs == 16
+    assert cfg.env.train.rollout_epoch == 1
+    assert cfg.env.train.get("stop_rank_when_all_done", False) is False
     assert cfg.env.train.max_episode_steps == 256
     assert cfg.env.train.max_steps_per_rollout_epoch == 256
     assert cfg.env.train.num_inference_steps == 5
@@ -982,9 +991,11 @@ def test_four_rank_fsdp_variant_composes_all_gpu_actor_world(tmp_path: Path) -> 
         OmegaConf.select(cfg, "actor.model.pipeline_model_parallel_size", default=1)
         == 1
     )
-    assert cfg.actor.global_batch_size == 32
+    assert cfg.actor.global_batch_size == 16
     assert cfg.actor.micro_batch_size == 1
-    assert cfg.env.train.total_num_envs == 32
+    assert cfg.env.train.total_num_envs == 16
+    assert cfg.env.train.rollout_epoch == 4
+    assert cfg.env.train.stop_rank_when_all_done is True
     assert OmegaConf.load(config_path).smoke.completed_bundle_handoff == (
         "release_before_training"
     )
@@ -1038,6 +1049,31 @@ def test_single_pipeline_diagnostic_preserves_task8_config_and_enables_artifacts
     assert cfg.env.train.video_cfg.save_video is True
     assert Path(cfg.env.train.video_cfg.video_base_dir) == trajectory_dir / "videos"
     assert Path(cfg.runner.task8_single_pipeline_artifact_dir) == trajectory_dir
+
+
+def test_wan_driver_config_rejects_non_boolean_rank_early_completion(
+    tmp_path: Path,
+) -> None:
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "e2e_tests"
+        / "embodied"
+        / "task8_wan_disaggregated.yaml"
+    )
+    source = OmegaConf.load(source_path)
+    source.smoke.stop_rank_when_all_done = "yes"
+    config_path = tmp_path / "invalid-rank-early-completion.yaml"
+    OmegaConf.save(source, config_path)
+
+    with pytest.raises(
+        ValueError, match="smoke.stop_rank_when_all_done must be a boolean"
+    ):
+        compose_wan_model_driver_config(
+            config_path,
+            names=derive_role_names(run_id="invalid-early-completion", role="a"),
+            driver_dir=tmp_path / "driver-a",
+            validator=lambda cfg: cfg,
+        )
 
 
 def test_generation_proof_enables_role_local_trajectory_videos(tmp_path: Path) -> None:

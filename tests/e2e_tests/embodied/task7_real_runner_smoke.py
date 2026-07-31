@@ -120,6 +120,13 @@ def _compose_runtime_config(
         cfg.env.train.total_num_envs = total_num_envs
         cfg.env.train.group_size = int(smoke_cfg.smoke.get("group_size", 1))
         cfg.env.train.rollout_epoch = int(smoke_cfg.smoke.rollout_epoch)
+        stop_rank_when_all_done = smoke_cfg.smoke.get(
+            "stop_rank_when_all_done",
+            cfg.env.train.get("stop_rank_when_all_done", False),
+        )
+        if not isinstance(stop_rank_when_all_done, bool):
+            raise ValueError("smoke.stop_rank_when_all_done must be a boolean")
+        cfg.env.train.stop_rank_when_all_done = stop_rank_when_all_done
         cfg.env.train.max_episode_steps = int(smoke_cfg.smoke.max_episode_steps)
         cfg.env.train.max_steps_per_rollout_epoch = int(
             smoke_cfg.smoke.max_steps_per_rollout_epoch

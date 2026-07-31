@@ -26,16 +26,17 @@ smoke:
   operation_timeout_s: 900.0
   monitor_poll_interval_s: 0.1
   output_dir: ${oc.env:RLINF_TASK8_OUTPUT,/tmp/rlinf_task8_four_rank_fsdp}
-  # Four FSDP actor ranks must each receive complete GRPO groups. With two
-  # environment ranks and a group size of eight, 32 global environments route
-  # as 16 per environment rank and then 8 per actor rank.
-  total_num_envs: 32
+  # Each generation rank owns exactly one complete eight-member group per
+  # epoch. Four epochs yield 32 trajectories per generation rank; its shard is
+  # split into two complete groups for each of the paired FSDP actor ranks.
+  total_num_envs: 16
   adv_type: grpo
   group_size: 8
+  stop_rank_when_all_done: true
   filter_rewards: true
   rewards_lower_bound: 0.0
   rewards_upper_bound: 5.0
-  rollout_epoch: 1
+  rollout_epoch: 4
   max_episode_steps: 256
   max_steps_per_rollout_epoch: 256
   max_train_steps: 10

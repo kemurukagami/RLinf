@@ -2649,10 +2649,11 @@ configuration/runtime regressions pass, but no four-rank GPU run has yet been
 recorded, so this is implementation progress rather than T8 acceptance.
 
 The first GPU attempt reached real generation but exposed a local GRPO routing
-constraint before batch seal: sixteen global trajectories became four per
-actor rank, which is not divisible by `group_size: 8`. The isolated overlay now
-uses 32 environments, yielding eight trajectories per actor rank, and its
-driver rejects partial local GRPO groups before Ray/model startup.
+constraint before batch seal: with one rollout epoch, sixteen global
+trajectories became four per actor rank, which is not divisible by
+`group_size: 8`. The first corrective overlay used 32 environments, yielding
+eight trajectories per actor rank, and its driver rejects partial local GRPO
+groups before Ray/model startup.
 
 The next GPU attempt passed that preflight and reached production batch seal.
 It failed because the previous actor receipt contract compared every actor's
@@ -2679,6 +2680,20 @@ foreign sender, duplicated route, partial actor shard, or mixed lifecycle or
 policy still fails before advantage calculation and training. The focused
 four-rank/acceptance regression set passes 136 tests, and the broad RLix suite
 passes 253 tests with two skips. Four-rank GPU rerun evidence remains pending.
+
+The subsequent `four-rank-fsdp-preempt-3` GPU run completed three full
+collection/training iterations in both pipelines and began the fourth before
+operator interruption. This established the four-rank harness as the active
+successor to the older one-rank trainer acceptance variant. Its next workload
+revision returns to 16 simultaneously resident environments while increasing
+`rollout_epoch` to 4 and enabling `stop_rank_when_all_done`. Each of the two
+generation ranks now owns exactly one eight-environment group per epoch. Four
+epochs produce 32 trajectories per generation rank and 64 per sealed
+collection; splitting each generation shard between two FSDP receivers gives
+16 trajectories, or two complete GRPO groups, per actor rank. Every epoch uses
+the same policy version and may finalize early only after all eight sticky local
+completion bits are set. Training still starts only after all four epochs seal,
+then reclaims GPUs 0-3 for four-rank FSDP.
 
 ## 20. Definition of done
 

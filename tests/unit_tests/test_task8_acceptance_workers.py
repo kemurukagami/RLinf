@@ -73,8 +73,10 @@ class _FakeEnvWorker:
     async def _send_elastic_barrier(self, rollout_channel, token):
         self.calls.append(("barrier", rollout_channel, token))
 
-    async def _send_elastic_observation(self, rollout_channel, env_output):
-        self.calls.append(("observation", rollout_channel, env_output))
+    async def _send_elastic_observation(
+        self, rollout_channel, env_output, *, final_bootstrap=False
+    ):
+        self.calls.append(("observation", rollout_channel, env_output, final_bootstrap))
 
 
 class _RecordingFakeEnv(RecordingEnvWorkerMixin, _FakeEnvWorker):
@@ -243,13 +245,24 @@ def test_recording_env_worker_preserves_outputs_calls_and_rng() -> None:
 
     asyncio.run(recorded.request_elastic_drain("request"))
     asyncio.run(recorded._send_elastic_barrier("channel", "token"))
-    asyncio.run(recorded._send_elastic_observation("channel", {"transition_id": "t1"}))
+    asyncio.run(
+        recorded._send_elastic_observation(
+            "channel", {"transition_id": "t1"}, final_bootstrap=True
+        )
+    )
+    assert recorded.calls[-1] == (
+        "observation",
+        "channel",
+        {"transition_id": "t1"},
+        True,
+    )
     assert [event.event for event in events[-4:]] == [
         "drain_requested",
         "drain_observed",
         "bootstrap_dispatched",
         "resumed_bootstrap_dispatched",
     ]
+    assert events[-2].details["final_bootstrap"] is True
 
 
 def test_recording_rollout_worker_preserves_outputs_and_call_order() -> None:

@@ -252,15 +252,27 @@ class RecordingEnvWorkerMixin(AcceptanceWorkerRecorderMixin):
         self._record_acceptance("drain_observed", token=token)
 
     async def _send_elastic_observation(
-        self, rollout_channel: Any, env_output: Any
+        self,
+        rollout_channel: Any,
+        env_output: Any,
+        *,
+        final_bootstrap: bool = False,
     ) -> None:
         resumed = getattr(self, "_task8_resume_dispatch_pending", False)
-        await super()._send_elastic_observation(rollout_channel, env_output)
+        await super()._send_elastic_observation(
+            rollout_channel,
+            env_output,
+            final_bootstrap=final_bootstrap,
+        )
         # The awaited production send is the earliest reliable indication that
         # this rank has produced a valid observation and handed it to rollout.
         # Recording before the await would allow the harness to introduce
         # competing demand while bootstrap was still blocked or had failed.
-        self._record_acceptance("bootstrap_dispatched", env_output=env_output)
+        self._record_acceptance(
+            "bootstrap_dispatched",
+            env_output=env_output,
+            final_bootstrap=final_bootstrap,
+        )
         if resumed:
             self._record_acceptance(
                 "resumed_bootstrap_dispatched", env_output=env_output

@@ -46,7 +46,7 @@ def test_four_rank_driver_rejects_partial_local_grpo_group(tmp_path: Path) -> No
     source = OmegaConf.load(
         _EMBODIED_TESTS / "task8_wan_disaggregated_four_rank_fsdp.yaml"
     )
-    source.smoke.total_num_envs = 16
+    source.smoke.rollout_epoch = 1
     path = tmp_path / "partial-group.yaml"
     OmegaConf.save(source, path)
 

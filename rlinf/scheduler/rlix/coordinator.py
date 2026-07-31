@@ -1041,13 +1041,27 @@ class RLixResizeCoordinator:
         record = self._records[rank]
         if record.env_run_task is None or record.rollout_run_task is None:
             return None
-        if not wait and (
-            not record.env_run_task.done() or not record.rollout_run_task.done()
-        ):
-            return None
+        tasks = (record.env_run_task, record.rollout_run_task)
         try:
+            if not wait:
+                # A paired lifecycle normally resolves both tasks together, but
+                # one peer may fail while the other remains blocked waiting for
+                # a message that can no longer arrive. Inspect every resolved
+                # task before treating the pair as merely incomplete.
+                for component, task in zip(("environment", "rollout"), tasks):
+                    if not task.done():
+                        continue
+                    if task.cancelled():
+                        raise RuntimeError(
+                            f"rank {rank} {component} run task was cancelled"
+                        )
+                    exception = task.exception()
+                    if exception is not None:
+                        raise exception
+                if any(not task.done() for task in tasks):
+                    return None
             env_result, rollout_result = await self._wait_tasks(
-                (record.env_run_task, record.rollout_run_task),
+                tasks,
                 operation=f"rank {rank} result observation",
             )
             if not isinstance(env_result, ElasticRunResult) or not isinstance(

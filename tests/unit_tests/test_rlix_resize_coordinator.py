@@ -61,11 +61,13 @@ class _FakeElasticWorker:
         self.drain_request = None
         self.drain_event = asyncio.Event()
         self.complete_event = asyncio.Event()
+        self.failure_event = asyncio.Event()
         self.activation_gate = asyncio.Event()
         self.activation_gate.set()
         self.active_event = asyncio.Event()
         self.run_cancelled = False
         self.complete_on_drain_request = False
+        self.run_failure: str | None = None
         self.fail_prepare = False
         self.fail_pause_offload = False
         self.fail_resume = False
@@ -126,6 +128,7 @@ class _FakeElasticWorker:
         self.drain_request = None
         self.drain_event = asyncio.Event()
         self.complete_event = asyncio.Event()
+        self.failure_event = asyncio.Event()
         self.active_event = asyncio.Event()
         self.prepare_count += 1
         return self._status()
@@ -138,6 +141,7 @@ class _FakeElasticWorker:
         self.drain_request = None
         self.drain_event = asyncio.Event()
         self.complete_event = asyncio.Event()
+        self.failure_event = asyncio.Event()
         self.active_event = asyncio.Event()
         self.resume_count += 1
         return ResidencyReceipt(
@@ -160,11 +164,18 @@ class _FakeElasticWorker:
             self.active_event.set()
             drain_wait = asyncio.create_task(self.drain_event.wait())
             complete_wait = asyncio.create_task(self.complete_event.wait())
+            failure_wait = asyncio.create_task(self.failure_event.wait())
             done, pending = await asyncio.wait(
-                (drain_wait, complete_wait), return_when=asyncio.FIRST_COMPLETED
+                (drain_wait, complete_wait, failure_wait),
+                return_when=asyncio.FIRST_COMPLETED,
             )
             for task in pending:
                 task.cancel()
+            if failure_wait in done and self.failure_event.is_set():
+                message = self.run_failure or "injected run failure"
+                self.failure = f"RuntimeError: {message}"
+                self.state = ElasticRankState.FAILED_RESIDENT
+                raise RuntimeError(message)
             if complete_wait in done and self.complete_event.is_set():
                 self.state = ElasticRankState.COMPLETED
                 return ElasticRunResult(ElasticRunOutcome.COMPLETED, None, None)
@@ -472,6 +483,29 @@ def test_rank_observation_is_repeatable_and_includes_durable_completion() -> Non
         assert first.progress.completed_trajectories == 2
         assert first.paired_results is not None
         assert first.callback_applied_active
+
+    asyncio.run(run())
+
+
+def test_nonblocking_result_observation_surfaces_one_sided_run_failure() -> None:
+    async def run() -> None:
+        coordinator, env, rollout = _coordinator()
+        await _configure(coordinator)
+        await coordinator.resize_infer([], [0])
+        env[0].run_failure = "injected environment transaction failure"
+        env[0].failure_event.set()
+        while env[0].state is not ElasticRankState.FAILED_RESIDENT:
+            await asyncio.sleep(0)
+
+        with pytest.raises(
+            ResizeCoordinatorError,
+            match="injected environment transaction failure",
+        ):
+            await coordinator.get_rank_results(0, wait=False)
+
+        assert env[0].state is ElasticRankState.FAILED_RESIDENT
+        assert rollout[0].state is ElasticRankState.FAILED_RESIDENT
+        assert coordinator._failure is not None
 
     asyncio.run(run())
 

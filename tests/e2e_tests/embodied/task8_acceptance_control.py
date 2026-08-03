@@ -33,6 +33,7 @@ _DEFAULT_GATES = frozenset(
         "a_generation_granted",
         "a_target_bootstrap_dispatched",
         "a_target_chunk_started",
+        "a_first_rank_completed",
         "a_target_rank_completed",
         "allow_b_collection",
         "b_generation_requested",
@@ -235,6 +236,12 @@ class AcceptanceControlCore:
             and event.gpu_ids == self._config.target_bundle
         ):
             self._gates["a_target_chunk_started"] = True
+        if (
+            event.driver_role == "a"
+            and event.component == "rollout"
+            and event.event == "rank_completed"
+        ):
+            self._gates["a_first_rank_completed"] = True
         if (
             event.driver_role == "a"
             and event.event == "rank_completed"

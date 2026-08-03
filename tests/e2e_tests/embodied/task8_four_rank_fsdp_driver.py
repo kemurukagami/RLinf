@@ -59,6 +59,10 @@ def _validate_four_rank_config(argv: list[str]) -> None:
             "four-rank FSDP driver requires "
             "smoke.completed_bundle_handoff=release_before_training"
         )
+    if str(cfg.smoke.get("policy_sync_mode", "")) != "async_cpu_prefetch":
+        raise ValueError(
+            "four-rank FSDP driver requires async_cpu_prefetch policy sync"
+        )
     total_num_envs = int(cfg.smoke.total_num_envs)
     group_size = int(cfg.smoke.group_size)
     rollout_epoch = int(cfg.smoke.rollout_epoch)
@@ -89,14 +93,24 @@ def _validate_four_rank_config(argv: list[str]) -> None:
 def _launch_four_rank_fsdp_workers(**kwargs: Any) -> Any:
     """Launch with completed bundles released before the all-GPU train request."""
     kwargs["completed_bundle_handoff"] = "release_before_training"
+    kwargs["policy_sync_mode"] = "async_cpu_prefetch"
+    kwargs["policy_sync_max_retries"] = 1
     return _launch_registered_rlix_workers(**kwargs)
 
 
 def _compose_four_rank_fsdp_config(*args: Any, **kwargs: Any) -> Any:
     """Expose the selected handoff in the composed runtime configuration."""
+    config_path = args[0] if args else kwargs["config_path"]
+    smoke_cfg = OmegaConf.load(config_path)
     cfg, channels = _compose_wan_model_driver_config(*args, **kwargs)
     with open_dict(cfg):
         cfg.rlix.completed_bundle_handoff = "release_before_training"
+        cfg.rlix.policy_sync = {
+            "mode": str(smoke_cfg.smoke.policy_sync_mode),
+            "bucket_size_mb": int(smoke_cfg.smoke.policy_sync_bucket_size_mb),
+            "max_cached_versions": int(smoke_cfg.smoke.policy_sync_max_cached_versions),
+            "max_retries": int(smoke_cfg.smoke.policy_sync_max_retries),
+        }
     return cfg, channels
 
 

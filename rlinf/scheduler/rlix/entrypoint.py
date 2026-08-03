@@ -74,6 +74,8 @@ def launch_registered_rlix_workers(
     enable_gpu_tracing: bool,
     bootstrapper: Callable[..., Awaitable[Any]],
     completed_bundle_handoff: str = "retain_overlap",
+    policy_sync_mode: str = "fixed_all_rank",
+    policy_sync_max_retries: int = 1,
 ) -> LaunchedRLixWorkers:
     """Launch replayed placements and atomically bootstrap their registration."""
     groups = [actor_group, rollout_group, env_group]
@@ -107,6 +109,12 @@ def launch_registered_rlix_workers(
         # including injected bootstrappers with the old keyword signature.
         if completed_bundle_handoff != "retain_overlap":
             bootstrap_kwargs["completed_bundle_handoff"] = completed_bundle_handoff
+        if policy_sync_mode != "fixed_all_rank":
+            bootstrap_kwargs.update(
+                actor_worker_group=actor,
+                policy_sync_mode=policy_sync_mode,
+                policy_sync_max_retries=policy_sync_max_retries,
+            )
         runtime = asyncio.run(bootstrapper(**bootstrap_kwargs))
     except BaseException as primary_error:
         from .runtime import close_worker_groups_after_bootstrap_failure

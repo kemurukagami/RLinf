@@ -40,6 +40,13 @@ from rlinf.hybrid_engines.fsdp.utils import (
     unpack_sequences,
 )
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
+from rlinf.hybrid_engines.weight_syncer.versioned_cache import (
+    PolicyCacheBuildReceipt,
+    PolicyCachePromotionReceipt,
+    PolicyTransferLease,
+    VersionedPolicyCache,
+    build_policy_cache,
+)
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Channel, Cluster, Worker
@@ -80,6 +87,7 @@ from rlinf.utils.utils import (
     cpu_weight_swap,
     get_loss_agg_func,
     masked_mean,
+    materialize_tensor,
     reshape_entropy,
     retrieve_model_state_dict_in_cpu,
 )
@@ -1060,6 +1068,30 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             range(self._component_placement.get_world_size("rollout"))
         )
         self._rlix_batch_receipt: ElasticBatchReceipt | None = None
+        policy_sync_mode = str(
+            OmegaConf.select(cfg, "rlix.policy_sync.mode", default="fixed_all_rank")
+        )
+        self._rlix_async_policy_prefetch = policy_sync_mode == "async_cpu_prefetch"
+        self._rlix_policy_cache_bucket_size = (
+            int(
+                OmegaConf.select(
+                    cfg,
+                    "rlix.policy_sync.bucket_size_mb",
+                    default=128,
+                )
+            )
+            * 1024
+            * 1024
+        )
+        self._rlix_policy_cache = VersionedPolicyCache(
+            max_cached_versions=int(
+                OmegaConf.select(
+                    cfg,
+                    "rlix.policy_sync.max_cached_versions",
+                    default=2,
+                )
+            )
+        )
 
     def init_worker(self) -> None:
         """
@@ -1125,6 +1157,101 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
     def get_rollout_state_dict(self) -> dict:
         return self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
+
+    def build_policy_cache_candidate(
+        self, policy_version: int
+    ) -> PolicyCacheBuildReceipt:
+        """Materialize one replayable policy version while FSDP is resident."""
+        if not self._rlix_async_policy_prefetch:
+            raise RuntimeError("asynchronous CPU policy prefetch is disabled")
+        if self.is_weight_offloaded:
+            raise RuntimeError("policy cache must be built before actor weight offload")
+        state_dict = self.get_rollout_state_dict()
+        selected_names = sorted(
+            name for name in set(self.param_names_need_sync) if name in state_dict
+        )
+        if not selected_names:
+            raise RuntimeError("actor has no rollout policy parameters to publish")
+
+        # DTensor.full_tensor() is collective. Every actor rank must materialize
+        # the same names in the same order even though only rank zero retains the
+        # full CPU cache.
+        if self._is_weight_sender:
+            manifest, buckets = build_policy_cache(
+                state_dict,
+                policy_version=policy_version,
+                bucket_size_bytes=self._rlix_policy_cache_bucket_size,
+                selected_names=selected_names,
+            )
+            self._rlix_policy_cache.store_candidate(manifest, buckets)
+            return PolicyCacheBuildReceipt(
+                actor_rank=self._rank,
+                policy_version=policy_version,
+                retained=True,
+                manifest_hash=manifest.manifest_hash,
+                bucket_count=manifest.bucket_count,
+                total_bytes=manifest.total_bytes,
+            )
+
+        for name in selected_names:
+            materialize_tensor(state_dict[name])
+        return PolicyCacheBuildReceipt(
+            actor_rank=self._rank,
+            policy_version=policy_version,
+            retained=False,
+            manifest_hash=None,
+            bucket_count=0,
+            total_bytes=0,
+        )
+
+    def promote_policy_cache(self, policy_version: int) -> PolicyCachePromotionReceipt:
+        """Promote an exact complete candidate after all actor ranks built it."""
+        if not self._rlix_async_policy_prefetch:
+            raise RuntimeError("asynchronous CPU policy prefetch is disabled")
+        if not self._is_weight_sender:
+            return PolicyCachePromotionReceipt(
+                actor_rank=self._rank,
+                policy_version=policy_version,
+                promoted=False,
+                manifest_hash=None,
+            )
+        manifest = self._rlix_policy_cache.promote(policy_version)
+        return PolicyCachePromotionReceipt(
+            actor_rank=self._rank,
+            policy_version=policy_version,
+            promoted=True,
+            manifest_hash=manifest.manifest_hash,
+        )
+
+    def get_policy_cache_status(self) -> dict[str, object]:
+        """Return owner cache diagnostics without exposing tensor payloads."""
+        status = self._rlix_policy_cache.status()
+        status.update({"actor_rank": self._rank, "is_owner": self._is_weight_sender})
+        return status
+
+    def acquire_policy_cache(self, policy_version: int) -> PolicyTransferLease:
+        """Acquire the active cache on the unique actor owner."""
+        if not self._is_weight_sender:
+            raise RuntimeError("only actor rank zero owns the policy cache")
+        return self._rlix_policy_cache.acquire(policy_version)
+
+    def get_policy_cache_manifest(self, lease: PolicyTransferLease):
+        """Return the immutable manifest protected by ``lease``."""
+        if not self._is_weight_sender:
+            raise RuntimeError("only actor rank zero owns the policy cache")
+        return self._rlix_policy_cache.manifest_for_lease(lease)
+
+    def get_policy_cache_bucket(self, lease: PolicyTransferLease, bucket_index: int):
+        """Return one bounded CPU bucket protected by ``lease``."""
+        if not self._is_weight_sender:
+            raise RuntimeError("only actor rank zero owns the policy cache")
+        return self._rlix_policy_cache.bucket_for_lease(lease, bucket_index)
+
+    def release_policy_cache(self, lease: PolicyTransferLease) -> None:
+        """Release one exact active-cache transfer lease."""
+        if not self._is_weight_sender:
+            raise RuntimeError("only actor rank zero owns the policy cache")
+        self._rlix_policy_cache.release(lease)
 
     @Worker.timer("actor/sync_model_to_rollout")
     async def sync_model_to_rollout(self) -> None:
@@ -1279,6 +1406,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         primary_error: BaseException | None = None
         try:
             metrics = self.run_training()
+            if getattr(self, "_rlix_async_policy_prefetch", False):
+                self.build_policy_cache_candidate(batch_receipt.policy_version + 1)
         except BaseException as exc:
             primary_error = exc
             raise

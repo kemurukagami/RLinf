@@ -120,6 +120,7 @@ class RegisteredRLixPipeline:
     placement_plan: RLixPlacementPlan
     operation_timeout_s: float = 300.0
     retain_training_overlap: bool = False
+    policy_sync_mode: str = "fixed_all_rank"
     _closed: bool = field(default=False, init=False, repr=False)
     _stage_state: RunnerStageState = field(
         default=RunnerStageState.INACTIVE, init=False, repr=False
@@ -156,6 +157,29 @@ class RegisteredRLixPipeline:
             runtime=self,
             expected_policy_version=expected_policy_version,
         )
+
+    def start_policy_prefetch(self, *, expected_policy_version: int) -> None:
+        """Start CPU rollout updates while the training stage still owns GPUs."""
+        if self.policy_sync_mode != "async_cpu_prefetch":
+            raise RuntimeError("asynchronous CPU policy prefetch is disabled")
+        _run_sync(
+            self.controller.start_policy_prefetch(
+                expected_policy_version=expected_policy_version
+            )
+        )
+
+    def wait_policy_prefetch(self, *, expected_policy_version: int) -> dict[int, Any]:
+        """Verify all CPU rollout replicas before generation can request GPUs."""
+        if self.policy_sync_mode != "async_cpu_prefetch":
+            raise RuntimeError("asynchronous CPU policy prefetch is disabled")
+        receipts = _run_sync(
+            self.controller.wait_policy_prefetch(
+                expected_policy_version=expected_policy_version
+            )
+        )
+        if not isinstance(receipts, dict):
+            raise TypeError("policy prefetch returned invalid rank receipts")
+        return receipts
 
     def begin_collection(
         self,
@@ -902,17 +926,24 @@ async def bootstrap_registered_rlix_pipeline(
     *,
     env_worker_group: Any,
     rollout_worker_group: Any,
+    actor_worker_group: Any | None = None,
     placement_plan: RLixPlacementPlan,
     worker_max_concurrency: int,
     operation_timeout_s: float,
     enable_gpu_tracing: bool = False,
     completed_bundle_handoff: str = "retain_overlap",
+    policy_sync_mode: str = "fixed_all_rank",
+    policy_sync_max_retries: int = 1,
     control_plane_factory: Callable[..., Any] | None = None,
     controller_factory: Callable[..., Any] = RLixStageController,
 ) -> RegisteredRLixPipeline:
     """Create, register, and admit one pipeline without requesting allocation."""
     if not isinstance(enable_gpu_tracing, bool):
         raise TypeError("enable_gpu_tracing must be a boolean")
+    if policy_sync_mode not in {"fixed_all_rank", "async_cpu_prefetch"}:
+        raise ValueError("unsupported policy_sync_mode")
+    if policy_sync_mode == "async_cpu_prefetch" and actor_worker_group is None:
+        raise ValueError("asynchronous policy prefetch requires actor_worker_group")
     if not isinstance(
         completed_bundle_handoff, str
     ) or completed_bundle_handoff not in {
@@ -933,14 +964,21 @@ async def bootstrap_registered_rlix_pipeline(
         pipeline_type="rlinf",
     )
     ray_namespace = get_pipeline_namespace(pipeline_id)
-    controller = controller_factory(
-        pipeline_id=pipeline_id,
-        ray_namespace=ray_namespace,
-        env_worker_group=env_worker_group,
-        rollout_worker_group=rollout_worker_group,
-        operation_timeout_s=operation_timeout_s,
-        worker_max_concurrency=worker_max_concurrency,
-    )
+    controller_kwargs = {
+        "pipeline_id": pipeline_id,
+        "ray_namespace": ray_namespace,
+        "env_worker_group": env_worker_group,
+        "rollout_worker_group": rollout_worker_group,
+        "operation_timeout_s": operation_timeout_s,
+        "worker_max_concurrency": worker_max_concurrency,
+    }
+    if policy_sync_mode == "async_cpu_prefetch":
+        controller_kwargs.update(
+            actor_worker_group=actor_worker_group,
+            policy_sync_mode=policy_sync_mode,
+            policy_sync_max_retries=policy_sync_max_retries,
+        )
+    controller = controller_factory(**controller_kwargs)
     registration_attempted = False
     try:
         registration_attempted = True
@@ -981,6 +1019,7 @@ async def bootstrap_registered_rlix_pipeline(
         placement_plan=placement_plan,
         operation_timeout_s=operation_timeout_s,
         retain_training_overlap=completed_bundle_handoff == "retain_overlap",
+        policy_sync_mode=policy_sync_mode,
     )
 
 

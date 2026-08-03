@@ -1761,6 +1761,7 @@ def test_acceptance_control_tracks_generation_proof_gates(tmp_path: Path) -> Non
         _event(
             event="rank_completed",
             producer_sequence=3,
+            component="rollout",
         )
     )
     control.record_event(
@@ -1880,6 +1881,7 @@ def test_acceptance_control_tracks_generation_proof_gates(tmp_path: Path) -> Non
     assert control.gate_status()["a_policy_sync_completed"] is True
     assert control.gate_status()["a_generation_requested"] is True
     assert control.gate_status()["a_generation_granted"] is True
+    assert control.gate_status()["a_first_rank_completed"] is True
     assert control.gate_status()["a_target_rank_completed"] is True
     assert control.gate_status()["b_generation_requested"] is True
     assert control.gate_status()["transfer_to_b_observed"] is True
@@ -1925,6 +1927,25 @@ def test_generation_proof_releases_b_after_a_target_rank_completes(monkeypatch) 
     assert calls.index(("wait", "b_batch_sealed")) < calls.index(
         ("release", "allow_b_training")
     )
+
+
+def test_first_rank_completion_gate_does_not_require_configured_target(
+    tmp_path: Path,
+) -> None:
+    control = _control_core(tmp_path)
+
+    control.record_event(
+        _event(
+            event="rank_completed",
+            component="rollout",
+            dp_rank=1,
+            transition_identity=None,
+            gpu_ids=(7, 9),
+        )
+    )
+
+    assert control.gate_status()["a_first_rank_completed"] is True
+    assert control.gate_status()["a_target_rank_completed"] is False
 
 
 def test_acceptance_control_explicit_gates_and_fail_closed_driver_loss(

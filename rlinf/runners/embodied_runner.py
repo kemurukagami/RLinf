@@ -262,6 +262,26 @@ class EmbodiedRunner:
             self._sync_rollout_weights()
             return
 
+        if self._uses_async_policy_prefetch():
+            if self.global_step == 0:
+                return
+            self._on_async_policy_prefetch_wait_started(self.global_step)
+            receipts = self.rlix_runtime.wait_policy_prefetch(
+                expected_policy_version=self.global_step
+            )
+            expected_ranks = {
+                rank for rank, _ in self.rlix_runtime.placement_plan.actor_infer_bundles
+            }
+            if set(receipts) != expected_ranks or any(
+                receipt.applied_version != self.global_step
+                for receipt in receipts.values()
+            ):
+                raise RuntimeError(
+                    "asynchronous policy prefetch lacks exact all-rank receipts"
+                )
+            self._on_async_policy_prefetch_completed(self.global_step, receipts)
+            return
+
         from rlix_core.protocol.types import POLICY_SYNC_CLUSTER_NAME
 
         with self.rlix_runtime.policy_sync_stage(
@@ -278,8 +298,30 @@ class EmbodiedRunner:
                 )
             )
 
+    def _uses_async_policy_prefetch(self) -> bool:
+        """Return whether this RLix pipeline updates offloaded CPU replicas."""
+        return (
+            getattr(
+                getattr(self, "rlix_runtime", None),
+                "policy_sync_mode",
+                "fixed_all_rank",
+            )
+            == "async_cpu_prefetch"
+        )
+
     def _on_rlix_policy_sync_stage_acquired(self) -> None:
         """Hook invoked only after fixed policy-sync ownership is acquired."""
+
+    def _on_async_policy_prefetch_started(self, policy_version: int) -> None:
+        """Acceptance hook after background CPU update tasks are launched."""
+
+    def _on_async_policy_prefetch_wait_started(self, policy_version: int) -> None:
+        """Acceptance hook before waiting for the next rollout version."""
+
+    def _on_async_policy_prefetch_completed(
+        self, policy_version: int, receipts: Mapping[int, object]
+    ) -> None:
+        """Acceptance hook after every rollout rank committed the version."""
 
     def _sync_rollout_weights(self) -> None:
         """Run the existing all-rank actor/rollout collective pair."""
@@ -357,6 +399,30 @@ class EmbodiedRunner:
             # transaction.  Policy sync must never depend on a caller remembering
             # to update the actor's authoritative source-version stamp later.
             self.actor.set_global_step(produced_policy_version).wait()
+            if self._uses_async_policy_prefetch():
+                promotion_receipts = self.actor.promote_policy_cache(
+                    produced_policy_version
+                ).wait()
+                promoted = [
+                    receipt
+                    for receipt in promotion_receipts
+                    if getattr(receipt, "promoted", False)
+                ]
+                if len(promoted) != 1 or (
+                    promoted[0].policy_version != produced_policy_version
+                    or not promoted[0].manifest_hash
+                ):
+                    raise RuntimeError(
+                        "policy cache promotion lacks exact owner evidence"
+                    )
+                # This RPC returns after strongly held background tasks are
+                # created.  The fixed training stage can then release its GPUs;
+                # the next collection waits for exact receipts before requesting
+                # generation resources.
+                self.rlix_runtime.start_policy_prefetch(
+                    expected_policy_version=produced_policy_version
+                )
+                self._on_async_policy_prefetch_started(produced_policy_version)
             residencies = self._get_rlix_fixed_residencies(self.actor)
             stage.complete(
                 self.rlix_runtime.fixed_residency_receipt(
@@ -776,10 +842,13 @@ class EmbodiedRunner:
                     "RLix profiling requires component-scoped stage integration"
                 )
             self.actor.set_global_step(self.global_step)
-            self.rollout.set_global_step(self.global_step)
+            if not self._uses_async_policy_prefetch():
+                self.rollout.set_global_step(self.global_step)
             with self.timer("step"):
                 with self.timer("sync_weights"):
-                    if _step % self.weight_sync_interval == 0:
+                    if self._uses_async_policy_prefetch() or (
+                        _step % self.weight_sync_interval == 0
+                    ):
                         self.update_rollout_weights()
                 with self.timer("generate_rollouts"):
                     batch_receipt = self._collect_rlix_rollouts()
@@ -798,6 +867,10 @@ class EmbodiedRunner:
                 actor_training_metrics=actor_training_metrics,
                 eval_metrics=eval_metrics,
             )
+        if self._uses_async_policy_prefetch() and self.global_step > 0:
+            # Leave every CPU rollout replica at the final committed policy.
+            # This also observes any background exception before runtime close.
+            self.update_rollout_weights()
         self._finish_run()
 
     def _log_rlix_step_metrics(

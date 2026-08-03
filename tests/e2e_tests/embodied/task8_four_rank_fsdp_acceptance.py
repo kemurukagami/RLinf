@@ -21,6 +21,7 @@ from task8_acceptance_control import (
     acceptance_control_actor_name,
     create_acceptance_control_actor,
 )
+from task8_gpu_profiler import Task8GPUProfiler
 from task8_two_pipeline_acceptance import (
     DriverProcessResult,
     _actor_id,
@@ -47,6 +48,22 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stream-driver-logs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--gpu-event-poll-interval-s",
+        "--gpu-profile-interval-s",
+        dest="gpu_event_poll_interval_s",
+        type=float,
+        default=0.5,
+        help=(
+            "poll interval for acceptance events; nvidia-smi is queried only "
+            "when a coalesced stage transition is observed"
+        ),
+    )
+    parser.add_argument(
+        "--gpu-profile",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
@@ -105,7 +122,11 @@ def _wait_for_both_b_ranks_working(control_actor: Any, *, timeout_s: float) -> N
         time.sleep(0.05)
 
 
-def _drive_four_rank_fsdp_gates(control_actor: Any, *, timeout_s: float) -> None:
+def _drive_four_rank_fsdp_gates(
+    control_actor: Any,
+    *,
+    timeout_s: float,
+) -> None:
     """Stage both B ranks before releasing A's all-GPU training request."""
     ray.get(
         control_actor.wait_for_gate.remote(
@@ -130,7 +151,7 @@ def _drive_four_rank_fsdp_gates(control_actor: Any, *, timeout_s: float) -> None
     )
     ray.get(
         control_actor.wait_for_gate.remote(
-            "a_target_rank_completed", timeout_s=timeout_s
+            "a_first_rank_completed", timeout_s=timeout_s
         )
     )
     ray.get(control_actor.release_gate.remote("allow_b_collection"))
@@ -157,7 +178,9 @@ def _drive_four_rank_fsdp_gates(control_actor: Any, *, timeout_s: float) -> None
     )
 
 
-def _validate_four_rank_lifecycle(events: list[Any] | tuple[Any, ...]) -> None:
+def _validate_four_rank_lifecycle(
+    events: list[Any] | tuple[Any, ...], *, iterations: int
+) -> None:
     """Require two-rank B preemption/resume and four-rank A training evidence."""
     required_worker_events = {
         "environment": {
@@ -199,13 +222,55 @@ def _validate_four_rank_lifecycle(events: list[Any] | tuple[Any, ...]) -> None:
             "A training did not complete on every FSDP rank: "
             f"observed={sorted(trained_actor_ranks)}"
         )
+    fixed_sync_acquisitions = [
+        event
+        for event in events
+        if event.event == "stage_acquired"
+        and event.details.get("stage") == "policy_sync"
+    ]
+    if fixed_sync_acquisitions:
+        raise ValueError(
+            "asynchronous CPU policy prefetch acquired the fixed sync stage"
+        )
+    expected_promotions = set(range(1, iterations + 1))
+    expected_consumed_versions = set(range(1, iterations))
+    for role in ("a", "b"):
+        promoted = {
+            event.details.get("policy_version")
+            for event in events
+            if event.driver_role == role
+            and event.component == "actor"
+            and event.event == "policy_cache_promoted"
+            and event.details.get("promoted") is True
+        }
+        if promoted != expected_promotions:
+            raise ValueError(
+                f"driver {role} policy cache promotions mismatch: "
+                f"expected={sorted(expected_promotions)}, observed={sorted(promoted)}"
+            )
+        consumed = {
+            event.details.get("policy_version")
+            for event in events
+            if event.driver_role == role
+            and event.component == "rollout"
+            and event.event == "async_policy_update_committed"
+        }
+        if not expected_consumed_versions.issubset(consumed):
+            raise ValueError(
+                f"driver {role} lacks asynchronous rollout versions: "
+                f"missing={sorted(expected_consumed_versions - consumed)}"
+            )
 
 
-def _summary(results: Mapping[str, DriverProcessResult]) -> dict[str, Any]:
+def _summary(
+    results: Mapping[str, DriverProcessResult], *, gpu_profile: Mapping[str, Any]
+) -> dict[str, Any]:
     return {
         "status": "passed",
         "scope": "four_rank_fsdp_generation_proof",
         "task8_accepted": False,
+        "policy_sync_mode": "async_cpu_prefetch",
+        "gpu_profile": dict(gpu_profile),
         "drivers": {
             role: {
                 "pid": result.pid,
@@ -221,11 +286,15 @@ def main() -> None:
     args = _parse_args()
     if args.timeout_s <= 0:
         raise ValueError("--timeout-s must be positive")
+    if args.gpu_event_poll_interval_s <= 0:
+        raise ValueError("--gpu-event-poll-interval-s must be positive")
     cfg = OmegaConf.load(args.config)
     if tuple(cfg.smoke.actor_gpus) != (0, 1, 2, 3):
         raise ValueError("config must place four FSDP actor ranks on GPUs 0,1,2,3")
     if cfg.smoke.completed_bundle_handoff != "release_before_training":
         raise ValueError("config must release completed bundles before training")
+    if cfg.smoke.policy_sync_mode != "async_cpu_prefetch":
+        raise ValueError("config must enable asynchronous CPU policy prefetch")
     local_actor_batch = (
         int(cfg.smoke.total_num_envs)
         * int(cfg.smoke.rollout_epoch)
@@ -244,6 +313,8 @@ def main() -> None:
         run_id=args.run_id,
         scope="generation_proof_only",
     )
+    gpu_profiler = None
+    gpu_profile_summary: Mapping[str, Any] = {"enabled": False}
     ray_context = ray.init(
         address=args.address,
         namespace=RLIX_NAMESPACE,
@@ -259,6 +330,12 @@ def main() -> None:
         ),
         namespace=RLIX_NAMESPACE,
     )
+    if args.gpu_profile:
+        gpu_profiler = Task8GPUProfiler(
+            layout.root / "gpu_profile",
+            interval_s=args.gpu_event_poll_interval_s,
+        )
+        gpu_profiler.start(event_source=lambda: ray.get(control_actor.events.remote()))
     environment = {
         "RLINF_TASK8_CONTROL_ACTOR": _actor_id(control_actor),
         "RLINF_TASK8_CONTROL_NAME": acceptance_control_actor_name(run_id=args.run_id),
@@ -302,7 +379,10 @@ def main() -> None:
             results,
             expected_iterations=int(cfg.smoke.max_train_steps),
         )
-        _validate_four_rank_lifecycle(ray.get(control_actor.events.remote()))
+        _validate_four_rank_lifecycle(
+            ray.get(control_actor.events.remote()),
+            iterations=int(cfg.smoke.max_train_steps),
+        )
     except BaseException as exc:
         try:
             ray.get(
@@ -326,10 +406,20 @@ def main() -> None:
         )
         raise
     finally:
+        if gpu_profiler is not None:
+            try:
+                gpu_profile_summary = gpu_profiler.stop()
+            except Exception:
+                if sys.exc_info()[0] is None:
+                    raise
         if ray.is_initialized():
+            try:
+                ray.kill(control_actor, no_restart=True)
+            except Exception:
+                pass
             ray.shutdown()
 
-    summary = _summary(results)
+    summary = _summary(results, gpu_profile=gpu_profile_summary)
     atomic_write_json(layout.root / "pair_result.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
 

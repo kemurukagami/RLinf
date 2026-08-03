@@ -10,6 +10,7 @@ from rlix_core.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX
 from rlix_core.protocol.validation import validate_pipeline_id
 
 from .coordinator import RLixResizeCoordinator
+from .model_update_service import AsyncPolicyUpdateService
 from .protocol import CoordinatorStatus, ElasticCollectionContext, PolicySyncLease
 
 
@@ -44,6 +45,9 @@ class RLixStageController:
         ray_namespace: str,
         env_worker_group: Any,
         rollout_worker_group: Any,
+        actor_worker_group: Any | None = None,
+        policy_sync_mode: str = "fixed_all_rank",
+        policy_sync_max_retries: int = 1,
         operation_timeout_s: float = 300.0,
         worker_max_concurrency: int | None = None,
     ) -> None:
@@ -66,6 +70,13 @@ class RLixStageController:
         )
         if set(env_workers) != set(rollout_workers):
             raise ValueError("environment and rollout worker ranks must match")
+        actor_workers = (
+            _extract_ranked_worker_handles(actor_worker_group, label="actor")
+            if actor_worker_group is not None
+            else {}
+        )
+        if policy_sync_mode == "async_cpu_prefetch" and not actor_workers:
+            raise ValueError("asynchronous policy prefetch requires actor workers")
 
         self.pipeline_id = pipeline_id
         self.ray_namespace = ray_namespace
@@ -83,7 +94,41 @@ class RLixStageController:
             rollout_workers=rollout_workers,
             operation_timeout_s=operation_timeout_s,
         )
+        self.policy_update_service = None
+        if policy_sync_mode == "async_cpu_prefetch":
+            service_class = ray.remote(AsyncPolicyUpdateService)
+            self.policy_update_service = service_class.options(
+                max_concurrency=1000,
+                max_restarts=0,
+                max_task_retries=0,
+            ).remote(
+                pipeline_id=pipeline_id,
+                actor_cache_owner=actor_workers[0],
+                rollout_workers=rollout_workers,
+                operation_timeout_s=operation_timeout_s,
+                max_retries=policy_sync_max_retries,
+            )
         self._closed = False
+
+    async def start_policy_prefetch(
+        self, *, expected_policy_version: int
+    ) -> dict[str, object]:
+        """Start post-training CPU updates without blocking stage release."""
+        if self.policy_update_service is None:
+            raise RuntimeError("asynchronous CPU policy prefetch is disabled")
+        return await self.policy_update_service.start_version.remote(
+            expected_policy_version=expected_policy_version
+        )
+
+    async def wait_policy_prefetch(
+        self, *, expected_policy_version: int
+    ) -> dict[int, object]:
+        """Wait for all rollout ranks before the next generation request."""
+        if self.policy_update_service is None:
+            raise RuntimeError("asynchronous CPU policy prefetch is disabled")
+        return await self.policy_update_service.wait_version.remote(
+            expected_policy_version=expected_policy_version
+        )
 
     async def configure_collection(
         self,
@@ -156,6 +201,9 @@ class RLixStageController:
         """Guard coordinator shutdown and then terminate its owner-scoped actor."""
         if self._closed:
             return
+        if self.policy_update_service is not None:
+            await self.policy_update_service.close.remote()
+            ray.kill(self.policy_update_service, no_restart=True)
         await self.coordinator.close.remote()
         ray.kill(self.coordinator, no_restart=True)
         self._closed = True

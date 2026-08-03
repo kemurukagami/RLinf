@@ -136,6 +136,12 @@ def main(cfg) -> None:
             operation_timeout_s=cfg.rlix.operation_timeout_s,
             enable_gpu_tracing=cfg.rlix.enable_gpu_tracing,
             completed_bundle_handoff=cfg.rlix.completed_bundle_handoff,
+            policy_sync_mode=str(
+                OmegaConf.select(cfg, "rlix.policy_sync.mode", default="fixed_all_rank")
+            ),
+            policy_sync_max_retries=int(
+                OmegaConf.select(cfg, "rlix.policy_sync.max_retries", default=1)
+            ),
             bootstrapper=bootstrap_registered_rlix_pipeline,
         )
         actor_group = launched.actor

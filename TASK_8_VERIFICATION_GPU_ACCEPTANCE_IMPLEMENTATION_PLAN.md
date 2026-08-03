@@ -2695,6 +2695,43 @@ the same policy version and may finalize early only after all eight sticky local
 completion bits are set. Training still starts only after all four epochs seal,
 then reclaims GPUs 0-3 for four-rank FSDP.
 
+### 19.14 Asynchronous CPU policy update and transition profiling (2026-08-03)
+
+The expansion-time `lazy_versioned` experiment was removed after a real run
+showed that a roughly 14-GiB rank update held `resize_infer()` for about 100
+seconds and could serialize two ranks into about 200 seconds. The isolated
+four-rank harness now selects `async_cpu_prefetch`. Each successful FSDP update
+builds and promotes a complete CPU candidate, then launches updates for all
+CPU-offloaded rollout ranks before the training stage releases its GPUs. The
+launch is nonblocking, so another pipeline can acquire GPUs while host-side
+updates continue. Before its next collection, the runner waits for exact
+all-rank receipts; only then can generation demand be published. Expansion no
+longer invokes the update service. Paused or resident ranks reject mutation.
+
+The old fixed all-rank sync remains available. Four-rank acceptance fails
+if a fixed policy-sync stage is acquired, if owner promotions do not cover
+versions 1 through the final trained version, or if rollout commits do not
+cover every version consumed by a later collection. Acceptance-only events
+record candidate size/hash, promotion, receiver transaction, each bucket, and
+the final receipt.
+
+The harness also starts switchable stage-transition GPU profiling by default;
+it can be disabled with `--no-gpu-profile`. It polls acceptance events but
+queries `nvidia-smi` only for coalesced allocation/release, generation, seal,
+prefetch, fixed-stage, and training transitions. Raw JSONL and a sparse
+per-GPU peak summary are written below `<run-root>/gpu_profile/`. Sparse
+snapshots are not reported as utilization-weighted GPU-seconds. Measurements
+remain node-total and include unrelated GPU processes.
+
+CPU regression gates at this checkpoint include 368 passing focused RLix,
+elastic lifecycle, cache/service/coordinator/runtime/runner, Task 8 config,
+instrumentation, and profiler tests with two opt-in Ray skips. The complete
+framework-neutral core suite passes 129 tests with one optional skip, and Ruff
+lint passes for both the modified RLinf files and core. The repository's
+unchanged core baseline still has two files that `ruff format --check` would
+reformat; modified RLinf files pass the formatting gate. Real GPU evidence for
+`async_cpu_prefetch` remains pending.
+
 ## 20. Definition of done
 
 T8 and the T0-T8 project are complete only when all of the following are true:

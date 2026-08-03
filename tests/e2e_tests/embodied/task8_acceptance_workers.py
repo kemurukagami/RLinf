@@ -303,6 +303,47 @@ class RecordingMultiStepRolloutWorkerMixin(AcceptanceWorkerRecorderMixin):
         self._record_acceptance("rollout_onload_verified", receipt=receipt)
         return receipt
 
+    def begin_async_policy_update(self, *, transfer_id: str, manifest: Any) -> None:
+        result = super().begin_async_policy_update(
+            transfer_id=transfer_id, manifest=manifest
+        )
+        self._record_acceptance(
+            "async_policy_update_started",
+            transfer_id=transfer_id,
+            policy_version=manifest.policy_version,
+            manifest_hash=manifest.manifest_hash,
+            bucket_count=manifest.bucket_count,
+            total_bytes=manifest.total_bytes,
+        )
+        return result
+
+    def apply_async_policy_bucket(self, *, transfer_id: str, bucket: Any) -> Any:
+        receipt = super().apply_async_policy_bucket(
+            transfer_id=transfer_id, bucket=bucket
+        )
+        self._record_acceptance(
+            "async_policy_bucket_applied",
+            transfer_id=transfer_id,
+            policy_version=receipt.policy_version,
+            bucket_index=receipt.bucket_index,
+            checksum=receipt.checksum,
+            byte_count=receipt.byte_count,
+        )
+        return receipt
+
+    def commit_async_policy_update(self, *, transfer_id: str) -> Any:
+        receipt = super().commit_async_policy_update(transfer_id=transfer_id)
+        self._record_acceptance(
+            "async_policy_update_committed",
+            transfer_id=transfer_id,
+            policy_version=receipt.applied_version,
+            prior_version=receipt.prior_version,
+            manifest_hash=receipt.manifest_hash,
+            bucket_count=receipt.bucket_count,
+            total_bytes=receipt.total_bytes,
+        )
+        return receipt
+
     async def request_elastic_drain(self, request: Any) -> Any:
         status = await super().request_elastic_drain(request)
         self._record_acceptance("drain_requested", request=request, status=status)
@@ -367,12 +408,55 @@ class RecordingEmbodiedFSDPActorMixin(AcceptanceWorkerRecorderMixin):
         )
         return result
 
+    def build_policy_cache_candidate(self, policy_version: int) -> Any:
+        """Record candidate construction after the production build succeeds."""
+        receipt = super().build_policy_cache_candidate(policy_version)
+        batch_receipt = getattr(self, "_rlix_batch_receipt", None)
+        lifecycle_generation = getattr(batch_receipt, "lifecycle_generation", None)
+        self._task8_last_policy_cache_lifecycle = lifecycle_generation
+        self._record_acceptance(
+            "policy_cache_built",
+            policy_version=policy_version,
+            lifecycle_generation=lifecycle_generation,
+            retained=receipt.retained,
+            manifest_hash=receipt.manifest_hash,
+            bucket_count=receipt.bucket_count,
+            total_bytes=receipt.total_bytes,
+        )
+        return receipt
+
+    def promote_policy_cache(self, policy_version: int) -> Any:
+        """Record the exact production promotion receipt."""
+        receipt = super().promote_policy_cache(policy_version)
+        self._record_acceptance(
+            "policy_cache_promoted",
+            policy_version=policy_version,
+            lifecycle_generation=getattr(
+                self, "_task8_last_policy_cache_lifecycle", None
+            ),
+            promoted=receipt.promoted,
+            manifest_hash=receipt.manifest_hash,
+        )
+        return receipt
+
 
 class RecordingEmbodiedRunnerMixin(AcceptanceWorkerRecorderMixin):
     """Record policy sync, sealed collection, and actor update boundaries."""
 
     def update_rollout_weights(self) -> Any:
         policy_version = self.global_step
+        if (
+            self.rlix_runtime is not None
+            and getattr(self.rlix_runtime, "policy_sync_mode", "fixed_all_rank")
+            == "async_cpu_prefetch"
+        ):
+            result = super().update_rollout_weights()
+            self._record_acceptance(
+                "policy_synchronized",
+                policy_version=policy_version,
+                sync_mode="async_cpu_prefetch",
+            )
+            return result
         self._record_acceptance(
             "stage_requested", stage="policy_sync", policy_version=policy_version
         )
@@ -389,6 +473,25 @@ class RecordingEmbodiedRunnerMixin(AcceptanceWorkerRecorderMixin):
             parent_hook()
         self._record_acceptance(
             "stage_acquired", stage="policy_sync", policy_version=self.global_step
+        )
+
+    def _on_async_policy_prefetch_started(self, policy_version: int) -> None:
+        self._record_acceptance(
+            "policy_prefetch_started", policy_version=policy_version
+        )
+
+    def _on_async_policy_prefetch_wait_started(self, policy_version: int) -> None:
+        self._record_acceptance(
+            "policy_prefetch_wait_started", policy_version=policy_version
+        )
+
+    def _on_async_policy_prefetch_completed(
+        self, policy_version: int, receipts: Mapping[int, object]
+    ) -> None:
+        self._record_acceptance(
+            "policy_prefetch_completed",
+            policy_version=policy_version,
+            rollout_ranks=sorted(receipts),
         )
 
     def _collect_rlix_rollouts(self) -> Any:

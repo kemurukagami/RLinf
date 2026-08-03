@@ -438,6 +438,25 @@ def test_cold_expand_pause_shrink_and_exact_token_resume() -> None:
     asyncio.run(run())
 
 
+def test_cold_expand_does_not_wait_for_cpu_policy_transfer() -> None:
+    async def run() -> None:
+        events: list[str] = []
+        env = {0: _FakeElasticWorker(0, event_log=events, label="env")}
+        rollout = {0: _FakeElasticWorker(0, event_log=events, label="rollout")}
+        coordinator = RLixResizeCoordinator(
+            pipeline_id="pipeline",
+            env_workers=env,
+            rollout_workers=rollout,
+        )
+
+        await _configure(coordinator)
+        await coordinator.resize_infer([], [0])
+
+        assert events[:2] == ["prepare:env", "prepare:rollout"]
+
+    asyncio.run(run())
+
+
 def test_completed_rank_result_and_token_free_release() -> None:
     async def run() -> None:
         coordinator, env, rollout = _coordinator()
@@ -1040,6 +1059,63 @@ def test_stage_controller_validates_public_ranked_handle_maps(monkeypatch) -> No
         "max_restarts": 0,
         "max_task_retries": 0,
     }
+
+
+def test_stage_controller_isolates_async_policy_service_from_coordinator(
+    monkeypatch,
+) -> None:
+    constructions: dict[str, dict[str, object]] = {}
+
+    class _RemoteClass:
+        def __init__(self, class_name: str) -> None:
+            self.class_name = class_name
+
+        def options(self, **kwargs):
+            constructions.setdefault(self.class_name, {})["options"] = kwargs
+            return self
+
+        def remote(self, **kwargs):
+            constructions.setdefault(self.class_name, {})["constructor"] = kwargs
+            return SimpleNamespace(class_name=self.class_name)
+
+    monkeypatch.setattr(
+        ray,
+        "remote",
+        lambda remote_type: _RemoteClass(remote_type.__name__),
+    )
+    actor_handle = object()
+    rollout_handle = object()
+    actor = SimpleNamespace(
+        worker_info_list=[SimpleNamespace(rank=0, worker=actor_handle)]
+    )
+    rollout = SimpleNamespace(
+        worker_info_list=[SimpleNamespace(rank=0, worker=rollout_handle)]
+    )
+    env = SimpleNamespace(worker_info_list=[SimpleNamespace(rank=0, worker=object())])
+
+    controller = RLixStageController(
+        pipeline_id="embodied_abc123def456",
+        ray_namespace="pipeline-namespace",
+        env_worker_group=env,
+        rollout_worker_group=rollout,
+        actor_worker_group=actor,
+        policy_sync_mode="async_cpu_prefetch",
+        policy_sync_max_retries=2,
+        operation_timeout_s=17,
+    )
+
+    coordinator_args = constructions["RLixResizeCoordinator"]["constructor"]
+    assert "actor_workers" not in coordinator_args
+    assert "policy_sync_mode" not in coordinator_args
+    service_args = constructions["AsyncPolicyUpdateService"]["constructor"]
+    assert service_args == {
+        "pipeline_id": "embodied_abc123def456",
+        "actor_cache_owner": actor_handle,
+        "rollout_workers": {0: rollout_handle},
+        "operation_timeout_s": 17,
+        "max_retries": 2,
+    }
+    assert controller.policy_update_service.class_name == "AsyncPolicyUpdateService"
 
 
 @pytest.mark.skipif(

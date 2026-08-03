@@ -36,6 +36,13 @@ from rlinf.data.embodied_io_struct import (
     merge_elastic_rollout_requests,
 )
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
+from rlinf.hybrid_engines.weight_syncer.versioned_cache import (
+    PolicyBucket,
+    PolicyBucketApplyReceipt,
+    PolicyCacheManifest,
+    PolicyCacheReceiver,
+    PolicyVersionReceipt,
+)
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
@@ -165,6 +172,7 @@ class MultiStepRolloutWorker(Worker):
             )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
+        self._rlix_policy_receiver = PolicyCacheReceiver(committed_version=self.version)
         self._elastic_cursor: RolloutPeerCursor | None = None
         self._elastic_state = ElasticRankState.INACTIVE_COLD
         self._elastic_expected_policy_version: int | None = None
@@ -297,6 +305,67 @@ class MultiStepRolloutWorker(Worker):
             cuda_graph_captured=False,
             policy_version=self.version,
         )
+
+    def get_async_policy_status(self) -> dict[str, object]:
+        """Return committed/staging version and CPU-update residency."""
+        return {
+            "worker_rank": self._rank,
+            "committed_version": self._rlix_policy_receiver.committed_version,
+            "staging_version": self._rlix_policy_receiver.staging_version,
+            "worker_version": self.version,
+            "elastic_state": self._elastic_state.value,
+            "model_resident": self._model_resident,
+        }
+
+    def begin_async_policy_update(
+        self, *, transfer_id: str, manifest: PolicyCacheManifest
+    ) -> None:
+        """Open a complete-version transaction on an inactive CPU model."""
+        self._assert_elastic_model_mutation_allowed("asynchronous policy update")
+        if self._model_resident or self._cuda_graph_captured:
+            raise RuntimeError("policy update requires an offloaded rollout model")
+        if self.version != self._rlix_policy_receiver.committed_version:
+            raise RuntimeError("rollout and policy-receiver versions diverged")
+        self._verify_rollout_model_residency(resident=False)
+        self._rlix_policy_receiver.begin(
+            transfer_id=transfer_id,
+            manifest=manifest,
+            state_dict=self.hf_model.state_dict(),
+        )
+
+    def apply_async_policy_bucket(
+        self, *, transfer_id: str, bucket: PolicyBucket
+    ) -> PolicyBucketApplyReceipt:
+        """Apply and acknowledge one ordered, checksummed CPU bucket."""
+        self._assert_elastic_model_mutation_allowed("asynchronous policy update")
+        if self._model_resident:
+            raise RuntimeError("policy update requires an offloaded rollout model")
+        status = self.get_async_policy_status()
+        if status["staging_version"] is None:
+            raise RuntimeError("no asynchronous policy transaction is active")
+        if self._rlix_policy_receiver.transfer_id != transfer_id:
+            raise ValueError("policy bucket transfer id does not match transaction")
+        receipt = self._rlix_policy_receiver.apply_bucket(
+            bucket,
+            state_dict=self.hf_model.state_dict(),
+        )
+        return receipt
+
+    def commit_async_policy_update(self, *, transfer_id: str) -> PolicyVersionReceipt:
+        """Commit the model version only after complete bucket coverage."""
+        self._assert_elastic_model_mutation_allowed("asynchronous policy update")
+        if self._rlix_policy_receiver.transfer_id != transfer_id:
+            raise ValueError("policy commit transfer id does not match transaction")
+        receipt = self._rlix_policy_receiver.commit()
+        self.version = receipt.applied_version
+        if hasattr(self.hf_model, "set_global_step"):
+            self.hf_model.set_global_step(receipt.applied_version)
+        return receipt
+
+    def abort_async_policy_update(self, *, transfer_id: str) -> None:
+        """Abort staging identity without exposing a partial model to generation."""
+        self._assert_elastic_model_mutation_allowed("asynchronous policy update")
+        self._rlix_policy_receiver.abort(transfer_id=transfer_id)
 
     def _validate_elastic_rollout_capability(self) -> None:
         if not self.enable_train:

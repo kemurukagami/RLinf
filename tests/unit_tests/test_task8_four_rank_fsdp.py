@@ -69,12 +69,19 @@ def test_four_rank_readiness_requires_all_gpu_actor_mapping() -> None:
         _validate_four_rank_ready(ready)
 
 
-def _event(role: str, component: str, rank: int, event: str) -> SimpleNamespace:
+def _event(
+    role: str,
+    component: str,
+    rank: int,
+    event: str,
+    **details,
+) -> SimpleNamespace:
     return SimpleNamespace(
         driver_role=role,
         component=component,
         dp_rank=rank,
         event=event,
+        details=details,
     )
 
 
@@ -97,8 +104,29 @@ def test_four_rank_lifecycle_requires_two_rank_resume_and_four_rank_training() -
             events.append(_event("b", "rollout", rank, event))
     for rank in range(4):
         events.append(_event("a", "actor", rank, "training_completed"))
+    for role in ("a", "b"):
+        for version in (1, 2):
+            events.append(
+                _event(
+                    role,
+                    "actor",
+                    0,
+                    "policy_cache_promoted",
+                    policy_version=version,
+                    promoted=True,
+                )
+            )
+        events.append(
+            _event(
+                role,
+                "rollout",
+                0,
+                "async_policy_update_committed",
+                policy_version=1,
+            )
+        )
 
-    _validate_four_rank_lifecycle(events)
+    _validate_four_rank_lifecycle(events, iterations=2)
     events = [event for event in events if event.event != "restore_validated"]
     with pytest.raises(ValueError, match="preemption evidence"):
-        _validate_four_rank_lifecycle(events)
+        _validate_four_rank_lifecycle(events, iterations=2)

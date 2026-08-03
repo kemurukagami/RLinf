@@ -102,6 +102,33 @@ class _Group:
         self.events.append(f"start_sync_to:{self.component}")
         return _Handle(self.events, f"wait_sync_to:{self.component}")
 
+    def get_policy_cache_status(self):
+        self.events.append("start_cache_status")
+        return _Handle(
+            self.events,
+            "wait_cache_status",
+            [
+                {
+                    "is_owner": True,
+                    "active_version": self.policy_version,
+                }
+            ],
+        )
+
+    def promote_policy_cache(self, policy_version):
+        self.events.append(f"start_promote:{policy_version}")
+        return _Handle(
+            self.events,
+            f"wait_promote:{policy_version}",
+            [
+                SimpleNamespace(
+                    promoted=True,
+                    policy_version=policy_version,
+                    manifest_hash="manifest",
+                )
+            ],
+        )
+
     def recv_rollout_trajectories(self, *, input_channel):
         self.events.append(f"start_receiver:{input_channel}")
         return _Handle(self.events, "wait_receiver")
@@ -149,6 +176,8 @@ class _Stage:
 class _Runtime:
     def __init__(self, events: list[str]) -> None:
         self.events = events
+        self.policy_sync_mode = "fixed_all_rank"
+        self.placement_plan = SimpleNamespace(actor_infer_bundles=((0, (0,)),))
 
     def fixed_stage(self, **kwargs):
         self.events.append(
@@ -166,6 +195,15 @@ class _Runtime:
             "verify:" + ",".join(status.component for status in statuses)
         )
         return "verified-receipt"
+
+    def start_policy_prefetch(self, *, expected_policy_version):
+        self.events.append(f"start_policy_prefetch:{expected_policy_version}")
+
+    def wait_policy_prefetch(self, *, expected_policy_version):
+        self.events.append(f"wait_policy_prefetch:{expected_policy_version}")
+        return {
+            0: SimpleNamespace(applied_version=expected_policy_version),
+        }
 
 
 class _CollectionRuntime:
@@ -332,6 +370,18 @@ def test_enabled_policy_sync_is_leased_versioned_and_verified() -> None:
     ]
 
 
+def test_async_policy_sync_waits_before_generation_without_fixed_allocation() -> None:
+    events: list[str] = []
+    runtime = _Runtime(events)
+    runtime.policy_sync_mode = "async_cpu_prefetch"
+    runner = _runner(events, runtime=runtime)
+    runner.global_step = 6
+
+    runner.update_rollout_weights()
+
+    assert events == ["wait_policy_prefetch:6"]
+
+
 def test_actor_seals_only_complete_single_version_cpu_batch() -> None:
     actor = object.__new__(EmbodiedFSDPActor)
     actor._rlix_batch_receipt = None
@@ -489,6 +539,25 @@ def test_fixed_actor_training_advances_version_only_after_verified_release() -> 
     ]
 
 
+def test_async_actor_training_starts_prefetch_before_residency_release() -> None:
+    events: list[str] = []
+    runtime = _Runtime(events)
+    runtime.policy_sync_mode = "async_cpu_prefetch"
+    runner = _runner(events, runtime=runtime)
+    runner.global_step = 3
+
+    runner._train_rlix_batch("batch-3")
+
+    assert events.index("wait_set_global_step:actor:4") < events.index(
+        "start_promote:4"
+    )
+    assert events.index("wait_promote:4") < events.index("start_residency:actor")
+    assert events.index("start_policy_prefetch:4") < events.index(
+        "start_residency:actor"
+    )
+    assert events.index("wait_promote:4") < events.index("release_actor_train")
+
+
 def test_failed_actor_training_does_not_advance_policy_version() -> None:
     events: list[str] = []
     runtime = _Runtime(events)
@@ -552,6 +621,33 @@ def test_actor_training_consumes_seal_and_offloads_state() -> None:
     assert metrics == {"loss": 1.0}
     assert events == ["train", "offload_weights:True", "offload_optimizer"]
     assert actor._rlix_batch_receipt is None
+
+
+def test_async_actor_builds_candidate_before_training_offload() -> None:
+    actor = object.__new__(EmbodiedFSDPActor)
+    receipt = ElasticBatchReceipt(2, 6, (0,), 4, 4, 12)
+    actor._rlix_batch_receipt = receipt
+    actor._rlix_async_policy_prefetch = True
+    actor.is_weight_offloaded = False
+    actor.is_optimizer_offloaded = False
+    events: list[str] = []
+    actor.run_training = lambda: events.append("train") or {"loss": 1.0}
+    actor.build_policy_cache_candidate = lambda version: events.append(
+        f"build:{version}"
+    )
+    actor.offload_param_and_grad = lambda offload_grad: events.append(
+        f"offload_weights:{offload_grad}"
+    )
+    actor.offload_optimizer = lambda: events.append("offload_optimizer")
+
+    actor.run_rlix_training(receipt)
+
+    assert events == [
+        "train",
+        "build:7",
+        "offload_weights:True",
+        "offload_optimizer",
+    ]
 
 
 def test_actor_rlix_checkpoint_restore_reestablishes_offload() -> None:
@@ -827,3 +923,38 @@ def test_rlix_loop_orders_sync_collection_training_and_post_step() -> None:
         "log:0",
         "finish",
     ]
+
+
+def test_async_prefetch_wait_is_not_skipped_by_weight_sync_interval() -> None:
+    events: list[str] = []
+    runner = EmbodiedRunner.__new__(EmbodiedRunner)
+    runner.cfg = SimpleNamespace(runner={"use_training_pipeline": False})
+    runner.rlix_runtime = SimpleNamespace(policy_sync_mode="async_cpu_prefetch")
+    runner.global_step = 0
+    runner.max_steps = 2
+    runner.weight_sync_interval = 99
+    runner.timer = lambda _label: nullcontext()
+    runner.actor = SimpleNamespace(set_global_step=lambda step: None)
+    runner.rollout = SimpleNamespace(
+        set_global_step=lambda step: pytest.fail(
+            "receiver commit must own rollout version advancement"
+        )
+    )
+    runner._should_profile_step = lambda step: False
+    runner.update_rollout_weights = lambda: events.append(
+        f"wait_policy:{runner.global_step}"
+    )
+    runner._collect_rlix_rollouts = lambda: "batch"
+
+    def train(_receipt):
+        runner.global_step += 1
+        return [], [], "handle"
+
+    runner._train_rlix_batch = train
+    runner._maybe_eval_and_checkpoint = lambda step: {}
+    runner._log_rlix_step_metrics = lambda **kwargs: None
+    runner._finish_run = lambda: None
+
+    runner._run_rlix()
+
+    assert events == ["wait_policy:0", "wait_policy:1", "wait_policy:2"]

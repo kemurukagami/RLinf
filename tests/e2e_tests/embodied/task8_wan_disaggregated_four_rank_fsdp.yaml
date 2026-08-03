@@ -23,6 +23,13 @@ smoke:
   rollout_gpu: [0, 1]
   env_gpu: [2, 3]
   completed_bundle_handoff: release_before_training
+  # Publish complete versioned CPU buckets after FSDP training, then update all
+  # offloaded rollout CPU replicas in the background while the other pipeline
+  # can use the GPUs. The next generation request waits for exact receipts.
+  policy_sync_mode: async_cpu_prefetch
+  policy_sync_bucket_size_mb: 128
+  policy_sync_max_cached_versions: 2
+  policy_sync_max_retries: 1
   operation_timeout_s: 900.0
   monitor_poll_interval_s: 0.1
   output_dir: ${oc.env:RLINF_TASK8_OUTPUT,/tmp/rlinf_task8_four_rank_fsdp}

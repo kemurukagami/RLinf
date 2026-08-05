@@ -2,23 +2,21 @@
 
 ## 1. Status and source of truth
 
-Status: in progress, updated 2026-07-30. T0-T7 are implemented and have focused
+Status: in progress, updated 2026-08-05. T0-T7 are implemented and have focused
 CPU coverage. T8 now has an executable two-OS-driver harness, shared detached
 control plane, real Wan model initialization, real generation instrumentation,
 safe-point drain/resume evidence, sealed-batch evidence, a single-pipeline
-control, and a ten-iteration two-pipeline workload. Successive accelerator
+control, a ten-iteration two-pipeline workload, four-rank FSDP training, early
+rank finalization, and asynchronous CPU policy delivery. Successive accelerator
 debug runs have reached real policy inference, Wan diffusion/reward, chunk
 commit, drain-barrier, snapshot/offload, completed-rank release, batch sealing,
-and GRPO stage boundaries, exposing and localizing several production and
-acceptance-contract defects recorded below. T8 is not complete: no single
-recorded two-driver run has yet completed the full linked ten-iteration
-generation/training proof, the newly implemented training-triggered
-interruption policy still needs real-GPU proof, and the Wan/OpenSora reference/
-recovery/utilization matrices have not passed. A 2026-07-30 run completed five linked
-generation/training iterations per driver and entered lifecycle 6 before an
-absolute harness timeout; this is substantial partial evidence, not T8
-acceptance, because it did not complete ten iterations or exercise preemption
-and resume.
+GRPO training, candidate promotion, and all-rollout-rank version commit. The
+latest checkpoint completed six linked updates per driver and exercised 11
+two-rank preemption episodes before manual interruption during iteration 7.
+T8 is not complete: no recorded two-driver run has completed the full linked
+ten-iteration proof, and the Wan/OpenSora reference, recovery, and utilization
+matrices have not passed. The current evidence is substantial implementation
+progress, not Task 8 acceptance.
 
 Implementation progress (through 2026-07-30; the dated entries below are an
 append-only evidence ledger):
@@ -2729,8 +2727,78 @@ instrumentation, and profiler tests with two opt-in Ray skips. The complete
 framework-neutral core suite passes 129 tests with one optional skip, and Ruff
 lint passes for both the modified RLinf files and core. The repository's
 unchanged core baseline still has two files that `ruff format --check` would
-reformat; modified RLinf files pass the formatting gate. Real GPU evidence for
-`async_cpu_prefetch` remains pending.
+reformat; modified RLinf files pass the formatting gate. At this checkpoint,
+real GPU evidence for `async_cpu_prefetch` remained pending; section 19.15
+records the subsequent partial run.
+
+### 19.15 Native baseline and async CPU policy GPU checkpoint (2026-08-05)
+
+The native comparison is now maintained and executed entirely in the original
+RLinf checkout. Its resolved ten-iteration workload is
+`/root/RLinf/tests/e2e_tests/embodied/wan_libero_spatial_grpo_openvlaoft_10_iteration.yaml`;
+it uses the native runner and does not import the `_VLAMP` launcher or RLix
+runtime. The recorded run at
+`/root/original-rlinf-baseline/native-wan-10-1/` completed ten of ten updates in
+1:43:25 (about 5.80 updates/hour), with mean generation 321.43 seconds, actor
+training 283.19 seconds, and native weight synchronization 15.94 seconds. It
+produced 640 trajectories and 80 videos. Mean logged rollout reward was
+0.007691 and mean `success_once` was 0.328125. Iteration 9 had zero return but
+trained normally under reward filter `[0, 5]`; no OOM, NCCL, or runtime failure
+was found.
+
+The corresponding RLix artifact is
+`/root/task8-four-rank-fsdp/four-rank-fsdp-async-cpu-prefetch-1/`. Each pipeline
+completed six updates and began collection for iteration 7 before manual
+interruption. The 12 completed aggregate updates took approximately 2:22:36
+through the twelfth policy-ready point (about 5.05 updates/hour). The run
+exercised 24 rank completions, 12 complete batch seals, 12 four-rank FSDP
+updates, 22 rank drain/snapshot cycles, all-rank policy receipts and commits,
+and 15 early-finalized rank epochs out of 96. Completed training batches kept
+the required shapes: rewards `[32, 16, 8]`, dones `[33, 16, 8]`, and loss mask
+`[32, 16, 8]`. Mean logged rollout reward over those updates was 0.007238 and
+the success-marker rate was approximately 0.319. Driver A wrote 52 videos,
+including partial iteration-7 output, and driver B wrote 48 videos for its six
+completed iterations.
+
+Mean scheduler wait for a generation grant was 137.8 seconds. Mean
+grant-to-last-rank collection wall time was 662.8 seconds, but that interval
+includes time paused for the other pipeline's training and is not active GPU
+generation time. Unpreempted RLix generation examples of 325.5 and 340.4
+seconds are close to the native 321.43-second mean. Early finalization exited
+at a mean step of approximately 117 versus the 256-step limit and is estimated
+to have avoided about 8.5 percent of aggregate environment steps.
+
+The acceptance stream contains 64,555 events and is approximately 259 MB,
+which also identifies instrumentation volume as an experiment variable. GPU
+transition snapshots observed approximately 47.2--47.6 GiB peak memory and
+100-percent peak utilization on each 80-GiB GPU. They are sparse, node-level
+snapshots that include unrelated processes and therefore cannot establish a
+utilization time integral.
+
+The selected policy cache was 15,082,474,368 bytes in 143 buckets. Mean
+training-through-cache time was 346.79 seconds and mean asynchronous CPU policy
+delivery was 119.93 seconds, compared with native training plus synchronization
+of 283.19 + 15.94 = 299.13 seconds. Current tracing supports only an inferred
+decomposition: about 283.19 seconds of common optimizer work, 2.33 seconds of
+collective materialization, a 60.02-second rank-0 CPU packaging tail, and a
+1.25-second completion/offload tail. The collective value is inferred from the
+non-owner cache marker and is not directly bracketed by an optimizer-complete
+event.
+
+These measurements identify CPU packing, repeated model-sized copies, byte
+conversion, checksumming, and Ray delivery as the immediate optimization
+target. Next implementation work should add exact markers around optimizer
+completion, materialization, device-to-host copying, bucket assembly, hashing,
+receiver apply, and commit; preallocate shared or pinned bucket storage; avoid
+`torch.cat` and `.numpy().tobytes()` model-sized copies; and evaluate shared
+immutable handles plus shard-aware cache ownership. Atomic promotion,
+exact-version receipts, and fail-closed admission remain mandatory.
+
+This checkpoint provides real-GPU evidence that the mechanism executes, but it
+does not satisfy Task 8: `pair_failure.json` records a manual
+`KeyboardInterrupt`, `status: failed`, and `task8_accepted: false`; neither
+pipeline completed all ten declared iterations. The Definition of Done below
+remains unchanged.
 
 ## 20. Definition of done
 

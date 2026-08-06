@@ -22,6 +22,7 @@ from rlinf.envs.world_model.base_world_env import (
     BaseWorldEnv,
     WorldEnvSnapshotContext,
 )
+from rlinf.workers.elastic_rollout_lifecycle import ElasticValidationMode
 from rlinf.workers.env.env_worker import (
     ENV_ROLLOUT_RESUME_SCHEMA_VERSION,
     EnvRolloutCursor,
@@ -822,6 +823,52 @@ def test_wan_worker_snapshot_derives_continuation_with_empty_bootstrap_caches(
         expected_lifecycle_generation=2,
         expected_policy_version=7,
     )
+
+
+def test_wan_worker_receipt_snapshot_omits_and_derives_redundant_state(monkeypatch):
+    worker = _make_wan_worker(monkeypatch)
+    worker._elastic_snapshot_validation_mode = ElasticValidationMode.RECEIPT
+    transition_id = RolloutTransitionIdentity(2, 0, 0, 1)
+    worker._current_env_outputs[0].transition_id = transition_id
+    worker._resume_bootstraps[0].transition_id = transition_id
+    worker.rollout_results[0].transition_ids = [RolloutTransitionIdentity(2, 0, 0, 0)]
+
+    state = worker.snapshot_rollout_stage()
+
+    assert state.validation_receipt is not None
+    assert state.current_env_outputs == ()
+    assert state.last_observations == ()
+    assert state.last_intervened_info == ()
+    worker.restore_rollout_stage(
+        state,
+        expected_lifecycle_generation=2,
+        expected_policy_version=7,
+    )
+    canonical = worker._resume_bootstraps[0]
+    assert canonical is not None
+    assert worker._continuation_values_equal(worker._current_env_outputs[0], canonical)
+    assert worker._continuation_values_equal(worker.last_obs_list[0], canonical.obs)
+
+
+def test_wan_worker_receipt_snapshot_rejects_stale_receipt(monkeypatch):
+    worker = _make_wan_worker(monkeypatch)
+    worker._elastic_snapshot_validation_mode = ElasticValidationMode.RECEIPT
+    transition_id = RolloutTransitionIdentity(2, 0, 0, 1)
+    worker._current_env_outputs[0].transition_id = transition_id
+    worker._resume_bootstraps[0].transition_id = transition_id
+    worker.rollout_results[0].transition_ids = [RolloutTransitionIdentity(2, 0, 0, 0)]
+    state = worker.snapshot_rollout_stage()
+    stale = replace(
+        state,
+        validation_receipt=replace(state.validation_receipt, receipt_id="stale"),
+    )
+
+    with pytest.raises(ValueError, match="missing, stale, or foreign"):
+        worker.validate_rollout_resume_state(
+            stale,
+            expected_lifecycle_generation=2,
+            expected_policy_version=7,
+        )
 
 
 def test_wan_worker_snapshot_normalizes_stale_end_of_rollout_caches(monkeypatch):

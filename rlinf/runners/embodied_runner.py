@@ -399,30 +399,6 @@ class EmbodiedRunner:
             # transaction.  Policy sync must never depend on a caller remembering
             # to update the actor's authoritative source-version stamp later.
             self.actor.set_global_step(produced_policy_version).wait()
-            if self._uses_async_policy_prefetch():
-                promotion_receipts = self.actor.promote_policy_cache(
-                    produced_policy_version
-                ).wait()
-                promoted = [
-                    receipt
-                    for receipt in promotion_receipts
-                    if getattr(receipt, "promoted", False)
-                ]
-                if len(promoted) != 1 or (
-                    promoted[0].policy_version != produced_policy_version
-                    or not promoted[0].manifest_hash
-                ):
-                    raise RuntimeError(
-                        "policy cache promotion lacks exact owner evidence"
-                    )
-                # This RPC returns after strongly held background tasks are
-                # created.  The fixed training stage can then release its GPUs;
-                # the next collection waits for exact receipts before requesting
-                # generation resources.
-                self.rlix_runtime.start_policy_prefetch(
-                    expected_policy_version=produced_policy_version
-                )
-                self._on_async_policy_prefetch_started(produced_policy_version)
             residencies = self._get_rlix_fixed_residencies(self.actor)
             stage.complete(
                 self.rlix_runtime.fixed_residency_receipt(
@@ -431,6 +407,34 @@ class EmbodiedRunner:
                     policy_version=produced_policy_version,
                 )
             )
+        if self._uses_async_policy_prefetch():
+            # CPU checksum, validation, and promotion deliberately wait outside
+            # fixed TP=4 ownership. The actor captured immutable bytes and
+            # offloaded before the stage supplied its release receipt.
+            finalizer_starts = self.actor.start_policy_cache_finalization(
+                produced_policy_version
+            ).wait()
+            if sum(result is True for result in finalizer_starts) != 1:
+                raise RuntimeError(
+                    "policy cache finalization lacks exact owner evidence"
+                )
+            promotion_receipts = self.actor.promote_policy_cache(
+                produced_policy_version
+            ).wait()
+            promoted = [
+                receipt
+                for receipt in promotion_receipts
+                if getattr(receipt, "promoted", False)
+            ]
+            if len(promoted) != 1 or (
+                promoted[0].policy_version != produced_policy_version
+                or not promoted[0].manifest_hash
+            ):
+                raise RuntimeError("policy cache promotion lacks exact owner evidence")
+            self.rlix_runtime.start_policy_prefetch(
+                expected_policy_version=produced_policy_version
+            )
+            self._on_async_policy_prefetch_started(produced_policy_version)
         self.global_step = produced_policy_version
         return actor_rollout_metrics, actor_training_metrics, training_handle
 

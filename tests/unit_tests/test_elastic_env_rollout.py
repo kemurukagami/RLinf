@@ -29,6 +29,8 @@ from rlinf.workers.elastic_rollout_lifecycle import (
     ElasticRankState,
     ElasticRunOutcome,
     ElasticRunResult,
+    ElasticValidationMode,
+    ResidencyOperationReceipt,
     ResidencyReceipt,
     RolloutTransitionIdentity,
     SafePointToken,
@@ -54,6 +56,53 @@ def _identity(*, lifecycle: int = 1, rank: int = 0, sequence: int = 0):
         stage_id=0,
         sequence=sequence,
     )
+
+
+def test_receipt_residency_mode_skips_python_tensor_traversal() -> None:
+    worker = _elastic_rollout_worker([])
+    worker._elastic_residency_validation_mode = ElasticValidationMode.RECEIPT
+    worker._elastic_residency_operation_generation = 0
+    worker._elastic_residency_operation_receipt = None
+    worker._elastic_cursor = RolloutPeerCursor(
+        lifecycle_generation=1,
+        policy_version=3,
+        epoch_index=0,
+        committed_chunk_count=0,
+        expected_transition_id=_identity(),
+        phase=RolloutPeerPhase.IDLE,
+    )
+    worker._model_resident = True
+
+    receipt = worker._validate_rollout_residency_operation(resident=True)
+
+    assert receipt is not None
+    assert receipt.operation_generation == 1
+    assert receipt.destination_device == "accelerator"
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"destination_device": "cpu"}, "destination"),
+        ({"synchronized": False}, "synchronized"),
+        ({"moved_bytes": -1}, "non-negative"),
+    ],
+)
+def test_residency_operation_receipt_rejects_incomplete_evidence(updates, message):
+    values = {
+        "worker_rank": 0,
+        "lifecycle_generation": 1,
+        "policy_version": 3,
+        "operation_generation": 1,
+        "resident": True,
+        "destination_device": "accelerator",
+        "synchronized": True,
+        "moved_bytes": None,
+    }
+    values.update(updates)
+
+    with pytest.raises(ValueError, match=message):
+        ResidencyOperationReceipt(**values)
 
 
 def _env_output(identity: RolloutTransitionIdentity | None) -> EnvOutput:

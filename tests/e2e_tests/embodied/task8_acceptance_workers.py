@@ -29,6 +29,13 @@ class AcceptanceWorkerRecorderMixin:
     """Add an explicitly configured fail-closed acceptance observer."""
 
     _task8_acceptance_observer: AcceptanceWorkerObserver | None = None
+    _task8_acceptance_instrumentation_enabled = True
+
+    def configure_acceptance_instrumentation(self, enabled: bool) -> None:
+        """Enable fail-closed recording or explicitly select no-op mode."""
+        if not isinstance(enabled, bool):
+            raise TypeError("acceptance instrumentation flag must be a bool")
+        self._task8_acceptance_instrumentation_enabled = enabled
 
     def configure_acceptance_observer(self, observer: AcceptanceWorkerObserver) -> None:
         """Install the observer before running an instrumented acceptance case."""
@@ -37,6 +44,8 @@ class AcceptanceWorkerRecorderMixin:
         self._task8_acceptance_observer = observer
 
     def _record_acceptance(self, event: str, **details: Any) -> None:
+        if not self._task8_acceptance_instrumentation_enabled:
+            return
         observer = self._task8_acceptance_observer
         if observer is None:
             raise RuntimeError("acceptance observer is not configured")
@@ -409,7 +418,7 @@ class RecordingEmbodiedFSDPActorMixin(AcceptanceWorkerRecorderMixin):
         return result
 
     def build_policy_cache_candidate(self, policy_version: int) -> Any:
-        """Record candidate construction after the production build succeeds."""
+        """Record synchronous compatibility candidate construction."""
         receipt = super().build_policy_cache_candidate(policy_version)
         batch_receipt = getattr(self, "_rlix_batch_receipt", None)
         lifecycle_generation = getattr(batch_receipt, "lifecycle_generation", None)
@@ -418,6 +427,31 @@ class RecordingEmbodiedFSDPActorMixin(AcceptanceWorkerRecorderMixin):
             "policy_cache_built",
             policy_version=policy_version,
             lifecycle_generation=lifecycle_generation,
+            retained=receipt.retained,
+            manifest_hash=receipt.manifest_hash,
+            bucket_count=receipt.bucket_count,
+            total_bytes=receipt.total_bytes,
+        )
+        return receipt
+
+    def _capture_policy_cache_candidate(self, policy_version: int) -> Any:
+        """Remember lifecycle identity before CPU finalization becomes async."""
+        capture = super()._capture_policy_cache_candidate(policy_version)
+        batch_receipt = getattr(self, "_rlix_batch_receipt", None)
+        self._task8_last_policy_cache_lifecycle = getattr(
+            batch_receipt, "lifecycle_generation", None
+        )
+        return capture
+
+    def _finalize_policy_cache_capture(self, capture: Any) -> Any:
+        """Record candidate readiness from the bounded CPU finalizer."""
+        receipt = super()._finalize_policy_cache_capture(capture)
+        self._record_acceptance(
+            "policy_cache_built",
+            policy_version=receipt.policy_version,
+            lifecycle_generation=getattr(
+                self, "_task8_last_policy_cache_lifecycle", None
+            ),
             retained=receipt.retained,
             manifest_hash=receipt.manifest_hash,
             bucket_count=receipt.bucket_count,

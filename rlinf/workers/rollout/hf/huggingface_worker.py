@@ -55,6 +55,8 @@ from rlinf.workers.elastic_rollout_lifecycle import (
     ElasticRankStatus,
     ElasticRunOutcome,
     ElasticRunResult,
+    ElasticValidationMode,
+    ResidencyOperationReceipt,
     ResidencyReceipt,
     SafePointToken,
     validate_elastic_state_transition,
@@ -183,6 +185,13 @@ class MultiStepRolloutWorker(Worker):
         self._elastic_run_call_active = False
         self._model_resident = False
         self._cuda_graph_captured = False
+        self._elastic_residency_validation_mode = ElasticValidationMode.parse(
+            OmegaConf.select(cfg, "rlix.residency_validation_mode", default="deep")
+        )
+        self._elastic_residency_operation_generation = 0
+        self._elastic_residency_operation_receipt: ResidencyOperationReceipt | None = (
+            None
+        )
         self.finished_episodes = None
 
         self.weight_syncer = None
@@ -296,7 +305,8 @@ class MultiStepRolloutWorker(Worker):
             raise RuntimeError("RLix rollout residency requires rollout offload")
         if self._model_resident or self._cuda_graph_captured:
             raise RuntimeError("rollout model or CUDA graph remains resident")
-        self._verify_rollout_model_residency(resident=False)
+        if self._residency_validation_mode() is ElasticValidationMode.DEEP:
+            self._verify_rollout_model_residency(resident=False)
         return FixedWorkerResidency(
             component="rollout",
             rank=self._rank,
@@ -326,7 +336,8 @@ class MultiStepRolloutWorker(Worker):
             raise RuntimeError("policy update requires an offloaded rollout model")
         if self.version != self._rlix_policy_receiver.committed_version:
             raise RuntimeError("rollout and policy-receiver versions diverged")
-        self._verify_rollout_model_residency(resident=False)
+        if self._residency_validation_mode() is ElasticValidationMode.DEEP:
+            self._verify_rollout_model_residency(resident=False)
         self._rlix_policy_receiver.begin(
             transfer_id=transfer_id,
             manifest=manifest,
@@ -1201,6 +1212,55 @@ class MultiStepRolloutWorker(Worker):
         ):
             raise RuntimeError("Cannot verify rollout model residency")
 
+    def _validate_rollout_residency_operation(
+        self, *, resident: bool
+    ) -> ResidencyOperationReceipt | None:
+        """Validate one synchronized move according to the configured policy."""
+
+        mode = self._residency_validation_mode()
+        if mode is ElasticValidationMode.DEEP:
+            self._verify_rollout_model_residency(resident=resident)
+            self._elastic_residency_operation_receipt = None
+            return None
+        if mode is ElasticValidationMode.OFF:
+            self._elastic_residency_operation_receipt = None
+            return None
+        if self._model_resident != resident:
+            raise RuntimeError("rollout residency state does not match completed move")
+        if not resident and self._cuda_graph_captured:
+            raise RuntimeError("offloaded rollout retained a CUDA graph")
+        cursor = self._elastic_cursor
+        if cursor is None:
+            raise RuntimeError("rollout residency receipt requires a lifecycle cursor")
+        self._elastic_residency_operation_generation += 1
+        receipt = ResidencyOperationReceipt(
+            worker_rank=self._rank,
+            lifecycle_generation=cursor.lifecycle_generation,
+            policy_version=cursor.policy_version,
+            operation_generation=self._elastic_residency_operation_generation,
+            resident=resident,
+            destination_device="accelerator" if resident else "cpu",
+            synchronized=True,
+        )
+        self._elastic_residency_operation_receipt = receipt
+        return receipt
+
+    def _residency_validation_result(self) -> dict[str, Any]:
+        mode = self._residency_validation_mode()
+        return {
+            "validation_mode": mode,
+            "operation_receipt": (
+                self._elastic_residency_operation_receipt
+                if mode is ElasticValidationMode.RECEIPT
+                else None
+            ),
+        }
+
+    def _residency_validation_mode(self) -> ElasticValidationMode:
+        return getattr(
+            self, "_elastic_residency_validation_mode", ElasticValidationMode.DEEP
+        )
+
     def offload_elastic_rollout(self, token: SafePointToken) -> ResidencyReceipt:
         """Offload and verify every model owned by a drained rollout rank."""
 
@@ -1214,6 +1274,7 @@ class MultiStepRolloutWorker(Worker):
                 state=ElasticRankState.PAUSED,
                 model_resident=False,
                 cuda_graph_captured=False,
+                **self._residency_validation_result(),
             )
         if self._elastic_state is not ElasticRankState.SNAPSHOTTING:
             raise RuntimeError(
@@ -1229,8 +1290,8 @@ class MultiStepRolloutWorker(Worker):
 
         try:
             self.offload_model()
-            self._verify_rollout_model_residency(resident=False)
             self.torch_platform.synchronize()
+            self._validate_rollout_residency_operation(resident=False)
             self.torch_platform.empty_cache()
             validate_elastic_state_transition(
                 self._elastic_state, ElasticRankState.PAUSED
@@ -1241,6 +1302,7 @@ class MultiStepRolloutWorker(Worker):
                 state=ElasticRankState.PAUSED,
                 model_resident=False,
                 cuda_graph_captured=False,
+                **self._residency_validation_result(),
             )
         except Exception as exc:
             self._record_elastic_failure(exc)
@@ -1259,10 +1321,10 @@ class MultiStepRolloutWorker(Worker):
         try:
             if self._model_resident or self._cuda_graph_captured:
                 self.offload_model()
-            self._verify_rollout_model_residency(resident=False)
             if self._cuda_graph_captured:
                 raise RuntimeError("Completed rollout retained a CUDA graph")
             self.torch_platform.synchronize()
+            self._validate_rollout_residency_operation(resident=False)
             self.torch_platform.empty_cache()
             self._model_resident = False
             return CompletedResidencyReceipt(
@@ -1272,6 +1334,7 @@ class MultiStepRolloutWorker(Worker):
                 state=ElasticRankState.COMPLETED,
                 model_resident=False,
                 cuda_graph_captured=False,
+                **self._residency_validation_result(),
             )
         except Exception as exc:
             self._record_elastic_failure(exc)
@@ -1302,12 +1365,15 @@ class MultiStepRolloutWorker(Worker):
         self._elastic_state = ElasticRankState.EXPANDING
         try:
             self.reload_model()
-            self._verify_rollout_model_residency(resident=True)
+            if self._residency_validation_mode() is ElasticValidationMode.RECEIPT:
+                self.torch_platform.synchronize()
+            self._validate_rollout_residency_operation(resident=True)
             receipt = ResidencyReceipt(
                 token=token,
                 state=ElasticRankState.EXPANDING,
                 model_resident=True,
                 cuda_graph_captured=self._cuda_graph_captured,
+                **self._residency_validation_result(),
             )
             self._elastic_drain_request = None
             self._elastic_safe_point_token = None

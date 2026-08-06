@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from typing import Optional
 
@@ -42,10 +43,13 @@ from rlinf.hybrid_engines.fsdp.utils import (
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.hybrid_engines.weight_syncer.versioned_cache import (
     PolicyCacheBuildReceipt,
+    PolicyCacheCapture,
     PolicyCachePromotionReceipt,
     PolicyTransferLease,
     VersionedPolicyCache,
     build_policy_cache,
+    capture_policy_cache,
+    finalize_policy_capture,
 )
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
@@ -1092,6 +1096,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 )
             )
         )
+        self._rlix_policy_finalize_executor: ThreadPoolExecutor | None = None
+        self._rlix_pending_policy_captures: dict[int, PolicyCacheCapture] = {}
+        self._rlix_policy_finalize_futures: dict[
+            int, Future[PolicyCacheBuildReceipt]
+        ] = {}
 
     def init_worker(self) -> None:
         """
@@ -1204,6 +1213,120 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             total_bytes=0,
         )
 
+    def _capture_policy_cache_candidate(
+        self, policy_version: int
+    ) -> PolicyCacheCapture | None:
+        """Capture trained bytes while every FSDP rank is still resident."""
+        if not self._rlix_async_policy_prefetch:
+            raise RuntimeError("asynchronous CPU policy prefetch is disabled")
+        if self.is_weight_offloaded:
+            raise RuntimeError("policy cache must be captured before actor offload")
+        state_dict = self.get_rollout_state_dict()
+        selected_names = sorted(
+            name for name in set(self.param_names_need_sync) if name in state_dict
+        )
+        if not selected_names:
+            raise RuntimeError("actor has no rollout policy parameters to publish")
+
+        if self._is_weight_sender:
+            return capture_policy_cache(
+                state_dict,
+                policy_version=policy_version,
+                bucket_size_bytes=self._rlix_policy_cache_bucket_size,
+                selected_names=selected_names,
+            )
+        for name in selected_names:
+            materialize_tensor(state_dict[name])
+        return None
+
+    def _finalize_policy_cache_capture(
+        self, capture: PolicyCacheCapture
+    ) -> PolicyCacheBuildReceipt:
+        """Seal one CPU capture without retaining accelerator references."""
+        manifest, buckets = finalize_policy_capture(capture)
+        self._rlix_policy_cache.store_candidate(manifest, buckets)
+        return PolicyCacheBuildReceipt(
+            actor_rank=self._rank,
+            policy_version=capture.policy_version,
+            retained=True,
+            manifest_hash=manifest.manifest_hash,
+            bucket_count=manifest.bucket_count,
+            total_bytes=manifest.total_bytes,
+        )
+
+    def _start_policy_cache_finalization(self, capture: PolicyCacheCapture) -> None:
+        """Start the one bounded CPU finalizer after actor offload completes."""
+        pending = getattr(self, "_rlix_policy_finalize_futures", None)
+        if pending is None:
+            pending = {}
+            self._rlix_policy_finalize_futures = pending
+        if pending:
+            versions = sorted(pending)
+            raise RuntimeError(
+                f"policy cache finalization already exists for versions {versions}"
+            )
+        executor = getattr(self, "_rlix_policy_finalize_executor", None)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"rlix-policy-finalize-rank-{self._rank}",
+            )
+            self._rlix_policy_finalize_executor = executor
+        pending[capture.policy_version] = executor.submit(
+            self._finalize_policy_cache_capture, capture
+        )
+
+    def _retain_policy_cache_capture(self, capture: PolicyCacheCapture) -> None:
+        """Retain one immutable CPU capture until the GPU stage is released."""
+        captures = getattr(self, "_rlix_pending_policy_captures", None)
+        if captures is None:
+            captures = {}
+            self._rlix_pending_policy_captures = captures
+        finalizers = getattr(self, "_rlix_policy_finalize_futures", {})
+        if captures or finalizers:
+            versions = sorted(set(captures) | set(finalizers))
+            raise RuntimeError(
+                f"policy cache publication already exists for versions {versions}"
+            )
+        captures[capture.policy_version] = capture
+
+    def start_policy_cache_finalization(self, policy_version: int) -> bool:
+        """Start CPU-only finalization after the caller releases training GPUs."""
+        if not self._rlix_async_policy_prefetch:
+            raise RuntimeError("asynchronous CPU policy prefetch is disabled")
+        if not isinstance(policy_version, int) or isinstance(policy_version, bool):
+            raise TypeError("policy_version must be an integer")
+        if policy_version < 0:
+            raise ValueError("policy_version must be non-negative")
+        if not self._is_weight_sender:
+            return False
+        captures = getattr(self, "_rlix_pending_policy_captures", {})
+        capture = captures.pop(policy_version, None)
+        if capture is None:
+            raise RuntimeError(
+                f"policy cache capture {policy_version} is not pending finalization"
+            )
+        try:
+            self._start_policy_cache_finalization(capture)
+        except BaseException:
+            captures[policy_version] = capture
+            raise
+        return True
+
+    def _wait_policy_cache_finalization(
+        self, policy_version: int
+    ) -> PolicyCacheBuildReceipt | None:
+        """Observe the exact owner finalizer before candidate promotion."""
+        if not self._is_weight_sender:
+            return None
+        pending = getattr(self, "_rlix_policy_finalize_futures", {})
+        future = pending.get(policy_version)
+        if future is None:
+            return None
+        receipt = future.result()
+        del pending[policy_version]
+        return receipt
+
     def promote_policy_cache(self, policy_version: int) -> PolicyCachePromotionReceipt:
         """Promote an exact complete candidate after all actor ranks built it."""
         if not self._rlix_async_policy_prefetch:
@@ -1215,6 +1338,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 promoted=False,
                 manifest_hash=None,
             )
+        self._wait_policy_cache_finalization(policy_version)
         manifest = self._rlix_policy_cache.promote(policy_version)
         return PolicyCachePromotionReceipt(
             actor_rank=self._rank,
@@ -1404,10 +1528,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         ):
             raise ValueError("training receipt does not match the sealed actor batch")
         primary_error: BaseException | None = None
+        policy_capture: PolicyCacheCapture | None = None
         try:
             metrics = self.run_training()
             if getattr(self, "_rlix_async_policy_prefetch", False):
-                self.build_policy_cache_candidate(batch_receipt.policy_version + 1)
+                policy_capture = self._capture_policy_cache_candidate(
+                    batch_receipt.policy_version + 1
+                )
         except BaseException as exc:
             primary_error = exc
             raise
@@ -1424,6 +1551,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "Actor offload after failed RLix training also failed: "
                     f"{type(cleanup_error).__name__}: {cleanup_error}"
                 )
+        if policy_capture is not None:
+            self._retain_policy_cache_capture(policy_capture)
         self._rlix_batch_receipt = None
         return metrics
 

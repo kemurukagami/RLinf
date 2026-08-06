@@ -13,7 +13,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import ray
 import task8_two_pipeline_driver as task8_driver
 from omegaconf import OmegaConf, open_dict
 
@@ -22,24 +21,6 @@ from rlinf.scheduler.rlix.entrypoint import (
 )
 
 _compose_wan_model_driver_config = task8_driver.compose_wan_model_driver_config
-
-
-class FourRankFSDPRecordingRunner(task8_driver.RecordingEmbodiedRunner):
-    """Hold A's first train request until B is active on both generation ranks."""
-
-    def _train_rlix_batch(self, batch_receipt: Any) -> Any:
-        if os.environ.get("RLINF_TASK8_ROLE") == "a" and self.global_step == 0:
-            control = ray.get_actor(
-                os.environ["RLINF_TASK8_CONTROL_NAME"],
-                namespace=os.environ["RLINF_TASK8_CONTROL_NAMESPACE"],
-            )
-            ray.get(
-                control.wait_for_gate.remote(
-                    "allow_a_training",
-                    timeout_s=float(self.cfg.rlix.operation_timeout_s),
-                )
-            )
-        return super()._train_rlix_batch(batch_receipt)
 
 
 def _validate_four_rank_config(argv: list[str]) -> None:
@@ -111,6 +92,12 @@ def _compose_four_rank_fsdp_config(*args: Any, **kwargs: Any) -> Any:
             "max_cached_versions": int(smoke_cfg.smoke.policy_sync_max_cached_versions),
             "max_retries": int(smoke_cfg.smoke.policy_sync_max_retries),
         }
+        cfg.rlix.residency_validation_mode = os.environ.get(
+            "RLINF_TASK8_RESIDENCY_VALIDATION_MODE", "deep"
+        )
+        cfg.rlix.snapshot_validation_mode = os.environ.get(
+            "RLINF_TASK8_SNAPSHOT_VALIDATION_MODE", "deep"
+        )
     return cfg, channels
 
 
@@ -122,7 +109,6 @@ def main() -> None:
     # file and its default behavior untouched.
     task8_driver.launch_registered_rlix_workers = _launch_four_rank_fsdp_workers
     task8_driver.compose_wan_model_driver_config = _compose_four_rank_fsdp_config
-    task8_driver.RecordingEmbodiedRunner = FourRankFSDPRecordingRunner
     task8_driver.main()
 
 

@@ -14,9 +14,10 @@
 
 import asyncio
 import gc
+import uuid
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from typing import Any
 
@@ -74,8 +75,11 @@ from rlinf.workers.elastic_rollout_lifecycle import (
     ElasticRankStatus,
     ElasticRunOutcome,
     ElasticRunResult,
+    ElasticValidationMode,
+    ResidencyOperationReceipt,
     ResidencyReceipt,
     SafePointToken,
+    SnapshotValidationReceipt,
     validate_elastic_state_transition,
 )
 from rlinf.workers.env.history_manager import HistoryManager
@@ -121,6 +125,7 @@ class EnvRolloutResumeState:
     env_metrics: dict[str, tuple[torch.Tensor, ...]]
     prefetched_train_bootstrap: tuple[EnvOutput, ...] | None
     history_state: Any | None
+    validation_receipt: SnapshotValidationReceipt | None = None
 
 
 class EnvWorker(Worker):
@@ -161,6 +166,18 @@ class EnvWorker(Worker):
         self._elastic_failure: str | None = None
         self._elastic_completed_trajectories = 0
         self._environment_resident = False
+        self._elastic_residency_validation_mode = ElasticValidationMode.parse(
+            OmegaConf.select(cfg, "rlix.residency_validation_mode", default="deep")
+        )
+        self._elastic_snapshot_validation_mode = ElasticValidationMode.parse(
+            OmegaConf.select(cfg, "rlix.snapshot_validation_mode", default="deep"),
+            allow_off=False,
+        )
+        self._elastic_residency_operation_generation = 0
+        self._elastic_residency_operation_receipt: ResidencyOperationReceipt | None = (
+            None
+        )
+        self._elastic_snapshot_receipt: SnapshotValidationReceipt | None = None
         stop_rank_when_all_done = OmegaConf.select(
             self.cfg,
             "env.train.stop_rank_when_all_done",
@@ -304,13 +321,14 @@ class EnvWorker(Worker):
             raise RuntimeError("RLix environment residency requires train offload")
         if self._environment_resident:
             raise RuntimeError("training environment remains resident")
-        for env in (*self.env_list, *self.eval_env_list):
-            verifier = get_env_attr(env, "verify_elastic_residency")
-            if not callable(verifier):
-                raise RuntimeError(
-                    "environment does not expose public residency verification"
-                )
-            verifier(resident=False)
+        if self._residency_validation_mode() is ElasticValidationMode.DEEP:
+            for env in (*self.env_list, *self.eval_env_list):
+                verifier = get_env_attr(env, "verify_elastic_residency")
+                if not callable(verifier):
+                    raise RuntimeError(
+                        "environment does not expose public residency verification"
+                    )
+                verifier(resident=False)
         return FixedWorkerResidency(
             component="environment",
             rank=self._rank,
@@ -425,6 +443,7 @@ class EnvWorker(Worker):
         self._elastic_drain_request = None
         self._elastic_safe_point_token = None
         self._elastic_resume_state = None
+        self._elastic_snapshot_receipt = None
         self._elastic_failure = None
         self._elastic_completed_trajectories = 0
         self._lifecycle_generation = lifecycle_generation
@@ -441,12 +460,71 @@ class EnvWorker(Worker):
         try:
             if not self._environment_resident:
                 get_env_attr(self.env_list[0], "onload")()
-            get_env_attr(self.env_list[0], "verify_elastic_residency")(resident=True)
             self._environment_resident = True
+            if self._residency_validation_mode() is ElasticValidationMode.RECEIPT:
+                self.torch_platform.synchronize()
+            self._validate_environment_residency_operation(resident=True)
         except Exception as exc:
             self._record_elastic_failure(exc)
             raise
         return self._elastic_status()
+
+    def _validate_environment_residency_operation(
+        self, *, resident: bool
+    ) -> ResidencyOperationReceipt | None:
+        """Validate one synchronized environment move under the selected policy."""
+
+        mode = self._residency_validation_mode()
+        if mode is ElasticValidationMode.DEEP:
+            for env in self.env_list:
+                get_env_attr(env, "verify_elastic_residency")(resident=resident)
+            self._elastic_residency_operation_receipt = None
+            return None
+        if mode is ElasticValidationMode.OFF:
+            self._elastic_residency_operation_receipt = None
+            return None
+        if self._environment_resident != resident:
+            raise RuntimeError(
+                "environment residency state does not match completed move"
+            )
+        cursor = self._rollout_cursor
+        if cursor is None:
+            raise RuntimeError(
+                "environment residency receipt requires a lifecycle cursor"
+            )
+        self._elastic_residency_operation_generation += 1
+        receipt = ResidencyOperationReceipt(
+            worker_rank=self._rank,
+            lifecycle_generation=cursor.lifecycle_generation,
+            policy_version=cursor.policy_version,
+            operation_generation=self._elastic_residency_operation_generation,
+            resident=resident,
+            destination_device="accelerator" if resident else "cpu",
+            synchronized=True,
+        )
+        self._elastic_residency_operation_receipt = receipt
+        return receipt
+
+    def _residency_validation_result(self) -> dict[str, Any]:
+        mode = self._residency_validation_mode()
+        return {
+            "validation_mode": mode,
+            "operation_receipt": (
+                self._elastic_residency_operation_receipt
+                if mode is ElasticValidationMode.RECEIPT
+                else None
+            ),
+        }
+
+    def _residency_validation_mode(self) -> ElasticValidationMode:
+        return getattr(
+            self, "_elastic_residency_validation_mode", ElasticValidationMode.DEEP
+        )
+
+    def _snapshot_validation_mode(self) -> ElasticValidationMode:
+        return getattr(
+            self, "_elastic_snapshot_validation_mode", ElasticValidationMode.DEEP
+        )
 
     async def request_elastic_drain(self, request: DrainRequest) -> ElasticRankStatus:
         """Record drain intent without interrupting an in-flight chunk."""
@@ -1825,7 +1903,32 @@ class EnvWorker(Worker):
             state,
             expected_lifecycle_generation=cursor.lifecycle_generation,
             expected_policy_version=cursor.policy_version,
+            force_deep=True,
         )
+        if self._snapshot_validation_mode() is ElasticValidationMode.RECEIPT:
+            transition_id = resume_bootstraps[0].transition_id
+            if not isinstance(transition_id, RolloutTransitionIdentity):
+                raise RuntimeError("snapshot receipt requires transition identity")
+            receipt = SnapshotValidationReceipt(
+                receipt_id=uuid.uuid4().hex,
+                worker_rank=self._rank,
+                worker_world_size=self._world_size,
+                lifecycle_generation=cursor.lifecycle_generation,
+                policy_version=cursor.policy_version,
+                next_transition_id=transition_id,
+            )
+            # Preserve the schema while omitting three representations that are
+            # derivable from the canonical pending bootstrap.
+            state = replace(
+                state,
+                current_env_outputs=(),
+                last_observations=(),
+                last_intervened_info=(),
+                validation_receipt=receipt,
+            )
+            self._elastic_snapshot_receipt = receipt
+        else:
+            self._elastic_snapshot_receipt = None
         return state
 
     def validate_rollout_resume_state(
@@ -1834,10 +1937,21 @@ class EnvWorker(Worker):
         *,
         expected_lifecycle_generation: int,
         expected_policy_version: int,
+        force_deep: bool = False,
     ) -> None:
         self._validate_snapshot_capability()
         if not isinstance(state, EnvRolloutResumeState):
             raise TypeError("resume state must be an EnvRolloutResumeState")
+        if (
+            self._snapshot_validation_mode() is ElasticValidationMode.RECEIPT
+            and not force_deep
+        ):
+            self._validate_snapshot_receipt(
+                state,
+                expected_lifecycle_generation=expected_lifecycle_generation,
+                expected_policy_version=expected_policy_version,
+            )
+            return
         BaseWorldEnv.assert_cpu_only(state, "env_rollout_resume_state")
         if state.schema_version != ENV_ROLLOUT_RESUME_SCHEMA_VERSION:
             raise ValueError("worker schema_version mismatch")
@@ -1917,6 +2031,44 @@ class EnvWorker(Worker):
         validate_world = get_env_attr(self.env_list[0], "validate_resume_state")
         validate_world(world_state, self._world_snapshot_context(cursor, world_state))
 
+    def _validate_snapshot_receipt(
+        self,
+        state: EnvRolloutResumeState,
+        *,
+        expected_lifecycle_generation: int,
+        expected_policy_version: int,
+    ) -> None:
+        """Validate identity of a private snapshot without traversing its tensors."""
+
+        receipt = state.validation_receipt
+        if receipt is None or receipt != self._elastic_snapshot_receipt:
+            raise ValueError(
+                "snapshot validation receipt is missing, stale, or foreign"
+            )
+        if (
+            receipt.worker_rank != self._rank
+            or receipt.worker_world_size != self._world_size
+        ):
+            raise ValueError("snapshot receipt worker identity mismatch")
+        if receipt.lifecycle_generation != expected_lifecycle_generation:
+            raise ValueError("snapshot receipt lifecycle_generation mismatch")
+        if receipt.policy_version != expected_policy_version:
+            raise ValueError("snapshot receipt policy_version mismatch")
+        if state.cursor.lifecycle_generation != receipt.lifecycle_generation:
+            raise ValueError("snapshot cursor lifecycle does not match receipt")
+        if state.cursor.policy_version != receipt.policy_version:
+            raise ValueError("snapshot cursor policy does not match receipt")
+        if len(state.resume_bootstraps) != 1 or state.resume_bootstraps[0] is None:
+            raise ValueError("receipt snapshot is missing its canonical bootstrap")
+        if state.resume_bootstraps[0].transition_id != receipt.next_transition_id:
+            raise ValueError("snapshot bootstrap transition does not match receipt")
+        if (
+            state.current_env_outputs
+            or state.last_observations
+            or state.last_intervened_info
+        ):
+            raise ValueError("receipt snapshot unexpectedly records redundant fields")
+
     def restore_rollout_stage(
         self,
         state: EnvRolloutResumeState,
@@ -1933,22 +2085,38 @@ class EnvWorker(Worker):
         )
         env = self.env_list[0]
         context = self._world_snapshot_context(state.cursor, state.world_states[0])
+        receipt_mode = self._snapshot_validation_mode() is ElasticValidationMode.RECEIPT
         prepared_world = get_env_attr(env, "prepare_resume_state")(
-            state.world_states[0], context
+            state.world_states[0], context, trusted_receipt=receipt_mode
         )
         cursor = self._clone_cursor(state.cursor)
         rollout_results = [
             self._clone_rollout_result(result) for result in state.rollout_results
         ]
-        current_outputs = [
-            self._clone_env_output(output) for output in state.current_env_outputs
-        ]
         resume_bootstraps = [
             self._clone_env_output(output) if output is not None else None
             for output in state.resume_bootstraps
         ]
-        last_observations = list(clone_nested_to_cpu(state.last_observations))
-        last_intervened = list(clone_nested_to_cpu(state.last_intervened_info))
+        if receipt_mode:
+            canonical_output = resume_bootstraps[0]
+            if canonical_output is None:
+                raise RuntimeError("receipt snapshot has no canonical bootstrap")
+            current_outputs = [self._clone_env_output(canonical_output)]
+            last_observations = [clone_nested_to_cpu(canonical_output.obs)]
+            last_intervened = [
+                clone_nested_to_cpu(
+                    (
+                        canonical_output.intervene_actions,
+                        canonical_output.intervene_flags,
+                    )
+                )
+            ]
+        else:
+            current_outputs = [
+                self._clone_env_output(output) for output in state.current_env_outputs
+            ]
+            last_observations = list(clone_nested_to_cpu(state.last_observations))
+            last_intervened = list(clone_nested_to_cpu(state.last_intervened_info))
         train_prev_done = list(clone_nested_to_cpu(state.train_prev_done))
         env_metrics = defaultdict(
             list,
@@ -1984,6 +2152,7 @@ class EnvWorker(Worker):
                 state=ElasticRankState.PAUSED,
                 model_resident=False,
                 cuda_graph_captured=False,
+                **self._residency_validation_result(),
             )
         if self._elastic_state is not ElasticRankState.SNAPSHOTTING:
             raise RuntimeError(
@@ -2005,11 +2174,12 @@ class EnvWorker(Worker):
         try:
             env = self.env_list[0]
             get_env_attr(env, "offload")()
-            get_env_attr(env, "verify_elastic_residency")(resident=False)
-            BaseWorldEnv.assert_cpu_only(state, "elastic_resume_state")
-            self.torch_platform.synchronize()
-            self.torch_platform.empty_cache()
             self._environment_resident = False
+            self.torch_platform.synchronize()
+            self._validate_environment_residency_operation(resident=False)
+            if self._snapshot_validation_mode() is ElasticValidationMode.DEEP:
+                BaseWorldEnv.assert_cpu_only(state, "elastic_resume_state")
+            self.torch_platform.empty_cache()
             validate_elastic_state_transition(
                 self._elastic_state, ElasticRankState.PAUSED
             )
@@ -2019,6 +2189,7 @@ class EnvWorker(Worker):
                 state=ElasticRankState.PAUSED,
                 model_resident=False,
                 cuda_graph_captured=False,
+                **self._residency_validation_result(),
             )
         except Exception as exc:
             self._record_elastic_failure(exc)
@@ -2040,10 +2211,10 @@ class EnvWorker(Worker):
             for env in self.env_list:
                 if self._environment_resident:
                     get_env_attr(env, "offload")()
-                get_env_attr(env, "verify_elastic_residency")(resident=False)
-            self.torch_platform.synchronize()
-            self.torch_platform.empty_cache()
             self._environment_resident = False
+            self.torch_platform.synchronize()
+            self._validate_environment_residency_operation(resident=False)
+            self.torch_platform.empty_cache()
             return CompletedResidencyReceipt(
                 worker_rank=self._rank,
                 lifecycle_generation=cursor.lifecycle_generation,
@@ -2051,6 +2222,7 @@ class EnvWorker(Worker):
                 state=ElasticRankState.COMPLETED,
                 model_resident=False,
                 cuda_graph_captured=False,
+                **self._residency_validation_result(),
             )
         except Exception as exc:
             self._record_elastic_failure(exc)
@@ -2085,8 +2257,10 @@ class EnvWorker(Worker):
         try:
             env = self.env_list[0]
             get_env_attr(env, "onload")()
-            get_env_attr(env, "verify_elastic_residency")(resident=True)
             self._environment_resident = True
+            if self._residency_validation_mode() is ElasticValidationMode.RECEIPT:
+                self.torch_platform.synchronize()
+            self._validate_environment_residency_operation(resident=True)
             self.restore_rollout_stage(
                 state,
                 expected_lifecycle_generation=token.lifecycle_generation,
@@ -2103,10 +2277,12 @@ class EnvWorker(Worker):
                 state=ElasticRankState.EXPANDING,
                 model_resident=True,
                 cuda_graph_captured=False,
+                **self._residency_validation_result(),
             )
             self._elastic_drain_request = None
             self._elastic_safe_point_token = None
             self._elastic_resume_state = None
+            self._elastic_snapshot_receipt = None
             return receipt
         except Exception as exc:
             self._record_elastic_failure(exc)

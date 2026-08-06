@@ -23,6 +23,103 @@ class ElasticRankState(str, Enum):
     FAILED_RESIDENT = "failed_resident"
 
 
+class ElasticValidationMode(str, Enum):
+    """Cost/safety policy for elastic snapshot and residency validation."""
+
+    DEEP = "deep"
+    RECEIPT = "receipt"
+    OFF = "off"
+
+    @classmethod
+    def parse(cls, value: object, *, allow_off: bool = True) -> ElasticValidationMode:
+        """Parse a configured mode and reject unsafe/unknown values explicitly."""
+
+        if isinstance(value, cls):
+            mode = value
+        elif isinstance(value, str):
+            try:
+                mode = cls(value.lower())
+            except ValueError as exc:
+                choices = "deep, receipt, off" if allow_off else "deep, receipt"
+                raise ValueError(f"validation mode must be one of: {choices}") from exc
+        else:
+            raise TypeError("validation mode must be a string")
+        if mode is cls.OFF and not allow_off:
+            raise ValueError("snapshot validation mode does not support off")
+        return mode
+
+
+@dataclass(frozen=True, slots=True)
+class ResidencyOperationReceipt:
+    """Identity-bound evidence produced after one synchronized residency move.
+
+    This receipt deliberately records what the owning worker actually completed;
+    it is not a replacement for the movement implementation reporting byte-level
+    accounting. ``moved_bytes`` remains optional until every model backend exposes
+    that information.
+    """
+
+    worker_rank: int
+    lifecycle_generation: int
+    policy_version: int
+    operation_generation: int
+    resident: bool
+    destination_device: str
+    synchronized: bool
+    moved_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        _validate_request_identity(
+            request_id="residency-operation",
+            worker_rank=self.worker_rank,
+            lifecycle_generation=self.lifecycle_generation,
+            policy_version=self.policy_version,
+        )
+        if not isinstance(self.operation_generation, int) or isinstance(
+            self.operation_generation, bool
+        ):
+            raise TypeError("operation_generation must be an integer")
+        if self.operation_generation <= 0:
+            raise ValueError("operation_generation must be positive")
+        expected_device = "accelerator" if self.resident else "cpu"
+        if self.destination_device != expected_device:
+            raise ValueError("residency receipt destination does not match state")
+        if not self.synchronized:
+            raise ValueError("residency receipt requires synchronized movement")
+        if self.moved_bytes is not None and self.moved_bytes < 0:
+            raise ValueError("moved_bytes must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotValidationReceipt:
+    """Opaque proof that one immutable private snapshot passed deep validation."""
+
+    receipt_id: str
+    worker_rank: int
+    worker_world_size: int
+    lifecycle_generation: int
+    policy_version: int
+    next_transition_id: RolloutTransitionIdentity
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipt_id, str) or not self.receipt_id:
+            raise ValueError("receipt_id must be a non-empty string")
+        _validate_request_identity(
+            request_id=self.receipt_id,
+            worker_rank=self.worker_rank,
+            lifecycle_generation=self.lifecycle_generation,
+            policy_version=self.policy_version,
+        )
+        if not isinstance(self.worker_world_size, int) or isinstance(
+            self.worker_world_size, bool
+        ):
+            raise TypeError("worker_world_size must be an integer")
+        if self.worker_world_size <= 0:
+            raise ValueError("worker_world_size must be positive")
+        if not isinstance(self.next_transition_id, RolloutTransitionIdentity):
+            raise TypeError("next_transition_id must be a RolloutTransitionIdentity")
+
+
 _ALLOWED_STATE_TRANSITIONS = {
     ElasticRankState.INACTIVE_COLD: frozenset({ElasticRankState.EXPANDING}),
     ElasticRankState.EXPANDING: frozenset(
@@ -206,6 +303,8 @@ class ResidencyReceipt:
     state: ElasticRankState
     model_resident: bool
     cuda_graph_captured: bool
+    validation_mode: ElasticValidationMode = ElasticValidationMode.DEEP
+    operation_receipt: ResidencyOperationReceipt | None = None
 
     def __post_init__(self) -> None:
         if self.state is ElasticRankState.PAUSED:
@@ -216,6 +315,15 @@ class ResidencyReceipt:
                 raise ValueError("EXPANDING residency must have a resident model")
         else:
             raise ValueError("Residency receipts require PAUSED or EXPANDING state")
+        if not isinstance(self.validation_mode, ElasticValidationMode):
+            raise TypeError("validation_mode must be an ElasticValidationMode")
+        if self.validation_mode is ElasticValidationMode.RECEIPT:
+            if self.operation_receipt is None:
+                raise ValueError("receipt validation requires an operation receipt")
+            if self.operation_receipt.resident != self.model_resident:
+                raise ValueError("operation receipt residency does not match result")
+        elif self.operation_receipt is not None:
+            raise ValueError("operation receipt is only valid in receipt mode")
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +336,8 @@ class CompletedResidencyReceipt:
     state: ElasticRankState
     model_resident: bool
     cuda_graph_captured: bool
+    validation_mode: ElasticValidationMode = ElasticValidationMode.DEEP
+    operation_receipt: ResidencyOperationReceipt | None = None
 
     def __post_init__(self) -> None:
         _validate_request_identity(
@@ -242,6 +352,15 @@ class CompletedResidencyReceipt:
             raise ValueError(
                 "Completed residency receipts require CPU-only state with no CUDA graph"
             )
+        if not isinstance(self.validation_mode, ElasticValidationMode):
+            raise TypeError("validation_mode must be an ElasticValidationMode")
+        if self.validation_mode is ElasticValidationMode.RECEIPT:
+            if self.operation_receipt is None or self.operation_receipt.resident:
+                raise ValueError(
+                    "receipt validation requires a non-resident operation receipt"
+                )
+        elif self.operation_receipt is not None:
+            raise ValueError("operation receipt is only valid in receipt mode")
 
 
 def _validate_request_identity(

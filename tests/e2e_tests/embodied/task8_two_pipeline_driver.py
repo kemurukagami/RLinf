@@ -195,8 +195,9 @@ def _install_acceptance_worker_observers(
     role: str,
     control_actor: Any,
     phase_diagnostics: bool,
+    acceptance_instrumentation: bool = True,
 ) -> None:
-    """Install fail-closed acceptance observers on every remote worker actor."""
+    """Configure detailed worker evidence independently of control markers."""
 
     pipeline_id = launched.runtime.pipeline_id
     actor_gpus_by_rank = {
@@ -215,6 +216,26 @@ def _install_acceptance_worker_observers(
     calls = []
     for component, worker_group, gpus_by_rank in groups:
         for worker_info in worker_group.worker_info_list:
+            configure_instrumentation = getattr(
+                worker_info.worker, "configure_acceptance_instrumentation", None
+            )
+            if configure_instrumentation is not None:
+                calls.append(
+                    configure_instrumentation.remote(acceptance_instrumentation)
+                )
+            elif not acceptance_instrumentation:
+                raise RuntimeError(
+                    f"{component} rank {worker_info.rank} cannot disable "
+                    "acceptance instrumentation"
+                )
+            if not acceptance_instrumentation:
+                if component == "environment":
+                    calls.append(
+                        worker_info.worker.configure_task8_phase_diagnostics.remote(
+                            False
+                        )
+                    )
+                continue
             gpu_ids = gpus_by_rank.get(worker_info.rank)
             if gpu_ids is None:
                 raise RuntimeError(
@@ -644,6 +665,7 @@ def run_generation_proof_driver(args: argparse.Namespace) -> None:
             role=role,
             control_actor=control_actor,
             phase_diagnostics=args.phase_diagnostics,
+            acceptance_instrumentation=args.acceptance_instrumentation,
         )
         runner.init_workers()
         if launched.runtime.stage_state is not RunnerStageState.INACTIVE:
@@ -679,6 +701,7 @@ def run_generation_proof_driver(args: argparse.Namespace) -> None:
                 "residencies": residencies,
                 "acceptance_control_actor_id": control_actor_id,
                 "event_log_path": manifest["event_log_path"],
+                "acceptance_instrumentation": args.acceptance_instrumentation,
             },
         )
         _wait_for(start_path, args.timeout_s)
@@ -758,13 +781,6 @@ def run_generation_proof_driver(args: argparse.Namespace) -> None:
                 phase="collection_completed",
                 policy_version=runner.global_step,
             )
-            if iteration == 0:
-                if role == "b":
-                    ray.get(
-                        control_actor.wait_for_gate.remote(
-                            "allow_b_training", timeout_s=args.timeout_s
-                        )
-                    )
             _print_iteration_progress(
                 role=role,
                 iteration=iteration,
@@ -780,12 +796,6 @@ def run_generation_proof_driver(args: argparse.Namespace) -> None:
                 phase="training_completed",
                 policy_version=runner.global_step,
             )
-            if iteration == 0:
-                ray.get(
-                    control_actor.wait_for_gate.remote(
-                        "both_training_completed", timeout_s=args.timeout_s
-                    )
-                )
 
         completed_iterations = runner.global_step
         runner._finish_run()
@@ -1073,6 +1083,15 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="enable acceptance-only fine-grained world-model phase markers",
+    )
+    parser.add_argument(
+        "--acceptance-instrumentation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "record detailed worker acceptance evidence; disabling retains only "
+            "lightweight runner/orchestrator control events"
+        ),
     )
     return parser.parse_args()
 

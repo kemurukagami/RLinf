@@ -159,7 +159,7 @@ class RegisteredRLixPipeline:
         )
 
     def start_policy_prefetch(self, *, expected_policy_version: int) -> None:
-        """Start CPU rollout updates while the training stage still owns GPUs."""
+        """Start CPU rollout updates after candidate promotion and GPU release."""
         if self.policy_sync_mode != "async_cpu_prefetch":
             raise RuntimeError("asynchronous CPU policy prefetch is disabled")
         _run_sync(

@@ -2800,6 +2800,50 @@ does not satisfy Task 8: `pair_failure.json` records a manual
 pipeline completed all ten declared iterations. The Definition of Done below
 remains unchanged.
 
+### 19.16 Queue-driven free-bundle acquisition (2026-08-06)
+
+The generation-proof harness no longer uses first-iteration training barriers
+to manufacture a deterministic pause/resume sequence. The prior sequence had
+three control-plane distortions:
+
+- B did not publish generation demand until after A's first completed-rank
+  event reached the external orchestrator;
+- B could seal a batch but could not publish its first training request until
+  the orchestrator released `allow_b_training`; and
+- both drivers waited at `both_training_completed` after their first updates,
+  preventing either from independently publishing its next policy-ready
+  collection demand.
+
+The revised harness keeps deterministic cold initialization and initially
+grants A generation so ownership transfer has an unambiguous source. As soon
+as A's first generation allocation is observed, however, the orchestrator
+releases B collection and waits for `b_generation_requested` *before* waiting
+for any A rank completion. B's request is therefore already pending in the
+scheduler when A releases a bundle. Scheduler wakeup and allocation commit no
+longer depend on an event round trip through the acceptance process.
+
+After collection, both drivers now request training immediately. Fixed-stage
+priority, GPU exclusivity, shrink-before-expand, safe drain, and fair request
+ordering are enforced by the production scheduler rather than acceptance
+gates. After training, each driver may await its own policy receipt and request
+its next collection without rendezvousing with the peer pipeline.
+
+The parent acceptance process still waits for observed gates such as batch
+seal, training start, training completion, and both-training completion. These
+are passive assertions over durable events: no driver waits on them and they
+cannot delay resource requests. Legacy gate names remain in the control actor
+for the dependency-light acceptance-control smoke and old artifact decoding;
+their presence does not imply that the real generation-proof drivers consume
+them.
+
+This change intentionally makes exact first-iteration interleaving a scheduler
+outcome rather than a scripted outcome. It does not relax batch cardinality,
+policy-version, lifecycle, physical non-residency, exclusive ownership,
+snapshot/restore, or asynchronous policy-receipt validation. The four-rank
+proof continues to require its declared preemption/resume evidence; failure to
+produce that evidence is reported as an acceptance failure instead of being
+hidden by resource-admission barriers.
+
 ## 20. Definition of done
 
 T8 and the T0-T8 project are complete only when all of the following are true:
@@ -2866,3 +2910,34 @@ Passing the correctness matrix without a material utilization improvement is
 not T8 completion. Passing Wan without real OpenSora is not T8 completion.
 Passing a scheduler/fake-model test without two real independent drivers is not
 T8 completion.
+
+## 18. Receipt-mode performance runs
+
+The four-rank FSDP harness now separates correctness evidence from performance
+observation with independent switches:
+
+- detailed worker acceptance events default on and remain fail closed;
+- phase diagnostics and sparse GPU profiling can be disabled independently;
+- residency validation selects `deep`, `receipt`, or benchmark-only `off`;
+- continuation snapshot validation selects `deep` or `receipt`;
+- video capture remains controlled by the environment video configuration and
+  is not disabled by any of these switches.
+
+Receipt residency mode records synchronized movement generation, worker rank,
+lifecycle, policy version, destination, and optional byte accounting. It skips
+Python parameter/buffer traversal but rejects stale identity, wrong destination,
+and unsynchronized evidence. Current backends do not all expose moved-byte
+counts, so `moved_bytes=None` is explicit rather than falsely claiming complete
+byte accounting.
+
+Receipt snapshot mode deeply validates once at construction, then stores an
+opaque receipt with the private immutable snapshot. Redundant continuation
+fields remain in the schema but are empty; restore reconstructs them from the
+canonical pending bootstrap. This removes repeated recursive validation during
+offload, prepare, and restore without changing transition identity, partial
+rollout contents, early-termination masks, or video metrics.
+
+When detailed worker instrumentation is disabled, the harness retains only the
+small runner/orchestrator event set needed for deterministic startup. It skips
+the detailed lifecycle-evidence validator and labels the result accordingly.
+Such a run must not be reported as Task 8 acceptance proof.

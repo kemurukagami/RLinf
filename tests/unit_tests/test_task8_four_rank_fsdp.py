@@ -14,6 +14,7 @@ _EMBODIED_TESTS = Path(__file__).resolve().parents[1] / "e2e_tests" / "embodied"
 sys.path.insert(0, str(_EMBODIED_TESTS))
 
 from task8_four_rank_fsdp_acceptance import (  # noqa: E402
+    _drive_four_rank_fsdp_gates,
     _validate_four_rank_lifecycle,
     _validate_four_rank_ready,
 )
@@ -67,6 +68,65 @@ def test_four_rank_readiness_requires_all_gpu_actor_mapping() -> None:
     ready["b"]["candidate_mapping"][ACTOR_TRAIN_CLUSTER_NAME] = [0]
     with pytest.raises(ValueError, match="actor_train mapping"):
         _validate_four_rank_ready(ready)
+
+
+def test_four_rank_harness_queues_b_without_training_release_gates(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    class RemoteMethod:
+        def __init__(self, operation: str) -> None:
+            self.operation = operation
+
+        def remote(self, gate: str, **kwargs) -> tuple[str, str]:
+            calls.append((self.operation, gate))
+            return self.operation, gate
+
+    control_actor = SimpleNamespace(
+        wait_for_gate=RemoteMethod("wait"),
+        release_gate=RemoteMethod("release"),
+    )
+    monkeypatch.setattr("task8_four_rank_fsdp_acceptance.ray.get", lambda value: value)
+
+    _drive_four_rank_fsdp_gates(control_actor, timeout_s=1.0)
+
+    assert calls.index(("release", "allow_b_collection")) < calls.index(
+        ("wait", "b_generation_requested")
+    )
+    assert calls.index(("wait", "b_generation_requested")) < calls.index(
+        ("wait", "a_first_rank_completed")
+    )
+    assert ("release", "allow_a_training") not in calls
+    assert ("release", "allow_b_training") not in calls
+
+
+def test_four_rank_performance_mode_skips_worker_evidence_gates(monkeypatch) -> None:
+    calls = []
+
+    class RemoteMethod:
+        def __init__(self, operation: str) -> None:
+            self.operation = operation
+
+        def remote(self, gate: str, **kwargs) -> tuple[str, str]:
+            calls.append((self.operation, gate))
+            return self.operation, gate
+
+    control_actor = SimpleNamespace(
+        wait_for_gate=RemoteMethod("wait"),
+        release_gate=RemoteMethod("release"),
+    )
+    monkeypatch.setattr("task8_four_rank_fsdp_acceptance.ray.get", lambda value: value)
+
+    _drive_four_rank_fsdp_gates(
+        control_actor,
+        timeout_s=1.0,
+        acceptance_instrumentation=False,
+    )
+
+    assert ("wait", "b_generation_requested") in calls
+    assert ("wait", "a_first_rank_completed") not in calls
+    assert ("wait", "a_batch_sealed") not in calls
 
 
 def _event(

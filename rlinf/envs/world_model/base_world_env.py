@@ -429,8 +429,33 @@ class BaseWorldEnv(ABC):
         self,
         state: WorldEnvResumeState,
         expected: WorldEnvSnapshotContext,
+        *,
+        trusted_receipt: bool = False,
     ) -> _PreparedWorldEnvState:
-        self.validate_resume_state(state, expected)
+        if not trusted_receipt:
+            self.validate_resume_state(state, expected)
+        else:
+            # The owning EnvWorker already deeply validated this immutable,
+            # process-private state before issuing its receipt. Retain cheap
+            # context identity checks here without recursively scanning tensors.
+            if not isinstance(state, WorldEnvResumeState):
+                raise TypeError("resume state must be a WorldEnvResumeState")
+            self._expect_equal("worker_rank", state.worker_rank, expected.worker_rank)
+            self._expect_equal(
+                "worker_world_size", state.worker_world_size, expected.worker_world_size
+            )
+            self._expect_equal("stage_id", state.stage_id, expected.stage_id)
+            self._expect_equal(
+                "lifecycle_generation",
+                state.lifecycle_generation,
+                expected.lifecycle_generation,
+            )
+            self._expect_equal("chunk_index", state.chunk_index, expected.chunk_index)
+            self._expect_equal(
+                "next_transition_id",
+                state.next_transition_id,
+                expected.next_transition_id,
+            )
         return _PreparedWorldEnvState(
             current_obs=recursive_to_device(
                 clone_nested_to_cpu(state.current_obs), self.device

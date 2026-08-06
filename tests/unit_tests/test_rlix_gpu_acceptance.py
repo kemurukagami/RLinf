@@ -1895,7 +1895,7 @@ def test_acceptance_control_tracks_generation_proof_gates(tmp_path: Path) -> Non
     assert control.gate_status()["both_training_completed"] is True
 
 
-def test_generation_proof_releases_b_after_a_target_rank_completes(monkeypatch) -> None:
+def test_generation_proof_queues_b_before_a_target_rank_completes(monkeypatch) -> None:
     calls = []
 
     class RemoteMethod:
@@ -1914,8 +1914,11 @@ def test_generation_proof_releases_b_after_a_target_rank_completes(monkeypatch) 
 
     _orchestrator._drive_generation_proof_gates(control_actor, timeout_s=1.0)
 
-    assert calls.index(("wait", "a_target_rank_completed")) < calls.index(
-        ("release", "allow_b_collection")
+    assert calls.index(("release", "allow_b_collection")) < calls.index(
+        ("wait", "b_generation_requested")
+    )
+    assert calls.index(("wait", "b_generation_requested")) < calls.index(
+        ("wait", "a_target_rank_completed")
     )
     assert ("release", "allow_a_training") not in calls
     assert calls.index(("wait", "b_useful_work_observed")) < calls.index(
@@ -1924,9 +1927,18 @@ def test_generation_proof_releases_b_after_a_target_rank_completes(monkeypatch) 
     assert calls.index(("wait", "a_training_completed")) < calls.index(
         ("wait", "b_batch_sealed")
     )
-    assert calls.index(("wait", "b_batch_sealed")) < calls.index(
-        ("release", "allow_b_training")
-    )
+    assert ("release", "allow_b_training") not in calls
+
+
+def test_generation_proof_driver_has_no_first_iteration_training_barrier() -> None:
+    gate_names = {
+        constant
+        for constant in _driver.run_generation_proof_driver.__code__.co_consts
+        if isinstance(constant, str)
+    }
+
+    assert "allow_b_training" not in gate_names
+    assert "both_training_completed" not in gate_names
 
 
 def test_first_rank_completion_gate_does_not_require_configured_target(

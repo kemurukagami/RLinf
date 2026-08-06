@@ -18,6 +18,8 @@ from rlinf.hybrid_engines.weight_syncer.versioned_cache import (
     PolicyCacheReceiver,
     VersionedPolicyCache,
     build_policy_cache,
+    capture_policy_cache,
+    finalize_policy_capture,
 )
 
 
@@ -81,6 +83,61 @@ def test_build_and_apply_preserves_mixed_dtype_bytes_exactly() -> None:
         assert torch.equal(target[name], source[name])
 
 
+def test_capture_is_cpu_owned_and_finalization_preserves_exact_bytes() -> None:
+    source = _state(8)
+    capture = capture_policy_cache(
+        source,
+        policy_version=4,
+        bucket_size_bytes=19,
+    )
+
+    assert capture.policy_version == 4
+    assert capture.total_bytes == sum(
+        value.numel() * value.element_size() for value in source.values()
+    )
+    assert all(bucket.payload.device.type == "cpu" for bucket in capture.buckets)
+    assert all(bucket.payload.dtype is torch.uint8 for bucket in capture.buckets)
+
+    manifest, buckets = finalize_policy_capture(capture)
+    target = {name: torch.zeros_like(value) for name, value in source.items()}
+    receiver = PolicyCacheReceiver(committed_version=3)
+    _apply_all(receiver, target, manifest, buckets)
+
+    assert manifest.total_bytes == capture.total_bytes
+    for name, value in source.items():
+        assert torch.equal(target[name], value)
+
+
+def test_finalization_rejects_inconsistent_capture_total() -> None:
+    capture = capture_policy_cache(_state(), policy_version=1, bucket_size_bytes=16)
+    malformed = replace(capture, total_bytes=capture.total_bytes + 1)
+
+    with pytest.raises(ValueError, match="total byte count"):
+        finalize_policy_capture(malformed)
+
+
+def test_finalization_rejects_capture_fragment_gap_before_hashing() -> None:
+    capture = capture_policy_cache(_state(), policy_version=1, bucket_size_bytes=16)
+    first_bucket = capture.buckets[0]
+    first_fragment = first_bucket.tensors[0]
+    malformed_fragment = replace(
+        first_fragment,
+        start_byte=first_fragment.start_byte + 1,
+        end_byte=first_fragment.end_byte + 1,
+    )
+    malformed_bucket = replace(
+        first_bucket,
+        tensors=(malformed_fragment, *first_bucket.tensors[1:]),
+    )
+    malformed = replace(
+        capture,
+        buckets=(malformed_bucket, *capture.buckets[1:]),
+    )
+
+    with pytest.raises(ValueError, match="gap or overlap"):
+        finalize_policy_capture(malformed)
+
+
 def test_manifest_is_deterministic_independent_of_mapping_order() -> None:
     source = _state(4)
     reversed_source = dict(reversed(list(source.items())))
@@ -97,12 +154,43 @@ def test_manifest_is_deterministic_independent_of_mapping_order() -> None:
     ]
 
 
-def test_large_tensor_is_not_split_across_buckets() -> None:
+@pytest.mark.parametrize("bucket_size", [1, 2, 3, 7, 16, 31, 128])
+def test_fragmented_roundtrip_is_exact_across_bucket_boundaries(bucket_size) -> None:
+    source = {
+        "bf16": torch.tensor(
+            [1.5, -0.25, float("inf"), float("nan")], dtype=torch.bfloat16
+        ),
+        "bool": torch.tensor([True, False, True], dtype=torch.bool),
+        "fp16": torch.linspace(-1, 1, 7, dtype=torch.float16),
+        "fp32": torch.linspace(-2, 2, 11, dtype=torch.float32).reshape(1, 11),
+        "int64": torch.tensor([-(2**40), 0, 2**40], dtype=torch.int64),
+    }
+    manifest, buckets = build_policy_cache(
+        source,
+        policy_version=9,
+        bucket_size_bytes=bucket_size,
+    )
+    target = {name: torch.zeros_like(value) for name, value in source.items()}
+    receiver = PolicyCacheReceiver(committed_version=8)
+
+    _apply_all(receiver, target, manifest, buckets)
+
+    assert all(bucket.payload.numel() <= bucket_size for bucket in buckets)
+    for name, value in source.items():
+        assert torch.equal(
+            target[name].reshape(-1).view(torch.uint8),
+            value.reshape(-1).view(torch.uint8),
+        )
+
+
+def test_large_tensor_is_split_into_bounded_exact_fragments() -> None:
     source = {
         "large": torch.arange(32, dtype=torch.float32),
         "small": torch.ones(1, dtype=torch.float32),
     }
-    manifest, _ = build_policy_cache(source, policy_version=1, bucket_size_bytes=16)
+    manifest, buckets = build_policy_cache(
+        source, policy_version=1, bucket_size_bytes=16
+    )
 
     large_descriptors = [
         tensor
@@ -110,8 +198,158 @@ def test_large_tensor_is_not_split_across_buckets() -> None:
         for tensor in bucket.tensors
         if tensor.name == "large"
     ]
-    assert len(large_descriptors) == 1
-    assert large_descriptors[0].byte_count == 128
+    assert len(large_descriptors) == 8
+    assert all(bucket.descriptor.byte_count <= 16 for bucket in buckets)
+    assert [
+        (descriptor.tensor_start_byte, descriptor.tensor_end_byte)
+        for descriptor in large_descriptors
+    ] == [(start, start + 16) for start in range(0, 128, 16)]
+
+    target = {name: torch.zeros_like(value) for name, value in source.items()}
+    receiver = PolicyCacheReceiver(committed_version=0)
+    _apply_all(receiver, target, manifest, buckets)
+    for name, value in source.items():
+        assert torch.equal(target[name], value)
+
+
+def test_builder_copies_directly_without_tensor_concatenation(monkeypatch) -> None:
+    def reject_cat(*args, **kwargs):
+        raise AssertionError("policy-cache builder must not call torch.cat")
+
+    monkeypatch.setattr(torch, "cat", reject_cat)
+
+    manifest, buckets = build_policy_cache(
+        _state(5), policy_version=1, bucket_size_bytes=17
+    )
+
+    assert manifest.bucket_count == len(buckets)
+    assert all(bucket.payload.is_contiguous() for bucket in buckets)
+    assert all(bucket.descriptor.byte_count <= 17 for bucket in buckets)
+
+
+def test_empty_and_scalar_tensors_round_trip() -> None:
+    source = {
+        "empty": torch.empty(0, dtype=torch.float32),
+        "scalar": torch.tensor(7, dtype=torch.int64),
+    }
+    manifest, buckets = build_policy_cache(
+        source, policy_version=1, bucket_size_bytes=3
+    )
+    target = {name: torch.zeros_like(value) for name, value in source.items()}
+    receiver = PolicyCacheReceiver(committed_version=0)
+
+    _apply_all(receiver, target, manifest, buckets)
+
+    assert target["empty"].shape == (0,)
+    assert torch.equal(target["scalar"], source["scalar"])
+
+
+def test_noncontiguous_cpu_target_is_staged_and_committed() -> None:
+    source = {"policy": torch.arange(12, dtype=torch.float32).reshape(3, 4)}
+    manifest, buckets = build_policy_cache(
+        source, policy_version=2, bucket_size_bytes=7
+    )
+    backing = torch.zeros(4, 3, dtype=torch.float32)
+    target = {"policy": backing.transpose(0, 1)}
+    assert not target["policy"].is_contiguous()
+    receiver = PolicyCacheReceiver(committed_version=1)
+
+    _apply_all(receiver, target, manifest, buckets)
+
+    assert torch.equal(target["policy"], source["policy"])
+
+
+def test_aborted_noncontiguous_target_remains_unmodified() -> None:
+    source = {"policy": torch.arange(12, dtype=torch.float32).reshape(3, 4)}
+    manifest, buckets = build_policy_cache(
+        source, policy_version=2, bucket_size_bytes=7
+    )
+    backing = torch.zeros(4, 3, dtype=torch.float32)
+    target = {"policy": backing.transpose(0, 1)}
+    receiver = PolicyCacheReceiver(committed_version=1)
+    receiver.begin(
+        transfer_id="abort-noncontiguous",
+        manifest=manifest,
+        state_dict=target,
+    )
+
+    receiver.apply_bucket(buckets[0], state_dict=target)
+    receiver.abort(transfer_id="abort-noncontiguous")
+
+    assert torch.count_nonzero(target["policy"]) == 0
+    assert receiver.staging_version is None
+
+
+def test_receiver_rejects_tensor_fragment_gap_before_mutation() -> None:
+    manifest, _ = build_policy_cache(
+        {"large": torch.arange(12, dtype=torch.float32)},
+        policy_version=1,
+        bucket_size_bytes=16,
+    )
+    second_bucket = manifest.bucket_descriptors[1]
+    second_fragment = second_bucket.tensors[0]
+    malformed_fragment = replace(
+        second_fragment,
+        tensor_start_byte=second_fragment.tensor_start_byte + 1,
+        tensor_end_byte=second_fragment.tensor_end_byte + 1,
+    )
+    malformed_bucket = replace(second_bucket, tensors=(malformed_fragment,))
+    malformed_manifest = replace(
+        manifest,
+        bucket_descriptors=(
+            manifest.bucket_descriptors[0],
+            malformed_bucket,
+            manifest.bucket_descriptors[2],
+        ),
+    )
+    target = {"large": torch.zeros(12, dtype=torch.float32)}
+    receiver = PolicyCacheReceiver(committed_version=0)
+
+    with pytest.raises(ValueError, match="gap or overlap"):
+        receiver.begin(
+            transfer_id="gap",
+            manifest=malformed_manifest,
+            state_dict=target,
+        )
+
+    assert torch.count_nonzero(target["large"]) == 0
+    assert receiver.staging_version is None
+
+
+def test_receiver_rejects_bucket_fragment_overlap_before_mutation() -> None:
+    manifest, _ = build_policy_cache(
+        {
+            "first": torch.arange(2, dtype=torch.float32),
+            "second": torch.arange(2, dtype=torch.float32),
+        },
+        policy_version=1,
+        bucket_size_bytes=32,
+    )
+    bucket = manifest.bucket_descriptors[0]
+    first, second = bucket.tensors
+    malformed_second = replace(
+        second,
+        start_byte=first.end_byte - 1,
+        end_byte=second.end_byte - 1,
+    )
+    malformed_manifest = replace(
+        manifest,
+        bucket_descriptors=(replace(bucket, tensors=(first, malformed_second)),),
+    )
+    target = {
+        "first": torch.zeros(2, dtype=torch.float32),
+        "second": torch.zeros(2, dtype=torch.float32),
+    }
+    receiver = PolicyCacheReceiver(committed_version=0)
+
+    with pytest.raises(ValueError, match="gap or overlap"):
+        receiver.begin(
+            transfer_id="overlap",
+            manifest=malformed_manifest,
+            state_dict=target,
+        )
+
+    assert receiver.staging_version is None
 
 
 @pytest.mark.parametrize("version", [-1, True, 1.5])
@@ -141,6 +379,16 @@ def test_candidate_must_be_complete_and_checksum_valid() -> None:
     corrupted = (replace(buckets[0], payload=corrupted_payload), *buckets[1:])
     with pytest.raises(ValueError, match="checksum"):
         cache.store_candidate(manifest, corrupted)
+
+    oversized = (
+        replace(
+            buckets[0],
+            payload=torch.cat((buckets[0].payload, torch.zeros(1, dtype=torch.uint8))),
+        ),
+        *buckets[1:],
+    )
+    with pytest.raises(ValueError, match="payload size"):
+        cache.store_candidate(manifest, oversized)
     assert cache.status()["active_version"] is None
     assert cache.status()["candidate_version"] is None
 

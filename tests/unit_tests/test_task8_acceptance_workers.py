@@ -265,6 +265,24 @@ def test_recording_env_worker_preserves_outputs_calls_and_rng() -> None:
     assert events[-2].details["final_bootstrap"] is True
 
 
+def test_disabled_acceptance_instrumentation_is_a_true_noop() -> None:
+    recorded = _RecordingFakeEnv()
+    recorded.configure_acceptance_instrumentation(False)
+
+    result = recorded.env_interact_step(torch.tensor([[1.0, 2.0]]), 0)
+
+    assert result is not None
+    assert recorded.calls
+    assert recorded._task8_acceptance_observer is None
+
+
+def test_enabled_acceptance_instrumentation_remains_fail_closed() -> None:
+    recorded = _RecordingFakeEnv()
+
+    with pytest.raises(RuntimeError, match="acceptance observer is not configured"):
+        recorded.env_interact_step(torch.tensor([[1.0, 2.0]]), 0)
+
+
 def test_recording_rollout_worker_preserves_outputs_and_call_order() -> None:
     plain = _FakeRolloutWorker()
     recorded = _RecordingFakeRollout()

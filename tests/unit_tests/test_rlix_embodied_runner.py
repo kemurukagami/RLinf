@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ import pytest
 import torch
 
 from rlinf.data.embodied_io_struct import RolloutTransitionIdentity
+from rlinf.hybrid_engines.weight_syncer.versioned_cache import PolicyCacheBuildReceipt
 from rlinf.runners.embodied_runner import EmbodiedRunner, _resolve_channel_names
 from rlinf.scheduler.rlix.protocol import ElasticBatchReceipt, FixedWorkerResidency
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
@@ -127,6 +129,14 @@ class _Group:
                     manifest_hash="manifest",
                 )
             ],
+        )
+
+    def start_policy_cache_finalization(self, policy_version):
+        self.events.append(f"start_finalize:{policy_version}")
+        return _Handle(
+            self.events,
+            f"wait_finalize:{policy_version}",
+            [True],
         )
 
     def recv_rollout_trajectories(self, *, input_channel):
@@ -539,7 +549,7 @@ def test_fixed_actor_training_advances_version_only_after_verified_release() -> 
     ]
 
 
-def test_async_actor_training_starts_prefetch_before_residency_release() -> None:
+def test_async_actor_releases_training_stage_before_promotion_and_prefetch() -> None:
     events: list[str] = []
     runtime = _Runtime(events)
     runtime.policy_sync_mode = "async_cpu_prefetch"
@@ -551,11 +561,11 @@ def test_async_actor_training_starts_prefetch_before_residency_release() -> None
     assert events.index("wait_set_global_step:actor:4") < events.index(
         "start_promote:4"
     )
-    assert events.index("wait_promote:4") < events.index("start_residency:actor")
-    assert events.index("start_policy_prefetch:4") < events.index(
-        "start_residency:actor"
-    )
-    assert events.index("wait_promote:4") < events.index("release_actor_train")
+    assert events.index("start_residency:actor") < events.index("release_actor_train")
+    assert events.index("release_actor_train") < events.index("start_promote:4")
+    assert events.index("release_actor_train") < events.index("start_finalize:4")
+    assert events.index("wait_finalize:4") < events.index("start_promote:4")
+    assert events.index("wait_promote:4") < events.index("start_policy_prefetch:4")
 
 
 def test_failed_actor_training_does_not_advance_policy_version() -> None:
@@ -603,6 +613,31 @@ def test_failed_actor_version_publication_does_not_release_or_advance() -> None:
     assert "complete:verified-receipt" not in events
 
 
+def test_failed_cpu_finalization_is_reported_after_training_gpu_release() -> None:
+    events: list[str] = []
+    runtime = _Runtime(events)
+    runtime.policy_sync_mode = "async_cpu_prefetch"
+    runner = _runner(events, runtime=runtime)
+    runner.global_step = 9
+
+    class _FailedPromotionHandle:
+        def wait(self):
+            events.append("wait_promote:10")
+            raise RuntimeError("checksum failed")
+
+    runner.actor.promote_policy_cache = lambda version: (
+        events.append(f"start_promote:{version}") or _FailedPromotionHandle()
+    )
+
+    with pytest.raises(RuntimeError, match="checksum failed"):
+        runner._train_rlix_batch("batch-9")
+
+    assert events.index("release_actor_train") < events.index("start_finalize:10")
+    assert events.index("wait_finalize:10") < events.index("start_promote:10")
+    assert runner.global_step == 9
+    assert "start_policy_prefetch:10" not in events
+
+
 def test_actor_training_consumes_seal_and_offloads_state() -> None:
     actor = object.__new__(EmbodiedFSDPActor)
     receipt = ElasticBatchReceipt(2, 6, (0,), 4, 4, 12)
@@ -623,7 +658,7 @@ def test_actor_training_consumes_seal_and_offloads_state() -> None:
     assert actor._rlix_batch_receipt is None
 
 
-def test_async_actor_builds_candidate_before_training_offload() -> None:
+def test_async_actor_captures_before_offload_and_finalizes_after_offload() -> None:
     actor = object.__new__(EmbodiedFSDPActor)
     receipt = ElasticBatchReceipt(2, 6, (0,), 4, 4, 12)
     actor._rlix_batch_receipt = receipt
@@ -632,8 +667,12 @@ def test_async_actor_builds_candidate_before_training_offload() -> None:
     actor.is_optimizer_offloaded = False
     events: list[str] = []
     actor.run_training = lambda: events.append("train") or {"loss": 1.0}
-    actor.build_policy_cache_candidate = lambda version: events.append(
-        f"build:{version}"
+    capture = object()
+    actor._capture_policy_cache_candidate = lambda version: (
+        events.append(f"capture:{version}") or capture
+    )
+    actor._retain_policy_cache_capture = lambda value: events.append(
+        f"retain:{value is capture}"
     )
     actor.offload_param_and_grad = lambda offload_grad: events.append(
         f"offload_weights:{offload_grad}"
@@ -644,10 +683,93 @@ def test_async_actor_builds_candidate_before_training_offload() -> None:
 
     assert events == [
         "train",
-        "build:7",
+        "capture:7",
         "offload_weights:True",
         "offload_optimizer",
+        "retain:True",
     ]
+
+
+def test_actor_policy_finalizer_is_bounded_and_observed_by_exact_version() -> None:
+    actor = object.__new__(EmbodiedFSDPActor)
+    actor._rank = 0
+    actor._is_weight_sender = True
+    actor._rlix_policy_finalize_executor = None
+    actor._rlix_policy_finalize_futures = {}
+    started = threading.Event()
+    release = threading.Event()
+    capture = SimpleNamespace(policy_version=7)
+    receipt = PolicyCacheBuildReceipt(0, 7, True, "manifest", 2, 32)
+
+    def finalize(value):
+        assert value is capture
+        started.set()
+        assert release.wait(timeout=5)
+        return receipt
+
+    actor._finalize_policy_cache_capture = finalize
+    actor._start_policy_cache_finalization(capture)
+    assert started.wait(timeout=5)
+    with pytest.raises(RuntimeError, match="already exists"):
+        actor._start_policy_cache_finalization(SimpleNamespace(policy_version=8))
+
+    release.set()
+    assert actor._wait_policy_cache_finalization(7) == receipt
+    assert actor._rlix_policy_finalize_futures == {}
+    actor._rlix_policy_finalize_executor.shutdown()
+
+
+def test_actor_starts_retained_capture_only_after_explicit_release_boundary() -> None:
+    actor = object.__new__(EmbodiedFSDPActor)
+    actor._is_weight_sender = True
+    actor._rlix_async_policy_prefetch = True
+    capture = SimpleNamespace(policy_version=3)
+    actor._rlix_pending_policy_captures = {3: capture}
+    observed: list[object] = []
+    actor._start_policy_cache_finalization = observed.append
+
+    assert actor.start_policy_cache_finalization(3) is True
+    assert observed == [capture]
+    assert actor._rlix_pending_policy_captures == {}
+
+
+def test_actor_restores_retained_capture_if_finalizer_launch_fails() -> None:
+    actor = object.__new__(EmbodiedFSDPActor)
+    actor._is_weight_sender = True
+    actor._rlix_async_policy_prefetch = True
+    capture = SimpleNamespace(policy_version=3)
+    actor._rlix_pending_policy_captures = {3: capture}
+
+    def fail_start(value):
+        assert value is capture
+        raise RuntimeError("executor unavailable")
+
+    actor._start_policy_cache_finalization = fail_start
+    with pytest.raises(RuntimeError, match="executor unavailable"):
+        actor.start_policy_cache_finalization(3)
+    assert actor._rlix_pending_policy_captures == {3: capture}
+
+
+def test_actor_policy_finalizer_failure_is_retained_and_fails_promotion() -> None:
+    actor = object.__new__(EmbodiedFSDPActor)
+    actor._rank = 0
+    actor._is_weight_sender = True
+    actor._rlix_async_policy_prefetch = True
+    actor._rlix_policy_finalize_executor = None
+    actor._rlix_policy_finalize_futures = {}
+    capture = SimpleNamespace(policy_version=5)
+
+    def fail_finalization(value):
+        assert value is capture
+        raise RuntimeError("checksum failed")
+
+    actor._finalize_policy_cache_capture = fail_finalization
+    actor._start_policy_cache_finalization(capture)
+
+    with pytest.raises(RuntimeError, match="checksum failed"):
+        actor.promote_policy_cache(5)
+    assert 5 in actor._rlix_policy_finalize_futures
+    actor._rlix_policy_finalize_executor.shutdown()
 
 
 def test_actor_rlix_checkpoint_restore_reestablishes_offload() -> None:

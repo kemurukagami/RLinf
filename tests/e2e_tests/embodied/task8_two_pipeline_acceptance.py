@@ -617,15 +617,18 @@ def _drive_generation_proof_gates(control_actor: Any, *, timeout_s: float) -> No
     ray.get(
         control_actor.wait_for_gate.remote("a_generation_granted", timeout_s=timeout_s)
     )
-    ray.get(
-        control_actor.wait_for_gate.remote(
-            "a_target_rank_completed", timeout_s=timeout_s
-        )
-    )
+    # Publish B's demand before A releases either bundle. The scheduler can
+    # then commit the first free bundle immediately without an orchestrator
+    # round trip on the resource-release critical path.
     ray.get(control_actor.release_gate.remote("allow_b_collection"))
     ray.get(
         control_actor.wait_for_gate.remote(
             "b_generation_requested", timeout_s=timeout_s
+        )
+    )
+    ray.get(
+        control_actor.wait_for_gate.remote(
+            "a_target_rank_completed", timeout_s=timeout_s
         )
     )
     ray.get(
@@ -646,7 +649,6 @@ def _drive_generation_proof_gates(control_actor: Any, *, timeout_s: float) -> No
         control_actor.wait_for_gate.remote("a_training_completed", timeout_s=timeout_s)
     )
     ray.get(control_actor.wait_for_gate.remote("b_batch_sealed", timeout_s=timeout_s))
-    ray.get(control_actor.release_gate.remote("allow_b_training"))
     ray.get(
         control_actor.wait_for_gate.remote(
             "both_training_completed", timeout_s=timeout_s

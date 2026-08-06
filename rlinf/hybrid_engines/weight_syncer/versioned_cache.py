@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import threading
 import uuid
 from dataclasses import dataclass
@@ -28,7 +29,7 @@ from torch.distributed.tensor import DTensor
 
 from rlinf.utils.utils import materialize_tensor
 
-_FORMAT_VERSION = 1
+_FORMAT_VERSION = 2
 
 
 def _require_policy_version(policy_version: int) -> int:
@@ -56,22 +57,29 @@ def _resolve_dtype(name: str) -> torch.dtype:
 def _sha256_bytes(payload: torch.Tensor) -> str:
     if payload.device.type != "cpu" or payload.dtype is not torch.uint8:
         raise TypeError("policy bucket checksum requires a CPU uint8 tensor")
-    return hashlib.sha256(payload.contiguous().numpy().tobytes()).hexdigest()
+    contiguous = payload.contiguous()
+    return hashlib.sha256(memoryview(contiguous.numpy())).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
 class PolicyTensorDescriptor:
-    """Location and interpretation of one tensor within a byte bucket."""
+    """Location of one tensor fragment in a bucket and the complete tensor."""
 
     name: str
     shape: tuple[int, ...]
     dtype: str
     start_byte: int
     end_byte: int
+    tensor_start_byte: int
+    tensor_end_byte: int
 
     @property
     def byte_count(self) -> int:
         return self.end_byte - self.start_byte
+
+    @property
+    def tensor_byte_count(self) -> int:
+        return self.tensor_end_byte - self.tensor_start_byte
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +114,25 @@ class PolicyBucket:
 
     descriptor: PolicyBucketDescriptor
     payload: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class CapturedPolicyBucket:
+    """Unsealed CPU payload captured before checksum and manifest creation."""
+
+    index: int
+    tensors: tuple[PolicyTensorDescriptor, ...]
+    payload: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyCacheCapture:
+    """Complete CPU byte capture that is not yet publishable or leasable."""
+
+    policy_version: int
+    format_version: int
+    buckets: tuple[CapturedPolicyBucket, ...]
+    total_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +203,8 @@ def _schema_payload(
                     "dtype": tensor.dtype,
                     "start_byte": tensor.start_byte,
                     "end_byte": tensor.end_byte,
+                    "tensor_start_byte": tensor.tensor_start_byte,
+                    "tensor_end_byte": tensor.tensor_end_byte,
                 }
                 for tensor in descriptor.tensors
             ],
@@ -189,18 +218,19 @@ def _hash_json(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def build_policy_cache(
+def capture_policy_cache(
     state_dict: Mapping[str, torch.Tensor | DTensor],
     *,
     policy_version: int,
     bucket_size_bytes: int,
     selected_names: Iterable[str] | None = None,
-) -> tuple[PolicyCacheManifest, tuple[PolicyBucket, ...]]:
-    """Materialize a complete state dict into deterministic CPU byte buckets.
+) -> PolicyCacheCapture:
+    """Capture a complete state dict into deterministic unsealed CPU buckets.
 
     Every caller participating in an FSDP/DTensor collective must invoke this
-    function with the same names and ordering. The returned payload is always
-    CPU-owned and preserves the exact source dtype bytes, including BF16.
+    function with the same names and ordering. Returned payloads are CPU-owned
+    and byte-exact, but cannot be published until :func:`finalize_policy_capture`
+    creates and checksums their immutable manifest.
     """
 
     policy_version = _require_policy_version(policy_version)
@@ -218,65 +248,182 @@ def build_policy_cache(
     if missing:
         raise KeyError(f"policy cache names missing from state dict: {missing}")
 
-    buckets: list[PolicyBucket] = []
-    pending: list[tuple[str, torch.Tensor]] = []
-    pending_bytes = 0
-
-    def flush() -> None:
-        nonlocal pending, pending_bytes
-        if not pending:
-            return
-        byte_views: list[torch.Tensor] = []
-        tensor_descriptors: list[PolicyTensorDescriptor] = []
-        offset = 0
-        for name, tensor in pending:
-            contiguous = tensor.detach().contiguous()
-            byte_view = (
-                contiguous.view(torch.uint8)
-                .reshape(-1)
-                .to(device="cpu", non_blocking=False)
-                .contiguous()
-            )
-            byte_views.append(byte_view)
-            end = offset + byte_view.numel()
-            tensor_descriptors.append(
-                PolicyTensorDescriptor(
-                    name=name,
-                    shape=tuple(contiguous.shape),
-                    dtype=_dtype_name(contiguous.dtype),
-                    start_byte=offset,
-                    end_byte=end,
-                )
-            )
-            offset = end
-        payload = torch.cat(byte_views).contiguous()
-        descriptor = PolicyBucketDescriptor(
-            index=len(buckets),
-            byte_count=payload.numel(),
-            tensors=tuple(tensor_descriptors),
-            checksum=_sha256_bytes(payload),
-        )
-        buckets.append(PolicyBucket(descriptor=descriptor, payload=payload))
-        pending = []
-        pending_bytes = 0
-
+    bucket_fragments: list[list[PolicyTensorDescriptor]] = []
+    bucket_byte_counts: list[int] = []
+    fragments_by_name: dict[str, list[tuple[int, PolicyTensorDescriptor]]] = {}
     for name in names:
         value = state_dict[name]
         if not isinstance(value, (torch.Tensor, DTensor)):
             raise TypeError(f"policy cache value {name!r} is not a tensor")
-        materialized = materialize_tensor(value)
-        value_bytes = materialized.numel() * materialized.element_size()
-        if pending and pending_bytes + value_bytes > bucket_size_bytes:
-            flush()
-        pending.append((name, materialized))
-        pending_bytes += value_bytes
-    flush()
+        shape = tuple(value.shape)
+        dtype = _dtype_name(value.dtype)
+        tensor_bytes = value.numel() * value.element_size()
+        tensor_offset = 0
+        if not bucket_fragments or bucket_byte_counts[-1] == bucket_size_bytes:
+            bucket_fragments.append([])
+            bucket_byte_counts.append(0)
+        if tensor_bytes == 0:
+            descriptor = PolicyTensorDescriptor(
+                name=name,
+                shape=shape,
+                dtype=dtype,
+                start_byte=bucket_byte_counts[-1],
+                end_byte=bucket_byte_counts[-1],
+                tensor_start_byte=0,
+                tensor_end_byte=0,
+            )
+            bucket_fragments[-1].append(descriptor)
+            fragments_by_name[name] = [(len(bucket_fragments) - 1, descriptor)]
+            continue
+        while tensor_offset < tensor_bytes:
+            if bucket_byte_counts[-1] == bucket_size_bytes:
+                bucket_fragments.append([])
+                bucket_byte_counts.append(0)
+            bucket_index = len(bucket_fragments) - 1
+            bucket_start = bucket_byte_counts[bucket_index]
+            fragment_bytes = min(
+                bucket_size_bytes - bucket_start,
+                tensor_bytes - tensor_offset,
+            )
+            bucket_end = bucket_start + fragment_bytes
+            tensor_end = tensor_offset + fragment_bytes
+            descriptor = PolicyTensorDescriptor(
+                name=name,
+                shape=shape,
+                dtype=dtype,
+                start_byte=bucket_start,
+                end_byte=bucket_end,
+                tensor_start_byte=tensor_offset,
+                tensor_end_byte=tensor_end,
+            )
+            bucket_fragments[bucket_index].append(descriptor)
+            bucket_byte_counts[bucket_index] = bucket_end
+            fragments_by_name.setdefault(name, []).append((bucket_index, descriptor))
+            tensor_offset = tensor_end
+
+    payloads: list[torch.Tensor | None] = [None] * len(bucket_fragments)
+    for name in names:
+        contiguous = materialize_tensor(state_dict[name]).detach().contiguous()
+        source_bytes = contiguous.reshape(-1).view(torch.uint8)
+        for bucket_index, descriptor in fragments_by_name[name]:
+            payload = payloads[bucket_index]
+            if payload is None:
+                payload = torch.empty(
+                    bucket_byte_counts[bucket_index], dtype=torch.uint8
+                )
+                payloads[bucket_index] = payload
+            payload[descriptor.start_byte : descriptor.end_byte].copy_(
+                source_bytes[descriptor.tensor_start_byte : descriptor.tensor_end_byte],
+                non_blocking=False,
+            )
+        del source_bytes
+        del contiguous
+
+    captured_buckets: list[CapturedPolicyBucket] = []
+    for index, (fragments, byte_count, payload) in enumerate(
+        zip(bucket_fragments, bucket_byte_counts, payloads, strict=True)
+    ):
+        if payload is None:
+            payload = torch.empty(byte_count, dtype=torch.uint8)
+        if payload.device.type != "cpu" or payload.dtype is not torch.uint8:
+            raise RuntimeError("policy capture payload must be a CPU uint8 tensor")
+        if payload.numel() != byte_count:
+            raise RuntimeError("policy capture payload size is inconsistent")
+        captured_buckets.append(
+            CapturedPolicyBucket(
+                index=index,
+                tensors=tuple(fragments),
+                payload=payload,
+            )
+        )
+    return PolicyCacheCapture(
+        policy_version=policy_version,
+        format_version=_FORMAT_VERSION,
+        buckets=tuple(captured_buckets),
+        total_bytes=sum(bucket.payload.numel() for bucket in captured_buckets),
+    )
+
+
+def finalize_policy_capture(
+    capture: PolicyCacheCapture,
+) -> tuple[PolicyCacheManifest, tuple[PolicyBucket, ...]]:
+    """Checksum and seal a complete CPU capture into a publishable candidate."""
+    if not isinstance(capture, PolicyCacheCapture):
+        raise TypeError("capture must be a PolicyCacheCapture")
+    if capture.format_version != _FORMAT_VERSION:
+        raise ValueError("policy capture format is unsupported")
+    if not capture.buckets:
+        raise ValueError("policy capture must contain at least one bucket")
+
+    tensor_ranges: dict[str, list[tuple[int, int]]] = {}
+    tensor_byte_counts: dict[str, int] = {}
+    tensor_schemas: dict[str, tuple[tuple[int, ...], str]] = {}
+    observed_bytes = 0
+    for index, captured in enumerate(capture.buckets):
+        if captured.index != index:
+            raise ValueError("policy capture bucket indices must be sequential")
+        payload = captured.payload
+        if payload.device.type != "cpu" or payload.dtype is not torch.uint8:
+            raise TypeError("policy capture payload must be a CPU uint8 tensor")
+        byte_count = payload.numel()
+        bucket_cursor = 0
+        for tensor in captured.tensors:
+            if tensor.start_byte != bucket_cursor:
+                raise ValueError("policy capture bucket contains a gap or overlap")
+            if tensor.end_byte < tensor.start_byte or tensor.end_byte > byte_count:
+                raise ValueError("policy capture tensor exceeds bucket bounds")
+            if tensor.tensor_start_byte < 0:
+                raise ValueError("policy capture tensor range is invalid")
+            if tensor.byte_count != tensor.tensor_byte_count:
+                raise ValueError("policy capture fragment byte counts do not match")
+            schema = (tensor.shape, tensor.dtype)
+            if tensor.name in tensor_schemas and tensor_schemas[tensor.name] != schema:
+                raise ValueError("policy capture tensor schema is inconsistent")
+            tensor_schemas[tensor.name] = schema
+            expected_bytes = (
+                math.prod(tensor.shape)
+                * torch.empty((), dtype=_resolve_dtype(tensor.dtype)).element_size()
+            )
+            if tensor.tensor_end_byte > expected_bytes:
+                raise ValueError("policy capture fragment exceeds tensor bounds")
+            tensor_byte_counts[tensor.name] = expected_bytes
+            tensor_ranges.setdefault(tensor.name, []).append(
+                (tensor.tensor_start_byte, tensor.tensor_end_byte)
+            )
+            bucket_cursor = tensor.end_byte
+        if bucket_cursor != byte_count:
+            raise ValueError("policy capture bucket does not cover its payload")
+        observed_bytes += byte_count
+    for name, ranges in tensor_ranges.items():
+        tensor_cursor = 0
+        for start, end in sorted(ranges):
+            if start != tensor_cursor:
+                raise ValueError(
+                    f"policy capture tensor {name!r} contains a gap or overlap"
+                )
+            tensor_cursor = end
+        if tensor_cursor != tensor_byte_counts[name]:
+            raise ValueError(f"policy capture tensor {name!r} is incomplete")
+    if observed_bytes != capture.total_bytes:
+        raise ValueError("policy capture total byte count is inconsistent")
+
+    buckets: list[PolicyBucket] = []
+    for index, captured in enumerate(capture.buckets):
+        payload = captured.payload
+        byte_count = payload.numel()
+        descriptor = PolicyBucketDescriptor(
+            index=index,
+            byte_count=byte_count,
+            tensors=captured.tensors,
+            checksum=_sha256_bytes(payload),
+        )
+        buckets.append(PolicyBucket(descriptor=descriptor, payload=payload))
 
     descriptors = tuple(bucket.descriptor for bucket in buckets)
     schema_payload = _schema_payload(descriptors)
     model_schema_hash = _hash_json(schema_payload)
     manifest_payload = {
-        "policy_version": policy_version,
+        "policy_version": capture.policy_version,
         "format_version": _FORMAT_VERSION,
         "model_schema_hash": model_schema_hash,
         "total_bytes": sum(item.byte_count for item in descriptors),
@@ -286,7 +433,7 @@ def build_policy_cache(
         ],
     }
     manifest = PolicyCacheManifest(
-        policy_version=policy_version,
+        policy_version=capture.policy_version,
         format_version=_FORMAT_VERSION,
         model_schema_hash=model_schema_hash,
         bucket_descriptors=descriptors,
@@ -294,6 +441,23 @@ def build_policy_cache(
         manifest_hash=_hash_json(manifest_payload),
     )
     return manifest, tuple(buckets)
+
+
+def build_policy_cache(
+    state_dict: Mapping[str, torch.Tensor | DTensor],
+    *,
+    policy_version: int,
+    bucket_size_bytes: int,
+    selected_names: Iterable[str] | None = None,
+) -> tuple[PolicyCacheManifest, tuple[PolicyBucket, ...]]:
+    """Capture and synchronously finalize a policy-cache compatibility path."""
+    capture = capture_policy_cache(
+        state_dict,
+        policy_version=policy_version,
+        bucket_size_bytes=bucket_size_bytes,
+        selected_names=selected_names,
+    )
+    return finalize_policy_capture(capture)
 
 
 class VersionedPolicyCache:
@@ -321,15 +485,25 @@ class VersionedPolicyCache:
         """Validate and store a complete unpublished version."""
         if not isinstance(manifest, PolicyCacheManifest):
             raise TypeError("manifest must be a PolicyCacheManifest")
+        if manifest.format_version != _FORMAT_VERSION:
+            raise ValueError("candidate policy-cache format is unsupported")
         if not isinstance(buckets, tuple):
             raise TypeError("buckets must be a tuple")
         if len(buckets) != manifest.bucket_count:
             raise ValueError("candidate bucket count does not match manifest")
+        if manifest.total_bytes != sum(
+            descriptor.byte_count for descriptor in manifest.bucket_descriptors
+        ):
+            raise ValueError("candidate manifest total byte count is inconsistent")
         for index, (bucket, expected) in enumerate(
             zip(buckets, manifest.bucket_descriptors, strict=True)
         ):
             if bucket.descriptor != expected or expected.index != index:
                 raise ValueError("candidate bucket descriptor does not match manifest")
+            if bucket.payload.numel() != expected.byte_count:
+                raise ValueError(
+                    "candidate bucket payload size does not match manifest"
+                )
             if _sha256_bytes(bucket.payload) != expected.checksum:
                 raise ValueError(f"candidate bucket {index} checksum mismatch")
         with self._lock:
@@ -448,6 +622,8 @@ class PolicyCacheReceiver:
         self._transfer_id: str | None = None
         self._received: set[int] = set()
         self._received_bytes = 0
+        self._noncontiguous_staging: dict[str, torch.Tensor] = {}
+        self._noncontiguous_targets: dict[str, torch.Tensor] = {}
 
     @property
     def committed_version(self) -> int:
@@ -477,7 +653,26 @@ class PolicyCacheReceiver:
             raise ValueError(
                 "received policy version must be newer than committed version"
             )
-        for descriptor in manifest.bucket_descriptors:
+        if manifest.format_version != _FORMAT_VERSION:
+            raise ValueError(
+                f"unsupported policy-cache format {manifest.format_version}; "
+                f"expected={_FORMAT_VERSION}"
+            )
+        if manifest.total_bytes != sum(
+            descriptor.byte_count for descriptor in manifest.bucket_descriptors
+        ):
+            raise ValueError("policy manifest total byte count is inconsistent")
+        tensor_ranges: dict[str, list[tuple[int, int]]] = {}
+        tensor_byte_counts: dict[str, int] = {}
+        tensor_schemas: dict[str, tuple[tuple[int, ...], str]] = {}
+        noncontiguous_staging: dict[str, torch.Tensor] = {}
+        noncontiguous_targets: dict[str, torch.Tensor] = {}
+        for expected_index, descriptor in enumerate(manifest.bucket_descriptors):
+            if descriptor.index != expected_index:
+                raise ValueError("policy bucket indices must be sequential")
+            if descriptor.byte_count < 0:
+                raise ValueError("policy bucket byte count must be non-negative")
+            bucket_cursor = 0
             for tensor in descriptor.tensors:
                 target = state_dict.get(tensor.name)
                 if target is None:
@@ -492,10 +687,59 @@ class PolicyCacheReceiver:
                     )
                 if target.device.type != "cpu":
                     raise ValueError("policy receiver requires CPU-offloaded tensors")
+                if not target.is_contiguous():
+                    noncontiguous_targets[tensor.name] = target
+                    if tensor.name not in noncontiguous_staging:
+                        noncontiguous_staging[tensor.name] = torch.empty(
+                            tuple(target.shape),
+                            dtype=target.dtype,
+                            device="cpu",
+                        )
+                if tensor.start_byte != bucket_cursor:
+                    raise ValueError("policy bucket fragments contain a gap or overlap")
+                if tensor.end_byte < tensor.start_byte:
+                    raise ValueError("policy bucket fragment range is invalid")
+                if tensor.end_byte > descriptor.byte_count:
+                    raise ValueError("policy bucket fragment exceeds bucket bounds")
+                if tensor.tensor_start_byte < 0:
+                    raise ValueError("policy tensor fragment range is invalid")
+                target_bytes = target.numel() * target.element_size()
+                if tensor.tensor_end_byte > target_bytes:
+                    raise ValueError("policy tensor fragment exceeds tensor bounds")
+                if tensor.byte_count != tensor.tensor_byte_count:
+                    raise ValueError("policy tensor fragment byte counts do not match")
+                schema = (tensor.shape, tensor.dtype)
+                if (
+                    tensor.name in tensor_schemas
+                    and tensor_schemas[tensor.name] != schema
+                ):
+                    raise ValueError("policy tensor fragment schema is inconsistent")
+                tensor_schemas[tensor.name] = schema
+                tensor_byte_counts[tensor.name] = target_bytes
+                tensor_ranges.setdefault(tensor.name, []).append(
+                    (tensor.tensor_start_byte, tensor.tensor_end_byte)
+                )
+                bucket_cursor = tensor.end_byte
+            if bucket_cursor != descriptor.byte_count:
+                raise ValueError("policy bucket descriptors do not cover its payload")
+        for name, ranges in tensor_ranges.items():
+            tensor_cursor = 0
+            for start, end in sorted(ranges):
+                if start != tensor_cursor:
+                    raise ValueError(
+                        f"policy tensor {name!r} fragments contain a gap or overlap"
+                    )
+                tensor_cursor = end
+            if tensor_cursor != tensor_byte_counts[name]:
+                raise ValueError(
+                    f"policy tensor {name!r} fragments do not cover the tensor"
+                )
         self._manifest = manifest
         self._transfer_id = transfer_id
         self._received = set()
         self._received_bytes = 0
+        self._noncontiguous_staging = noncontiguous_staging
+        self._noncontiguous_targets = noncontiguous_targets
 
     @torch.no_grad()
     def apply_bucket(
@@ -518,12 +762,19 @@ class PolicyCacheReceiver:
         expected = manifest.bucket_descriptors[expected_index]
         if bucket.descriptor != expected:
             raise ValueError("policy bucket descriptor does not match manifest")
+        if bucket.payload.numel() != expected.byte_count:
+            raise ValueError("policy bucket payload size does not match manifest")
         if _sha256_bytes(bucket.payload) != expected.checksum:
             raise ValueError("policy bucket checksum mismatch")
         for tensor in expected.tensors:
             byte_slice = bucket.payload[tensor.start_byte : tensor.end_byte]
-            value = byte_slice.view(_resolve_dtype(tensor.dtype)).reshape(tensor.shape)
-            state_dict[tensor.name].copy_(value)
+            destination = self._noncontiguous_staging.get(
+                tensor.name, state_dict[tensor.name]
+            )
+            target_bytes = destination.detach().reshape(-1).view(torch.uint8)
+            target_bytes[tensor.tensor_start_byte : tensor.tensor_end_byte].copy_(
+                byte_slice
+            )
         self._received.add(expected_index)
         self._received_bytes += expected.byte_count
         return PolicyBucketApplyReceipt(
@@ -534,6 +785,7 @@ class PolicyCacheReceiver:
             byte_count=expected.byte_count,
         )
 
+    @torch.no_grad()
     def commit(self) -> PolicyVersionReceipt:
         """Publish the receiver version only after complete bucket coverage."""
         manifest = self._manifest
@@ -547,6 +799,8 @@ class PolicyCacheReceiver:
             )
         if self._received_bytes != manifest.total_bytes:
             raise RuntimeError("policy transfer byte count does not match manifest")
+        for name, staging in self._noncontiguous_staging.items():
+            self._noncontiguous_targets[name].copy_(staging)
         prior_version = self._committed_version
         self._committed_version = manifest.policy_version
         receipt = PolicyVersionReceipt(
@@ -561,6 +815,8 @@ class PolicyCacheReceiver:
         self._transfer_id = None
         self._received = set()
         self._received_bytes = 0
+        self._noncontiguous_staging = {}
+        self._noncontiguous_targets = {}
         return receipt
 
     def abort(self, *, transfer_id: str) -> None:
@@ -571,3 +827,5 @@ class PolicyCacheReceiver:
         self._transfer_id = None
         self._received = set()
         self._received_bytes = 0
+        self._noncontiguous_staging = {}
+        self._noncontiguous_targets = {}

@@ -6,7 +6,6 @@ import argparse
 import json
 import os
 import sys
-import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -45,6 +44,22 @@ def _parse_args() -> argparse.Namespace:
         "--phase-diagnostics",
         action=argparse.BooleanOptionalAction,
         default=True,
+    )
+    parser.add_argument(
+        "--acceptance-instrumentation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="record and validate detailed worker acceptance evidence",
+    )
+    parser.add_argument(
+        "--residency-validation-mode",
+        choices=("deep", "receipt", "off"),
+        default="deep",
+    )
+    parser.add_argument(
+        "--snapshot-validation-mode",
+        choices=("deep", "receipt"),
+        default="deep",
     )
     parser.add_argument(
         "--stream-driver-logs",
@@ -87,47 +102,13 @@ def _validate_four_rank_ready(ready: Mapping[str, Mapping[str, Any]]) -> None:
             )
 
 
-def _wait_for_both_b_ranks_working(control_actor: Any, *, timeout_s: float) -> None:
-    """Wait until both B environment ranks have entered a real Wan chunk."""
-    deadline = time.monotonic() + timeout_s
-    while True:
-        events = ray.get(control_actor.events.remote())
-        active = {
-            event.dp_rank
-            for event in events
-            if event.driver_role == "b"
-            and event.component == "environment"
-            and event.event == "chunk_started"
-            and event.dp_rank in {0, 1}
-        }
-        completed = {
-            event.dp_rank
-            for event in events
-            if event.driver_role == "b"
-            and event.component == "rollout"
-            and event.event == "rank_completed"
-            and event.dp_rank in {0, 1}
-        }
-        if completed:
-            raise RuntimeError(
-                "B completed a rank before both ranks were staged for preemption: "
-                f"completed={sorted(completed)}"
-            )
-        if active == {0, 1}:
-            return
-        if time.monotonic() >= deadline:
-            raise TimeoutError(
-                "timed out waiting for B to start real chunks on ranks 0 and 1"
-            )
-        time.sleep(0.05)
-
-
 def _drive_four_rank_fsdp_gates(
     control_actor: Any,
     *,
     timeout_s: float,
+    acceptance_instrumentation: bool = True,
 ) -> None:
-    """Stage both B ranks before releasing A's all-GPU training request."""
+    """Start deterministic initialization, then observe queue-driven execution."""
     ray.get(
         control_actor.wait_for_gate.remote(
             "both_drivers_initialized", timeout_s=timeout_s
@@ -149,20 +130,22 @@ def _drive_four_rank_fsdp_gates(
     ray.get(
         control_actor.wait_for_gate.remote("a_generation_granted", timeout_s=timeout_s)
     )
-    ray.get(
-        control_actor.wait_for_gate.remote(
-            "a_first_rank_completed", timeout_s=timeout_s
-        )
-    )
+    # Queue B while A still owns both bundles. A completed-rank release can
+    # therefore transfer directly to B without waiting for this orchestrator.
     ray.get(control_actor.release_gate.remote("allow_b_collection"))
     ray.get(
         control_actor.wait_for_gate.remote(
             "b_generation_requested", timeout_s=timeout_s
         )
     )
+    if not acceptance_instrumentation:
+        return
+    ray.get(
+        control_actor.wait_for_gate.remote(
+            "a_first_rank_completed", timeout_s=timeout_s
+        )
+    )
     ray.get(control_actor.wait_for_gate.remote("a_batch_sealed", timeout_s=timeout_s))
-    _wait_for_both_b_ranks_working(control_actor, timeout_s=timeout_s)
-    ray.get(control_actor.release_gate.remote("allow_a_training"))
     ray.get(
         control_actor.wait_for_gate.remote("a_training_started", timeout_s=timeout_s)
     )
@@ -170,7 +153,6 @@ def _drive_four_rank_fsdp_gates(
         control_actor.wait_for_gate.remote("a_training_completed", timeout_s=timeout_s)
     )
     ray.get(control_actor.wait_for_gate.remote("b_batch_sealed", timeout_s=timeout_s))
-    ray.get(control_actor.release_gate.remote("allow_b_training"))
     ray.get(
         control_actor.wait_for_gate.remote(
             "both_training_completed", timeout_s=timeout_s
@@ -263,12 +245,20 @@ def _validate_four_rank_lifecycle(
 
 
 def _summary(
-    results: Mapping[str, DriverProcessResult], *, gpu_profile: Mapping[str, Any]
+    results: Mapping[str, DriverProcessResult],
+    *,
+    gpu_profile: Mapping[str, Any],
+    acceptance_instrumentation: bool,
+    residency_validation_mode: str,
+    snapshot_validation_mode: str,
 ) -> dict[str, Any]:
     return {
         "status": "passed",
         "scope": "four_rank_fsdp_generation_proof",
         "task8_accepted": False,
+        "detailed_acceptance_evidence": acceptance_instrumentation,
+        "residency_validation_mode": residency_validation_mode,
+        "snapshot_validation_mode": snapshot_validation_mode,
         "policy_sync_mode": "async_cpu_prefetch",
         "gpu_profile": dict(gpu_profile),
         "drivers": {
@@ -340,6 +330,8 @@ def main() -> None:
         "RLINF_TASK8_CONTROL_ACTOR": _actor_id(control_actor),
         "RLINF_TASK8_CONTROL_NAME": acceptance_control_actor_name(run_id=args.run_id),
         "RLINF_TASK8_CONTROL_NAMESPACE": RLIX_NAMESPACE,
+        "RLINF_TASK8_RESIDENCY_VALIDATION_MODE": args.residency_validation_mode,
+        "RLINF_TASK8_SNAPSHOT_VALIDATION_MODE": args.snapshot_validation_mode,
     }
     driver = Path(__file__).with_name("task8_four_rank_fsdp_driver.py")
     command = [
@@ -359,6 +351,11 @@ def main() -> None:
         "--timeout-s",
         str(args.timeout_s),
         "--phase-diagnostics" if args.phase_diagnostics else "--no-phase-diagnostics",
+        (
+            "--acceptance-instrumentation"
+            if args.acceptance_instrumentation
+            else "--no-acceptance-instrumentation"
+        ),
     ]
     try:
         results = run_driver_pair(
@@ -372,6 +369,7 @@ def main() -> None:
                 _drive_four_rank_fsdp_gates(
                     control_actor,
                     timeout_s=args.timeout_s,
+                    acceptance_instrumentation=args.acceptance_instrumentation,
                 ),
             ),
         )
@@ -379,10 +377,11 @@ def main() -> None:
             results,
             expected_iterations=int(cfg.smoke.max_train_steps),
         )
-        _validate_four_rank_lifecycle(
-            ray.get(control_actor.events.remote()),
-            iterations=int(cfg.smoke.max_train_steps),
-        )
+        if args.acceptance_instrumentation:
+            _validate_four_rank_lifecycle(
+                ray.get(control_actor.events.remote()),
+                iterations=int(cfg.smoke.max_train_steps),
+            )
     except BaseException as exc:
         try:
             ray.get(
@@ -419,7 +418,13 @@ def main() -> None:
                 pass
             ray.shutdown()
 
-    summary = _summary(results, gpu_profile=gpu_profile_summary)
+    summary = _summary(
+        results,
+        gpu_profile=gpu_profile_summary,
+        acceptance_instrumentation=args.acceptance_instrumentation,
+        residency_validation_mode=args.residency_validation_mode,
+        snapshot_validation_mode=args.snapshot_validation_mode,
+    )
     atomic_write_json(layout.root / "pair_result.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
 

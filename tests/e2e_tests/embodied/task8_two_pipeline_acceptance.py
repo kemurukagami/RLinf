@@ -183,20 +183,36 @@ def validate_driver_ready_pair(
                 else set()
             )
             | (
-                {"acceptance_control_actor_id", "event_log_path"}
+                {
+                    "acceptance_control_actor_id",
+                    "event_log_path",
+                    "acceptance_instrumentation",
+                }
                 if scope == "generation_proof_only"
                 else set()
             )
         )
     for role, payload in (("a", a), ("b", b)):
         if set(payload) != required:
-            raise ValueError(f"driver {role} readiness schema is incomplete")
+            missing = sorted(required - set(payload))
+            unexpected = sorted(set(payload) - required)
+            raise ValueError(
+                f"driver {role} readiness schema mismatch: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
         if payload["role"] != role:
             raise ValueError(f"driver {role} readiness reports the wrong role")
         if not isinstance(payload["pid"], int) or isinstance(payload["pid"], bool):
             raise ValueError(f"driver {role} readiness has an invalid pid")
-        if any(not payload[field] for field in required - {"pid", "role"}):
+        non_identity_fields = {"pid", "role", "acceptance_instrumentation"}
+        if any(not payload[field] for field in required - non_identity_fields):
             raise ValueError(f"driver {role} readiness contains an empty identity")
+        if scope == "generation_proof_only" and not isinstance(
+            payload["acceptance_instrumentation"], bool
+        ):
+            raise ValueError(
+                f"driver {role} readiness acceptance_instrumentation must be boolean"
+            )
         if scope == "acceptance_control_only":
             continue
         names = payload["role_names"]
@@ -285,7 +301,7 @@ def run_driver_pair(
     *,
     layout: AcceptanceArtifactLayout,
     commands: Mapping[str, Sequence[str]],
-    timeout_s: float,
+    timeout_s: float | None,
     environment: Mapping[str, str] | None = None,
     after_start: Callable[[Mapping[str, Mapping[str, Any]]], None] | None = None,
     stream_driver_logs: bool = False,
@@ -295,13 +311,13 @@ def run_driver_pair(
     """Launch two OS drivers, validate readiness, release, and collect results."""
     if set(commands) != {"a", "b"}:
         raise ValueError("commands must contain exactly roles 'a' and 'b'")
-    if timeout_s <= 0 or poll_interval_s <= 0:
+    if (timeout_s is not None and timeout_s <= 0) or poll_interval_s <= 0:
         raise ValueError("driver timeout and poll interval must be positive")
     for role, command in commands.items():
         if not command or any(not argument for argument in command):
             raise ValueError(f"driver {role} command must not be empty")
 
-    deadline = clock() + timeout_s
+    deadline = None if timeout_s is None else clock() + timeout_s
     control_dir = layout.root / "control"
     control_dir.mkdir(parents=True, exist_ok=False)
     start_path = control_dir / "start.json"
@@ -406,8 +422,8 @@ def run_driver_pair(
                 clock=clock,
                 poll_interval_s=poll_interval_s,
             )
-            remaining = deadline - clock()
-            if remaining <= 0:
+            remaining = None if deadline is None else deadline - clock()
+            if remaining is not None and remaining <= 0:
                 raise TimeoutError("driver pair exceeded its completion deadline")
             return_code = processes[role].wait(timeout=remaining)
             if return_code != 0:
@@ -465,7 +481,7 @@ def _wait_for_json(
     *,
     role: str,
     processes: Mapping[str, subprocess.Popen[Any]],
-    deadline: float,
+    deadline: float | None,
     clock: Callable[[], float],
     poll_interval_s: float,
 ) -> Mapping[str, Any]:
@@ -475,7 +491,7 @@ def _wait_for_json(
             raise RuntimeError(
                 f"driver {role} exited with code {return_code} before writing {path.name}"
             )
-        if clock() >= deadline:
+        if deadline is not None and clock() >= deadline:
             raise TimeoutError(f"timed out waiting for driver {role} {path.name}")
         time.sleep(poll_interval_s)
     try:

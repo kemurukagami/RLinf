@@ -1010,6 +1010,90 @@ def test_wan_worker_later_epoch_uses_result_boundary_counts(monkeypatch):
     assert len(state.rollout_results[0].transition_ids) == 4
 
 
+def _configure_padded_later_epoch_snapshot(worker):
+    """Reproduce a drain after an earlier epoch added synthetic padding."""
+    cursor = worker._rollout_cursor
+    cursor.epoch_index = 2
+    cursor.chunk_index = 66
+    cursor.next_transition_ids = (57,)
+    cursor.synthetic_padding_chunks = 11
+    pending_identity = RolloutTransitionIdentity(
+        lifecycle_generation=2,
+        env_worker_rank=0,
+        stage_id=0,
+        sequence=57,
+    )
+    worker._current_env_outputs[0].transition_id = pending_identity
+    worker._resume_bootstraps[0].transition_id = pending_identity
+
+    rollout_result = worker.rollout_results[0]
+    rollout_result.actions = [torch.ones(2, 56) for _ in range(66)]
+    rollout_result.intervene_flags = [
+        torch.zeros(2, 56, dtype=torch.bool) for _ in range(66)
+    ]
+    rollout_result.rewards = [torch.ones(2, 8) for _ in range(65)]
+    rollout_result.terminations = [
+        torch.zeros(2, 8, dtype=torch.bool) for _ in range(68)
+    ]
+    rollout_result.truncations = [
+        torch.zeros(2, 8, dtype=torch.bool) for _ in range(68)
+    ]
+    rollout_result.dones = [torch.zeros(2, 8, dtype=torch.bool) for _ in range(68)]
+    rollout_result.prev_logprobs = [torch.full((2, 8), 0.25) for _ in range(66)]
+    rollout_result.prev_values = [torch.full((2, 1), 0.5) for _ in range(68)]
+    rollout_result.versions = [torch.full((2, 8), 7.0) for _ in range(66)]
+    rollout_result.forward_inputs = [{"action": torch.ones(2, 56)} for _ in range(66)]
+    rollout_result.transition_ids = [
+        RolloutTransitionIdentity(
+            lifecycle_generation=2,
+            env_worker_rank=0,
+            stage_id=0,
+            sequence=sequence,
+        )
+        for sequence in range(57)
+    ]
+
+
+def test_wan_worker_snapshot_accepts_padding_from_earlier_epoch(monkeypatch):
+    worker = _make_wan_worker(monkeypatch)
+    _configure_padded_later_epoch_snapshot(worker)
+
+    state = worker.snapshot_rollout_stage()
+
+    assert state.cursor.synthetic_padding_chunks == 11
+    assert state.cursor.next_transition_ids == (57,)
+    assert len(state.rollout_results[0].actions) == 66
+    assert len(state.rollout_results[0].transition_ids) == 57
+
+
+def test_wan_worker_receipt_snapshot_restores_padding_from_earlier_epoch(
+    monkeypatch,
+):
+    worker = _make_wan_worker(monkeypatch)
+    worker._elastic_snapshot_validation_mode = ElasticValidationMode.RECEIPT
+    _configure_padded_later_epoch_snapshot(worker)
+
+    state = worker.snapshot_rollout_stage()
+    worker.restore_rollout_stage(
+        state,
+        expected_lifecycle_generation=2,
+        expected_policy_version=7,
+    )
+
+    assert state.validation_receipt is not None
+    assert worker._rollout_cursor.synthetic_padding_chunks == 11
+    assert worker._resume_bootstraps[0].transition_id.sequence == 57
+
+
+def test_wan_worker_snapshot_rejects_wrong_padding_count(monkeypatch):
+    worker = _make_wan_worker(monkeypatch)
+    _configure_padded_later_epoch_snapshot(worker)
+    worker._rollout_cursor.synthetic_padding_chunks = 10
+
+    with pytest.raises(ValueError, match="cursor transition/chunk identity mismatch"):
+        worker.snapshot_rollout_stage()
+
+
 def test_wan_worker_snapshot_rejects_missing_action_representation(monkeypatch):
     worker = _make_wan_worker(monkeypatch)
     rollout_result = worker.rollout_results[0]

@@ -2941,3 +2941,9 @@ When detailed worker instrumentation is disabled, the harness retains only the
 small runner/orchestrator event set needed for deterministic startup. It skips
 the detailed lifecycle-evidence validator and labels the result accordingly.
 Such a run must not be reported as Task 8 acceptance proof.
+
+The four-rank performance harness has no wall-clock timeout by default. Its
+orchestrator, child-driver filesystem rendezvous, acceptance-control gates, and
+OS process waits all propagate an explicit unbounded wait. `--timeout-s` remains
+available as an opt-in operator safeguard. Signal/error cleanup retains short
+bounded termination waits so shutdown cannot become permanently stuck.

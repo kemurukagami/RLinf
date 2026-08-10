@@ -150,20 +150,20 @@ class AcceptanceControlCore:
         self,
         gate: str,
         *,
-        timeout_s: float,
+        timeout_s: float | None,
         poll_interval_s: float = 0.05,
     ) -> dict[str, bool]:
         """Block until one gate is released or fail closed."""
         self._require_gate(gate)
-        if timeout_s <= 0 or poll_interval_s <= 0:
+        if (timeout_s is not None and timeout_s <= 0) or poll_interval_s <= 0:
             raise ValueError("gate timeout and poll interval must be positive")
-        deadline = time.monotonic() + timeout_s
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
         while True:
             with self._lock:
                 if self._gates[gate]:
                     return dict(self._gates)
                 self._raise_if_failed()
-            if time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"timed out waiting for acceptance gate {gate}")
             self._sleep(poll_interval_s)
 

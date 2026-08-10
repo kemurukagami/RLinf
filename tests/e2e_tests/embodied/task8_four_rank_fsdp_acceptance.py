@@ -39,7 +39,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("disaggregated",), required=True)
     parser.add_argument("--bundles", required=True)
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--timeout-s", type=float, default=3600.0)
+    parser.add_argument(
+        "--timeout-s",
+        type=float,
+        default=None,
+        help="optional wall-clock limit; omitted means no timeout",
+    )
     parser.add_argument(
         "--phase-diagnostics",
         action=argparse.BooleanOptionalAction,
@@ -105,7 +110,7 @@ def _validate_four_rank_ready(ready: Mapping[str, Mapping[str, Any]]) -> None:
 def _drive_four_rank_fsdp_gates(
     control_actor: Any,
     *,
-    timeout_s: float,
+    timeout_s: float | None,
     acceptance_instrumentation: bool = True,
 ) -> None:
     """Start deterministic initialization, then observe queue-driven execution."""
@@ -274,7 +279,7 @@ def _summary(
 
 def main() -> None:
     args = _parse_args()
-    if args.timeout_s <= 0:
+    if args.timeout_s is not None and args.timeout_s <= 0:
         raise ValueError("--timeout-s must be positive")
     if args.gpu_event_poll_interval_s <= 0:
         raise ValueError("--gpu-event-poll-interval-s must be positive")
@@ -348,8 +353,6 @@ def main() -> None:
         args.bundles,
         "--config",
         str(args.config.resolve()),
-        "--timeout-s",
-        str(args.timeout_s),
         "--phase-diagnostics" if args.phase_diagnostics else "--no-phase-diagnostics",
         (
             "--acceptance-instrumentation"
@@ -357,6 +360,10 @@ def main() -> None:
             else "--no-acceptance-instrumentation"
         ),
     ]
+    if args.timeout_s is None:
+        command.append("--no-timeout")
+    else:
+        command.extend(("--timeout-s", str(args.timeout_s)))
     try:
         results = run_driver_pair(
             layout=layout,

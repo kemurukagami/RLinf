@@ -1055,10 +1055,10 @@ def _required_environment_path(name: str) -> Path:
     return Path(raw)
 
 
-def _wait_for(path: Path, timeout_s: float) -> None:
-    deadline = time.monotonic() + timeout_s
+def _wait_for(path: Path, timeout_s: float | None) -> None:
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
     while not path.is_file():
-        if time.monotonic() >= deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError(f"timed out waiting for orchestrator gate {path}")
         time.sleep(0.05)
 
@@ -1077,7 +1077,15 @@ def _parse_args() -> argparse.Namespace:
         "--mode", choices=("disaggregated", "collocated"), required=True
     )
     parser.add_argument("--bundles", required=True)
-    parser.add_argument("--timeout-s", type=float, default=60.0)
+    timeout = parser.add_mutually_exclusive_group()
+    timeout.add_argument("--timeout-s", type=float, default=60.0)
+    timeout.add_argument(
+        "--no-timeout",
+        dest="timeout_s",
+        action="store_const",
+        const=None,
+        help="wait indefinitely for driver and acceptance-control gates",
+    )
     parser.add_argument(
         "--phase-diagnostics",
         action=argparse.BooleanOptionalAction,
@@ -1098,7 +1106,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    if args.timeout_s <= 0:
+    if args.timeout_s is not None and args.timeout_s <= 0:
         raise ValueError("--timeout-s must be positive")
     if args.acceptance_control_only or args.connectivity_only:
         if args.config is not None:

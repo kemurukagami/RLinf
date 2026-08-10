@@ -84,7 +84,7 @@ from rlinf.workers.elastic_rollout_lifecycle import (
 )
 from rlinf.workers.env.history_manager import HistoryManager
 
-ENV_ROLLOUT_RESUME_SCHEMA_VERSION = 3
+ENV_ROLLOUT_RESUME_SCHEMA_VERSION = 4
 
 
 class RolloutCursorPhase(str, Enum):
@@ -106,6 +106,11 @@ class EnvRolloutCursor:
     stage_id: int
     next_transition_ids: tuple[int, ...]
     phase: RolloutCursorPhase
+    # Fixed-horizon padding occupies training slots without producing a real
+    # environment/rollout exchange. Keep that distinction explicit so a later
+    # snapshot can validate both the logical batch position and the real
+    # protocol sequence.
+    synthetic_padding_chunks: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1615,6 +1620,7 @@ class EnvWorker(Worker):
             stage_id=cursor.stage_id,
             next_transition_ids=tuple(cursor.next_transition_ids),
             phase=cursor.phase,
+            synthetic_padding_chunks=cursor.synthetic_padding_chunks,
         )
 
     def _validate_snapshot_capability(self) -> None:
@@ -1784,7 +1790,9 @@ class EnvWorker(Worker):
             raise ValueError(
                 "partial rollout alignment failed: "
                 f"{reason}; committed_chunks={committed_chunks} "
-                f"epoch_index={cursor.epoch_index} {rendered_counts} "
+                f"epoch_index={cursor.epoch_index} "
+                f"synthetic_padding_chunks={cursor.synthetic_padding_chunks} "
+                f"{rendered_counts} "
                 f"pending_reward_present={pending_output.rewards is not None} "
                 f"forward_input_keys={forward_input_keys}"
             )
@@ -1814,11 +1822,16 @@ class EnvWorker(Worker):
             for inputs in rollout_result.forward_inputs
         ):
             fail("forward_inputs entries must be non-empty mappings")
+        real_result_boundaries = result_boundaries - cursor.synthetic_padding_chunks
+        if real_result_boundaries <= 0:
+            fail("synthetic padding leaves no real transition boundary")
         expected_transition_counts = (
-            (result_boundaries,) if require_transition_ids else (0, result_boundaries)
+            (real_result_boundaries,)
+            if require_transition_ids
+            else (0, real_result_boundaries)
         )
         if counts["transition_ids"] not in expected_transition_counts:
-            fail("transition_ids do not cover the materialized result boundaries")
+            fail("transition_ids do not cover the real result boundaries")
 
     def _world_snapshot_context(
         self, cursor: EnvRolloutCursor, world_state: WorldEnvResumeState | None = None
@@ -1977,7 +1990,17 @@ class EnvWorker(Worker):
             raise ValueError("cursor topology is invalid for Task 1")
         if cursor.epoch_index < 0 or cursor.chunk_index < 1:
             raise ValueError("cursor epoch/chunk indices are invalid")
-        if cursor.next_transition_ids[0] != cursor.chunk_index + cursor.epoch_index:
+        if (
+            not isinstance(cursor.synthetic_padding_chunks, int)
+            or isinstance(cursor.synthetic_padding_chunks, bool)
+            or cursor.synthetic_padding_chunks < 0
+            or cursor.synthetic_padding_chunks > cursor.chunk_index
+        ):
+            raise ValueError("cursor synthetic padding count is invalid")
+        expected_next_transition = (
+            cursor.chunk_index + cursor.epoch_index - cursor.synthetic_padding_chunks
+        )
+        if cursor.next_transition_ids[0] != expected_next_transition:
             raise ValueError("cursor transition/chunk identity mismatch")
         if not all(
             len(values) == 1
@@ -2710,6 +2733,7 @@ class EnvWorker(Worker):
                         target_chunk_steps=self.n_train_chunk_steps,
                         policy_version=self._rollout_cursor.policy_version,
                     )
+                    self._rollout_cursor.synthetic_padding_chunks += saved_chunks
                     self.log_info(
                         "RLIX_RANK_EARLY_FINALIZED "
                         f"rank={self._rank} "

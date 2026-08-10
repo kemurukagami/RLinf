@@ -419,9 +419,11 @@ def test_acceptance_artifact_layout_rejects_run_id_path_traversal(
         prepare_acceptance_artifacts(tmp_path, run_manifest=manifest)
 
 
+@pytest.mark.parametrize("timeout_s", [10.0, None], ids=["bounded", "unbounded"])
 def test_two_os_driver_orchestrator_rendezvous_and_isolates_identities(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    timeout_s: float | None,
 ) -> None:
     manifest = RunManifest(
         run_id="run-processes",
@@ -473,7 +475,7 @@ print(f"driver {role} stderr", file=sys.stderr)
     results = run_driver_pair(
         layout=layout,
         commands={"a": command, "b": command},
-        timeout_s=10.0,
+        timeout_s=timeout_s,
         stream_driver_logs=True,
     )
 
@@ -630,6 +632,61 @@ def test_model_init_ready_pair_requires_offloaded_residencies() -> None:
     pair["b"]["residencies"][0]["safe_to_release"] = False
     with pytest.raises(ValueError, match="accelerator-resident"):
         validate_driver_ready_pair(pair)
+
+
+@pytest.mark.parametrize("instrumentation", [False, True])
+def test_generation_ready_pair_records_acceptance_instrumentation(
+    instrumentation: bool,
+) -> None:
+    residency = {
+        "component": "rollout",
+        "rank": 0,
+        "model_resident": False,
+        "optimizer_resident": False,
+        "cuda_graph_captured": False,
+        "policy_version": 0,
+        "safe_to_release": True,
+    }
+
+    def ready(role: str) -> dict:
+        return {
+            "scope": "generation_proof_only",
+            "role": role,
+            "pid": 1 if role == "a" else 2,
+            "control_plane_actor_id": "control",
+            "scheduler_actor_id": "scheduler",
+            "pipeline_id": f"pipeline-{role}",
+            "pipeline_namespace": f"namespace-{role}",
+            "candidate_mapping": {"actor_infer": [0, 1, 2, 3]},
+            "candidate_dp_mapping": {"actor_infer": {"0": [0, 2], "1": [1, 3]}},
+            "generation_preemption_mode": "fixed_stage_only",
+            "role_names": {"actor": f"actor-{role}"},
+            "runtime_state": "inactive",
+            "actor_infer_bundles": [[0, 2], [1, 3]],
+            "residencies": [dict(residency)],
+            "acceptance_control_actor_id": "acceptance-control",
+            "event_log_path": "/tmp/task8/events.jsonl",
+            "acceptance_instrumentation": instrumentation,
+        }
+
+    validate_driver_ready_pair({role: ready(role) for role in ("a", "b")})
+
+
+def test_generation_ready_schema_reports_missing_and_unexpected_fields() -> None:
+    payload = {
+        "scope": "generation_proof_only",
+        "role": "a",
+        "pid": 1,
+        "unexpected": "value",
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"missing=.*acceptance_instrumentation.*unexpected=\['unexpected'\]",
+    ):
+        validate_driver_ready_pair(
+            {"a": payload, "b": {**payload, "role": "b", "pid": 2}}
+        )
 
 
 def test_connectivity_driver_parses_four_gpu_canonical_bundles() -> None:
@@ -1967,6 +2024,7 @@ def test_acceptance_control_explicit_gates_and_fail_closed_driver_loss(
 
     assert control.release_gate("allow_a_collection")["allow_a_collection"] is True
     assert control.wait_for_gate("allow_a_collection", timeout_s=0.01)
+    assert control.wait_for_gate("allow_a_collection", timeout_s=None)
     with pytest.raises(ValueError, match="unknown acceptance gate"):
         control.release_gate("not-a-gate")
 

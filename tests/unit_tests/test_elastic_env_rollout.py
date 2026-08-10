@@ -1132,6 +1132,7 @@ def test_environment_rank_early_completion_drives_final_bootstrap_and_padding():
     assert trajectory.actions.shape[0] == 3
     assert trajectory.dones.shape[0] == 4
     assert not compute_loss_mask(trajectory.dones)[0][1:].any()
+    assert env_worker._rollout_cursor.synthetic_padding_chunks == 2
     assert env_worker.get_elastic_progress().completed_trajectories == 1
     assert any("RLIX_TRAJECTORY_COMPLETED" in marker for marker in markers)
     assert any("RLIX_RANK_EARLY_FINALIZED" in marker for marker in markers)
